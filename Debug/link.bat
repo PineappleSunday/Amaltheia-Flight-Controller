@@ -1,0 +1,3 @@
+@echo off
+set GCC="C:/ST/STM32CubeIDE_1.18.1/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344/tools/bin/arm-none-eabi-gcc.exe"
+%GCC% -o "Amaltheia.elf" @"objects.list" -mcpu=cortex-m4 -T"G:\Electronics Projects\Flight Controller Quadcopter\Amaltheia Flight Controller\STM32F411VETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Amaltheia.map" -Wl,--gc-sections -static -L"G:\Electronics Projects\Flight Controller Quadcopter\Amaltheia Flight Controller\RunnionProjectDrivers" -u _printf_float --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group

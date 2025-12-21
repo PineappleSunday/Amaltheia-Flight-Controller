@@ -1,0 +1,26 @@
+[
+    {
+        "position": [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+        ],
+        "action": "TAKEOFF",
+        "tolerance": 0.2,
+        "duration": 0.0,
+        "toa": 5.0
+    },
+    {
+        "position": [
+            0.0,
+            0.0,
+            1.0,
+            0.0
+        ],
+        "action": "HOVER",
+        "tolerance": 0.2,
+        "duration": 9999.0,
+        "toa": 10.0
+    }
+]

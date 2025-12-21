@@ -1,0 +1,7 @@
+@echo off
+set GCC="C:/ST/STM32CubeIDE_1.18.1/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344/tools/bin/arm-none-eabi-gcc.exe"
+set FLAGS=-mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F411xE -c -I../USB_DEVICE/App -I"G:/Electronics Projects/Flight Controller Quadcopter/Amaltheia Flight Controller/RunnionProjectDrivers/inc" -I"G:/Electronics Projects/Flight Controller Quadcopter/Amaltheia Flight Controller/RunnionProjectDrivers/src" -I../USB_DEVICE/Target -I../Core/Inc -I../Drivers/STM32F4xx_HAL_Driver/Inc -I../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -I../Middlewares/ST/STM32_USB_Device_Library/Core/Inc -I../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc -I../Drivers/CMSIS/Device/ST/STM32F4xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb
+
+%GCC% "../RunnionProjectDrivers/src/i3gd20.c" %FLAGS% -MF"./RunnionProjectDrivers/src/i3gd20.d" -MT"./RunnionProjectDrivers/src/i3gd20.o" -o "./RunnionProjectDrivers/src/i3gd20.o"
+%GCC% "../RunnionProjectDrivers/src/lsm303.c" %FLAGS% -MF"./RunnionProjectDrivers/src/lsm303.d" -MT"./RunnionProjectDrivers/src/lsm303.o" -o "./RunnionProjectDrivers/src/lsm303.o"
+%GCC% "../RunnionProjectDrivers/src/PID.c" %FLAGS% -MF"./RunnionProjectDrivers/src/PID.d" -MT"./RunnionProjectDrivers/src/PID.o" -o "./RunnionProjectDrivers/src/PID.o"

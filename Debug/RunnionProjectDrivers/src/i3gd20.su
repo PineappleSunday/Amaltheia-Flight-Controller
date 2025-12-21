@@ -1,0 +1,7 @@
+../RunnionProjectDrivers/src/i3gd20.c:35:20:i3gd20_cs_assert	8	static
+../RunnionProjectDrivers/src/i3gd20.c:38:20:i3gd20_cs_deassert	8	static
+../RunnionProjectDrivers/src/i3gd20.c:43:13:i3gd20_write_reg	24	static
+../RunnionProjectDrivers/src/i3gd20.c:60:13:i3gd20_read_reg	56	static
+../RunnionProjectDrivers/src/i3gd20.c:87:6:I3GD20_Init	32	static
+../RunnionProjectDrivers/src/i3gd20.c:137:6:I3GD20_CalibrateZeroRate	40	static
+../RunnionProjectDrivers/src/i3gd20.c:164:6:I3GD20_ReadGyro	24	static

@@ -1,0 +1,98 @@
+[
+    {
+        "position": [
+            0.0,
+            0.0,
+            50.0,
+            0.0
+        ],
+        "action": "TAKEOFF",
+        "tolerance": 1.0,
+        "duration": 0.0,
+        "toa": 10.0
+    },
+    {
+        "position": [
+            250.0,
+            100.0,
+            50.0,
+            0.38
+        ],
+        "action": "MOVE",
+        "tolerance": 5.0,
+        "duration": 0.0,
+        "toa": 30.0
+    },
+    {
+        "position": [
+            500.0,
+            -100.0,
+            50.0,
+            -0.67
+        ],
+        "action": "MOVE",
+        "tolerance": 5.0,
+        "duration": 0.0,
+        "toa": 55.0
+    },
+    {
+        "position": [
+            750.0,
+            100.0,
+            50.0,
+            0.67
+        ],
+        "action": "MOVE",
+        "tolerance": 5.0,
+        "duration": 0.0,
+        "toa": 80.0
+    },
+    {
+        "position": [
+            1000.0,
+            0.0,
+            50.0,
+            -0.38
+        ],
+        "action": "MOVE",
+        "tolerance": 5.0,
+        "duration": 0.0,
+        "toa": 100.0
+    },
+    {
+        "position": [
+            1000.0,
+            0.0,
+            50.0,
+            3.141592653589793
+        ],
+        "action": "HOVER",
+        "tolerance": 2.0,
+        "duration": 5.0,
+        "toa": 105.0
+    },
+    {
+        "position": [
+            0.0,
+            0.0,
+            50.0,
+            3.141592653589793
+        ],
+        "action": "MOVE",
+        "tolerance": 5.0,
+        "duration": 0.0,
+        "toa": 175.0
+    },
+    {
+        "position": [
+            0.0,
+            0.0,
+            0.0,
+            3.141592653589793
+        ],
+        "action": "LAND",
+        "tolerance": 0.5,
+        "duration": 0.0,
+        "toa": 185.0
+    }
+]
