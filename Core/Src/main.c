@@ -308,18 +308,18 @@ int main(void)
 			float est_yaw = Kalman_Update(&kf_yaw, mag_yaw);
 
 			// --- Update Telemetry (Atomic Block) ---
-			telem_data.header = 0xDEADBEEF;
-			telem_data.timestamp = dt_sec;
-			telem_data.roll = est_roll;
-			telem_data.pitch = est_pitch;
-			telem_data.yaw = est_yaw;
-			telem_data.altitude = range_dist_cm;
-			telem_data.voltage = 15.0f;
-			telem_data.sensor_status = current_status;
-			telem_data.magic_footer = 0xAB;
+			telem_data.header = 0xDEADBEEF; //UINT32
+			telem_data.timestamp = dt_sec; //float 1
+			telem_data.roll = est_roll; //float 2
+			telem_data.pitch = est_pitch; //float 3
+			telem_data.yaw = est_yaw; //float 4
+			telem_data.altitude = range_dist_cm; //float 5
+			telem_data.voltage = 15.0f; //float 6
+			telem_data.sensor_status = current_status; //UINT8
+			telem_data.magic_footer = 0xAB; //UINT8
 
 			// --- Print to UART (Debug) ---
-			// This will now appear on your Serial Terminal (Termite/Putty)
+			// This will now appear on your Serial Terminal
 			printf("DATA,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.4f\r\n",
 					gx, gy, gz,
 					ax, ay, az,
