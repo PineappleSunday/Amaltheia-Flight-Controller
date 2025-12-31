@@ -58,8 +58,6 @@ typedef struct __attribute__((packed)) {
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-volatile uint8_t command_ready = 0; // For COMMAND FROM TELEM
-
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
@@ -83,6 +81,8 @@ uint8_t rx_byte;              // Holds the incoming character
 uint8_t rx_buffer[10];        // Buffer to build the command string
 uint8_t rx_index = 0;         // Current position in buffer
 volatile float target_throttle = 0.0f; // The throttle we want
+
+uint8_t command_ready = 0;
 // TELEM Data Length
 
 LSM303 imu;
@@ -220,7 +220,7 @@ int main(void)
 	I2C1_Scan();
 
 	// --- SENSOR SETUP ---
-	uint8_t current_status = 0;
+
 
 	// Gyro (SPI1)
 	memset(&gyro_raw, 0, sizeof(gyro_raw));
@@ -229,7 +229,7 @@ int main(void)
 	} else {
 		printf("I3GD20 init OK\r\n");
 		I3GD20_CalibrateZeroRate(&i3gd20, 1000);
-		current_status |= 0x01;
+		telem_data.sensor_status |= 0x01;
 	}
 
 	// Accel/Mag (I2C1)
@@ -238,7 +238,8 @@ int main(void)
 		printf("LSM303 init FAILED\r\n");
 	} else {
 		printf("LSM303 init OK\r\n");
-		current_status |= 0x06;
+		telem_data.sensor_status |= 0x02; //ACC
+		telem_data.sensor_status |= 0x04; //MAG
 	}
 
 	// --- CONTROL INIT ---
@@ -303,15 +304,7 @@ int main(void)
 				led_timer = now;
 			}
 			uint32_t now = HAL_GetTick();
-			// --- HEARTBEAT FAILSAFE ---
-			if (now - last_heartbeat_tick > 5000) { // 500ms timeout
-				target_throttle = 0.0f;
-				ESC_SetThrottle(TIM_CHANNEL_1, 0.0f);
-				ESC_SetThrottle(TIM_CHANNEL_2, 0.0f);
-				ESC_SetThrottle(TIM_CHANNEL_3, 0.0f);
-				ESC_SetThrottle(TIM_CHANNEL_4, 0.0f);
-				// Optional: Toggle an Error LED
-			}
+
 
 			// --- Static Variables ---
 			static float ax_g = 0, ay_g = 0, az_g = 0;
@@ -375,17 +368,10 @@ int main(void)
 			telem_data.yaw = est_yaw; //float 4
 			telem_data.altitude = range_dist_cm; //float 5
 			telem_data.voltage = 15.0f; //float 6
-			telem_data.sensor_status = current_status; //UINT8
+			//telem_data.sensor_status = current_status; //UINT8
 			telem_data.magic_footer = 0xAB; //UINT8
 			telem_data.header = 0xDEADBEEF;
-			telem_data.timestamp = dt_sec;
-			telem_data.roll = est_roll;
-			telem_data.pitch = est_pitch;
-			telem_data.yaw = est_yaw;
-			telem_data.altitude = range_dist_cm;
-			telem_data.voltage = 15.0f; // Telemetry constant
-			telem_data.sensor_status = current_status;
-			telem_data.magic_footer = 0xAB;
+
 
 			// --- Print to UART (Debug) ---
 			// This will now appear on your Serial Terminal
@@ -441,7 +427,7 @@ void SystemClock_Config(void)
 			|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
 	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
 	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
 	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV8;
 
 	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
@@ -578,7 +564,7 @@ static void MX_TIM3_Init(void)
 
 	/* USER CODE END TIM3_Init 1 */
 	htim3.Instance = TIM3;
-	htim3.Init.Prescaler = 95;
+	htim3.Init.Prescaler = 47;
 	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
 	htim3.Init.Period = 2499;
 	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -835,9 +821,9 @@ static void MX_GPIO_Init(void)
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
 	if (hspi->Instance == SPI5) {
-	        command_ready = 1;
-	        // Do NOT call Process_TELEM_Command here
-	    }
+		command_ready = 1;
+		// Do NOT call Process_TELEM_Command here
+	}
 }
 
 void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
@@ -878,9 +864,21 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 		}
 		memset(Buf, 0, Len);
 		memset(local_buf, 0, Len);
+	} else if (strstr(local_buf, "all") != NULL || strstr(local_buf, "ALL") != NULL) {
+
+		char* t_ptr = strchr(local_buf, 't');
+		if (t_ptr != NULL) {
+			float throttle = atof(t_ptr + 1);
+			ESC_SetThrottle(TIM_CHANNEL_1, throttle);
+			ESC_SetThrottle(TIM_CHANNEL_2, throttle);
+			ESC_SetThrottle(TIM_CHANNEL_3, throttle);
+			ESC_SetThrottle(TIM_CHANNEL_4, throttle);
+			printf("All Motors -> %.1f%%\r\n", throttle);
+		}
+		memset(Buf, 0, Len);
+		memset(local_buf, 0, Len);
 	}
 }
-
 /**
  * @brief Helper to map Motor ID 1-4 to TIM_CHANNEL_x
  */
@@ -904,7 +902,17 @@ void ESC_SetThrottle(uint32_t channel, float percentage) {
 
 	// 3. Hardware Register Update
 	__HAL_TIM_SET_COMPARE(&htim3, channel, pulse);
-	return;
+
+	// 4. Update Telemetry Data (Fixed Syntax)
+	if (channel == TIM_CHANNEL_1) {
+		telem_data.motor1_T = percentage;
+	} else if (channel == TIM_CHANNEL_2) {
+		telem_data.motor2_T = percentage;
+	} else if (channel == TIM_CHANNEL_3) {
+		telem_data.motor3_T = percentage;
+	} else if (channel == TIM_CHANNEL_4) {
+		telem_data.motor4_T = percentage;
+	}
 }
 
 void ESC_ArmAll(void) {
@@ -922,10 +930,22 @@ void ESC_ArmAll(void) {
 	// Wait for ESC Init Beeps (standard BLHeli startup is ~2-3 seconds)
 	HAL_Delay(3000);
 	is_system_armed = 1;
+	target_throttle = 5;
+	ESC_SetThrottle(TIM_CHANNEL_1, target_throttle);
+	ESC_SetThrottle(TIM_CHANNEL_2, target_throttle);
+	ESC_SetThrottle(TIM_CHANNEL_3, target_throttle);
+	ESC_SetThrottle(TIM_CHANNEL_4, target_throttle);
+	telem_data.armed = 0xFF;
+	telem_data.motor1_T = target_throttle;
+	telem_data.motor2_T = target_throttle;
+	telem_data.motor3_T = target_throttle;
+	telem_data.motor4_T = target_throttle;
+
 }
 
 void Process_Lidar_DMA(void) {
 	uint8_t write_idx = (LIDAR_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx)) % LIDAR_BUF_SIZE;
+	telem_data.sensor_status |= 0x08;
 	while (lidar_read_idx != write_idx) {
 		uint8_t b = lidar_dma_buffer[lidar_read_idx];
 		switch(tf_state) {
