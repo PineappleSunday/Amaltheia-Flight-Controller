@@ -1,4 +1,5 @@
-RunnionProjectDrivers/src/kalman.o: ../RunnionProjectDrivers/src/kalman.c \
+Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_tim_ex.o: \
+ ../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_tim_ex.c \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/i3gd20.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h \
  ../Core/Inc/stm32f4xx_hal_conf.h \
@@ -33,8 +34,7 @@ RunnionProjectDrivers/src/kalman.o: ../RunnionProjectDrivers/src/kalman.c \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal_uart.h \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/lsm303.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/PID.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h
+ G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/PID.h
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/i3gd20.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
@@ -70,4 +70,3 @@ G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Contr
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h:
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/lsm303.h:
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/PID.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h:
