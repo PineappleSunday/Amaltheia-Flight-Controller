@@ -55,7 +55,8 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+void ESC_SetThrottle(uint32_t channel, float percentage);
+uint32_t get_timer_channel(int motor_num);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
@@ -75,6 +76,8 @@ void Error_Handler(void);
 #define MISO_I3G4250D_GPIO_Port GPIOA
 #define MOSI_I3G4250D_Pin GPIO_PIN_7
 #define MOSI_I3G4250D_GPIO_Port GPIOA
+#define SPI5_NSS_Pin GPIO_PIN_1
+#define SPI5_NSS_GPIO_Port GPIOB
 #define CLK_IN_Pin GPIO_PIN_10
 #define CLK_IN_GPIO_Port GPIOB
 #define LD4_Pin GPIO_PIN_12
@@ -103,10 +106,10 @@ void Error_Handler(void);
 #define OTG_FS_OverCurrent_GPIO_Port GPIOD
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
-#define Audio_SCL_Pin GPIO_PIN_6
-#define Audio_SCL_GPIO_Port GPIOB
-#define Audio_SDA_Pin GPIO_PIN_9
-#define Audio_SDA_GPIO_Port GPIOB
+#define LSM303_Pin GPIO_PIN_6
+#define LSM303_GPIO_Port GPIOB
+#define LSM303B9_Pin GPIO_PIN_9
+#define LSM303B9_GPIO_Port GPIOB
 #define MEMS_INT2_Pin GPIO_PIN_1
 #define MEMS_INT2_GPIO_Port GPIOE
 

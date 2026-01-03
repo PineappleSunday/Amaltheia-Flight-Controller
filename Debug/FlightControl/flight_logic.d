@@ -1,4 +1,4 @@
-Core/Src/main.o: ../Core/Src/main.c \
+FlightControl/flight_logic.o: ../FlightControl/flight_logic.c \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/i3gd20.h \
  ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h \
  ../Core/Inc/stm32f4xx_hal_conf.h \
@@ -34,15 +34,9 @@ Core/Src/main.o: ../Core/Src/main.c \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/lsm303.h \
  G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/PID.h \
- ../Core/Inc/main.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/state.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/AHRS.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/state.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/navigation.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/flight_logic.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/navigation.h \
- G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/mixer.h
+ ../FlightControl/flight_logic.h ../FlightControl/state.h \
+ ../FlightControl/navigation.h ../FlightControl/mixer.h \
+ ../Core/Inc/main.h
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/i3gd20.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
@@ -78,12 +72,8 @@ G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Contr
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h:
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/lsm303.h:
 G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/PID.h:
+../FlightControl/flight_logic.h:
+../FlightControl/state.h:
+../FlightControl/navigation.h:
+../FlightControl/mixer.h:
 ../Core/Inc/main.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/RunnionProjectDrivers/inc/kalman.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/state.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/AHRS.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/state.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/navigation.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/flight_logic.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/navigation.h:
-G:/Electronics\ Projects/Flight\ Controller\ Quadcopter/Amaltheia\ Flight\ Controller/FlightControl/mixer.h:

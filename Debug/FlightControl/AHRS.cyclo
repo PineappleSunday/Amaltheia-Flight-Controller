@@ -1,0 +1,2 @@
+../FlightControl/AHRS.c:12:14:wrap_deg	3
+../FlightControl/AHRS.c:22:6:AHRS_Update	3

@@ -1,0 +1,2 @@
+../FlightControl/AHRS.c:12:14:wrap_deg	16	static
+../FlightControl/AHRS.c:22:6:AHRS_Update	88	static

@@ -1,0 +1,2 @@
+../FlightControl/state.c:7:6:Vehicle_State_Init	16	static
+../FlightControl/state.c:13:6:Target_State_Init	16	static

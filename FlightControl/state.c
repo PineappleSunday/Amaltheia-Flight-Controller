@@ -3,23 +3,13 @@
 #include "state.h"
 #include <string.h>
 
-void Vehicle_State_Init(VehicleState* state) {
-    memset(state, 0, sizeof(VehicleState));
+// Using the typedef names from your header
+void Vehicle_State_Init(droneState_t* state) {
+    if (state == NULL) return;
+    memset(state, 0, sizeof(droneState_t));
+    state->armed = 0; // Explicit safety zero
 }
 
-void Target_State_Init(TargetState* target) {
-    memset(target, 0, sizeof(TargetState));
+void Target_State_Init(targetState_t* target) {
+    memset(target, 0, sizeof(targetState_t));
 }
-
-
-typedef struct {
-    float x, y, z;          // Position [m]
-    float vx, vy, vz;       // Velocity [m/s]
-    float roll, pitch, yaw; // Attitude [rad]
-    float p, q, r;          // Body rates [rad/s]
-} VehicleState;
-
-typedef struct {
-    float x, y, z, yaw;     // Target setpoints
-    float ff_vx, ff_vy, ff_vz; // Feedforward velocities [m/s]
-} TargetState;
