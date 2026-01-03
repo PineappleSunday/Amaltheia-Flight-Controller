@@ -303,7 +303,6 @@ int main(void)
 				HAL_GPIO_TogglePin(GPIOD, LD4_Pin);
 				led_timer = now;
 			}
-			uint32_t now = HAL_GetTick();
 
 
 			// --- Static Variables ---
@@ -375,13 +374,15 @@ int main(void)
 
 			// --- Print to UART (Debug) ---
 			// This will now appear on your Serial Terminal
-			printf("DATA,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.4f\r\n",
+			/*
+			  printf("DATA,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f,%.2f,%.4f\r\n",
 					gx, gy, gz,
 					ax, ay, az,
 					mx, my, mz,
 					range_dist_cm,
 					est_roll, est_pitch, est_yaw,
 					dt_sec);
+			 */
 		}
 	}
 	/* USER CODE END WHILE */
