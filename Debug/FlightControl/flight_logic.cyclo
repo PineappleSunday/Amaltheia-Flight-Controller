@@ -1,1 +1,2 @@
-../FlightControl/flight_logic.c:13:6:FlightLogic_Update	2
+../FlightControl/flight_logic.c:16:6:FlightLogic_Update	1
+../FlightControl/flight_logic.c:50:7:wrap_deg	3

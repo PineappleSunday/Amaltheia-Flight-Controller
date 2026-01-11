@@ -8,33 +8,47 @@
 extern PIDController pid_roll, pid_pitch, pid_yaw;
 // Assuming you add velocity/position PIDs to your main.c globals
 extern PIDController pid_pos_z, pid_vel_z;
-static const float ESC_MIN_VAL = 1000.0f;
+extern PIDController pid_roll_angle, pid_pitch_angle, pid_yaw_angle;
+extern PIDController pid_roll_rate, pid_pitch_rate, pid_yaw_rate;
+
+float wrap_deg(float a);
 
 void FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
-    // 1. ALTITUDE CONTROL (Cascaded)
-    float corr_vel_z = PID_Calculate(&pid_pos_z, state->z, target->z);
-    float target_vz  = corr_vel_z + target->ff_vz;
-    float thrust_adj = PID_Calculate(&pid_vel_z, state->vz, target_vz);
+	// 1. ALTITUDE CONTROL (Cascaded)
+	float corr_vel_z = PID_Calculate(&pid_pos_z, target->z, state->z); // Setpoint first
+	float target_vz  = corr_vel_z + target->ff_vz;
+	float thrust_adj = PID_Calculate(&pid_vel_z, target_vz, state->vz);
+	float base_thrust = 30.0f + thrust_adj;
 
-    // 1500us is a typical starting hover point for a 4S build
-    float base_thrust = 1500.0f + thrust_adj;
+	// 2. ATTITUDE OUTER LOOP (Angle -> Rate)
+	// We wrap the Yaw error to ensure we take the shortest path
+	float yaw_err = wrap_deg(target->yaw - state->yaw);
 
-    // 2. ATTITUDE CONTROL (Inner Loop)
-    float roll_cmd  = PID_Calculate(&pid_roll,  state->roll,  target->roll);
-    float pitch_cmd = PID_Calculate(&pid_pitch, state->pitch, target->pitch);
-    float yaw_cmd   = PID_Calculate(&pid_yaw,   state->yaw,   target->yaw);
+	// The output of these PIDs is the "Desired Rotation Rate" (deg/s)
+	target->rate_roll  = PID_Calculate(&pid_roll_angle,  target->roll,  state->roll);
+	target->rate_pitch = PID_Calculate(&pid_pitch_angle, target->pitch, state->pitch);
+	target->rate_yaw   = PID_Calculate(&pid_yaw_angle,   yaw_err,      0); // Error already wrapped
 
-    // 3. MOTOR MIXING
-    uint32_t motor_pwms[4];
-    Mixer_Apply(base_thrust, roll_cmd, pitch_cmd, yaw_cmd, motor_pwms);
+	// 3. ATTITUDE INNER LOOP (Rate -> Torque)
+	// We compare the Desired Rate to the RAW Gyro data (state->roll_rate / pitch_rate / yaw_rate)
+    // Note: Use the 'rate' variables from your state struct
+	float roll_torque  = PID_Calculate(&pid_roll_rate,  target->rate_roll,  state->roll_rate);
+	float pitch_torque = PID_Calculate(&pid_pitch_rate, target->rate_pitch, state->pitch_rate);
+	float yaw_torque   = PID_Calculate(&pid_yaw_rate,   target->rate_yaw,   state->yaw_rate);
 
-    // 4. HARDWARE ACTUATION
-    for (int i = 0; i < 4; i++) {
-        // Fix: Use 'motor_pwms' to match the declaration above
-        // Convert Pulse (1000-2000) to Percentage (0-100) for ESC_SetThrottle
-        float pct = (float)(motor_pwms[i] - ESC_MIN_VAL) / 10.0f;
+	// 4. MOTOR MIXING (Plus Configuration)
+	float motor_pcts[4];
+	Mixer_Apply(base_thrust, roll_torque, pitch_torque, yaw_torque, motor_pcts);
 
-        // Scope is provided by main.h
-        ESC_SetThrottle(get_timer_channel(i + 1), pct);
-    }
+	// 5. HARDWARE ACTUATION
+	ESC_SetThrottle(TIM_CHANNEL_1, motor_pcts[0]); // Front
+	ESC_SetThrottle(TIM_CHANNEL_2, motor_pcts[1]); // Right
+	ESC_SetThrottle(TIM_CHANNEL_3, motor_pcts[2]); // Rear
+	ESC_SetThrottle(TIM_CHANNEL_4, motor_pcts[3]); // Left
+}
+
+float wrap_deg(float a) {
+	while (a > 180.0f) a -= 360.0f;
+	while (a < -180.0f) a += 360.0f;
+	return a;
 }

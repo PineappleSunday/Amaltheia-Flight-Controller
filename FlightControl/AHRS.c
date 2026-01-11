@@ -10,9 +10,9 @@ extern Kalman_t kf_pitch;
 extern Kalman_t kf_yaw;
 
 static float wrap_deg(float a) {
-	while (a > 180.0f) a -= 360.0f;
-	while (a < -180.0f) a += 360.0f;
-	return a;
+    a = fmodf(a + 180.0f, 360.0f);
+    if (a < 0) a += 360.0f;
+    return a - 180.0f;
 }
 
 /**
@@ -71,7 +71,12 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	/* -------------------------------------------------
 	 * 5. Body rates (rad/s)
 	 * ------------------------------------------------- */
-	state->p = gx * 0.0174533f;
-	state->q = gy * 0.0174533f;
-	state->r = gz * 0.0174533f;
+	state->gyro_x = gx * 0.0174533f; // converting deg/s to rad/s
+	state->gyro_y = gy * 0.0174533f;
+	state->gyro_z = gz * 0.0174533f;
+
+	// Also map to your rate members for the PID
+	state->roll_rate  = gx;
+	state->pitch_rate = gy;
+	state->yaw_rate   = gz;
 }

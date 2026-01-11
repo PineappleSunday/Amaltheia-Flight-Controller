@@ -4,19 +4,29 @@
 
 #include <stdint.h>
 
+
+#define MODE_MANUAL_LEVEL  1  // Auto-level on, but user controls vertical
+#define MODE_MISSION       2  // Following your mission_plan[64] string
+
+#define SUBMODE_STABLE     0
+#define SUBMODE_TAKEOFF    1
+
 // Kinematic State of the drone (Single Source of Truth)
 typedef struct {
-    float x, y, z;          // Position [m]
-    float vx, vy, vz;       // Velocity [m/s]
-    float roll, pitch, yaw; // Attitude [rad]
-    float p, q, r;          // Body rates [rad/s]
+    float x, y, z;
+    float vx, vy, vz;
+    float roll, pitch, yaw;
+    // Add these for the Rate PID
+    float gyro_x, gyro_y, gyro_z;
+    float roll_rate, pitch_rate, yaw_rate;
 } vehicleState_t;
 
 // Desired State (from Navigation/Mission Manager)
 typedef struct {
-    float x, y, z, yaw;        // Target position/heading
-    float roll, pitch;         // Target attitude (calculated from position PIDs)
-    float ff_vx, ff_vy, ff_vz; // Feedforward velocities
+    float x, y, z, yaw;
+    float roll, pitch;         // Target Angles
+    float rate_roll, rate_pitch, rate_yaw; // Target Rates (Add these!)
+    float ff_vx, ff_vy, ff_vz;
 } targetState_t;
 
 // Drone Status and Telemetry Metadata

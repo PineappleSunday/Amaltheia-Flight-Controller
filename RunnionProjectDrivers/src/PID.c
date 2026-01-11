@@ -35,6 +35,9 @@ float PID_Calculate(PIDController* pid, float actual, float goal) {
     if (I > pid->i_limit) I = pid->i_limit;
     else if (I < -pid->i_limit) I = -pid->i_limit;
 
+    if (pid->cycle_time_seconds == 0.0f) {
+    	pid->cycle_time_seconds = 0.01f;
+    }
     // Derivative term
     float D = pid->kd * (error - pid->previous_error) / pid->cycle_time_seconds;
 
