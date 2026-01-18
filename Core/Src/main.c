@@ -54,7 +54,8 @@ typedef enum {
 	STATE_INIT,
 	STATE_TUNE,
 	STATE_DATA_DUMP,
-	STATE_MODE_SEL
+	STATE_MODE_SEL,
+	STATE_MODE_SEL_COMPLETE
 } StartControlState_t;
 typedef enum {
 	AXIS_PITCH,
@@ -70,6 +71,7 @@ typedef enum {
 	TUNE_CALCULATE,
 	TUNE_COOLDOWN
 } TuneState_t;
+
 #define TUNE_LOG_SIZE 600 // 600ms at 1kHz
 static uint16_t dump_idx = 0;
 static bool is_dumping = false;
@@ -135,6 +137,7 @@ DMA_HandleTypeDef hdma_usart1_tx;
 volatile uint8_t is_system_armed = 0; // 0: Locked, 1: Armed
 volatile uint32_t last_heartbeat_tick = 0; // Tracks last valid command
 volatile uint8_t is_estop_active = 0; // 0: Normal, 1: Emergency Landing
+volatile uint8_t tune_request = 0;
 
 typedef enum { READ_ACCEL, READ_MAG } sensor_state_t;
 
@@ -264,7 +267,7 @@ static void MX_TIM3_Init(void);
 void Vehicle_State_Init(droneState_t* state);
 static void SPI5_ArmNextFrame(void);
 void start_control(void);
-void run_autotune_step(float *rate_setpoint, float current_rate);
+bool run_autotune_step(float *rate_setpoint, float current_rate);
 
 //SPI1 GYRO
 //I2C1 ACCEL/MAG
@@ -340,7 +343,7 @@ int main(void)
 	telem_data.voltage = 12.0f;
 	telem_data.sensor_status = 0;
 	telem_data.armed = 0x00;
-
+	telem_data.flight_mode = 0x05;
 
 	// Fill with test pattern to verify DMA is reading memory
 	// memset(&telem_data.roll, 0xAA, 12);
@@ -355,10 +358,9 @@ int main(void)
 	I2C1_Scan();
 	Vehicle_State_Init(&g_drone_status);
 	last = HAL_GetTick();
-	while(StartControlState != STATE_MODE_SEL) {
-		start_control();
-		// INIT DRONE LIGHTS <== STILL TO ADD
-	}
+	g_drone_status.flight_mode = 10; // 0 = START UP
+	HAL_Delay(10);
+	while(StartControlState != STATE_MODE_SEL_COMPLETE) { start_control(); }
 
 	// NOTE TO COLIN
 	// MODE SELECT
@@ -421,7 +423,7 @@ int main(void)
 		uint32_t now = HAL_GetTick();
 		// 2. Run Control Loop at 100Hz (10ms)
 		if (now - main_last >= 10) {
-			float dt_sec = (now - last) / 1000.0f;
+			float dt_sec = (now - main_last) / 1000.0f;
 			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.01f;
 			main_last = now;
 
@@ -465,7 +467,7 @@ int main(void)
 					raw_data.mz = (int16_t)((mag_snap[5] << 8) | mag_snap[4]) * imu.mag_gauss_per_lsb;
 				}
 			}
-			// --- 3. GYROSCOPE: 1:1 Capture ---
+			// --- 3. GYROSCOPE  ---
 			if (i3gd20.initialized && I3GD20_ReadGyro(&i3gd20, &gyro_raw)) {
 				raw_data.gx = gyro_raw.gx * i3gd20.dps_per_lsb;
 				raw_data.gy = gyro_raw.gy * i3gd20.dps_per_lsb;
@@ -509,18 +511,18 @@ int main(void)
 					is_estop_active = 0; // Reset for next boot
 				}
 			} else if (g_drone_status.drone_mode == MODE_MANUAL_LEVEL){
-
+				telem_data.flight_mode = 0x08;
 				if (isnan(g_state.roll) || isnan(g_state.pitch) || isnan(g_state.yaw)) {
-				    // Force reset the state so the math can recover
-				    g_state.roll = 0.0f;
-				    g_state.pitch = 0.0f;
-				    g_state.yaw = 0.0f;
-				    printf("RECOVERY: AHRS NaN detected and cleared.\r\n");
+					// Force reset the state so the math can recover
+					g_state.roll = 0.0f;
+					g_state.pitch = 0.0f;
+					g_state.yaw = 0.0f;
+					printf("RECOVERY: AHRS NaN detected and cleared.\r\n");
 				}
 				if (isnan(g_target.rate_roll)) {
-				    g_target.rate_roll = 0.0f;
-				    g_target.rate_pitch = 0.0f;
-				    g_target.rate_yaw = 0.0f;
+					g_target.rate_roll = 0.0f;
+					g_target.rate_pitch = 0.0f;
+					g_target.rate_yaw = 0.0f;
 				}
 				g_target.z = commandZ + 0.2;
 				g_drone_status.drone_mode = 1; // Signal Manual Mode
@@ -534,9 +536,9 @@ int main(void)
 			// This is where we run PIDs and then the Mixer
 			// 3. FLIGHT CONTROL & TELEMETRY
 			if (isnan(g_target.rate_pitch) || isnan(g_target.rate_roll)) {
-			    g_target.rate_pitch = 0.0f;
-			    g_target.rate_roll = 0.0f;
-			    g_target.rate_yaw = 0.0f;
+				g_target.rate_pitch = 0.0f;
+				g_target.rate_roll = 0.0f;
+				g_target.rate_yaw = 0.0f;
 			}
 			if (is_system_armed) {
 
@@ -1014,18 +1016,19 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void start_control(void) {
 
-	g_drone_status.flight_mode = 0; // 0 = IDLE/DISARMED
+
 
 	switch (StartControlState) {
 	case STATE_INIT:
+		g_drone_status.flight_mode = 5;
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---
-		PID_Init(&pid_roll,  1.0f, 0.0f, 0.0f, 0.01f, 100.0f);
-		PID_Init(&pid_pitch, 1.0f, 0.0f, 0.0f, 0.01f, 100.0f);
-		PID_Init(&pid_yaw,   1.0f, 0.0f, 0.0f, 0.01f, 100.0f);
+		PID_Init(&pid_roll,  1.0f, 0.0f, 0.0f, 0.01f, 10.0f);
+		PID_Init(&pid_pitch, 1.0f, 0.0f, 0.0f, 0.01f, 10.0f);
+		PID_Init(&pid_yaw,   1.0f, 0.0f, 0.0f, 0.01f, 10.0f);
 
-		PID_Init(&pid_roll_rate, 0.1f, 0.0f, 0.01f, 0.01f, 100.0f);
-		PID_Init(&pid_pitch_rate, 0.1f, 0.0f, 0.01f, 0.01f, 100.0f);
-		PID_Init(&pid_yaw_rate, 0.1f, 0.0f, 0.01f, 0.01f, 100.0f);
+		PID_Init(&pid_roll_rate, 0.1f, 0.0f, 0.01f, 0.01f, 10.0f);
+		PID_Init(&pid_pitch_rate, 0.1f, 0.0f, 0.01f, 0.01f, 10.0f);
+		PID_Init(&pid_yaw_rate, 0.1f, 0.0f, 0.01f, 0.01f, 10.0f);
 
 		PID_Init(&pid_pos_z, 1.5f, 0.0f, 0.0f, 0.01f, 0.0f);   // Position P gain
 		PID_Init(&pid_vel_z, 2.0f, 0.5f, 0.1f, 0.01f, 50.0f); // Velocity PID with I-limit
@@ -1155,28 +1158,81 @@ void start_control(void) {
 			telem_data.magic_footer = 0xAB;       // UINT8
 			telem_data.header = 0xDEADBEEF;       // Redundant header as per your code
 		}
-		StartControlState = STATE_TUNE;
+		StartControlState = STATE_MODE_SEL;
 		printf("Initialization Complete. Entering Control Loop.\r\n");
 		break;
 
 	case STATE_TUNE:
 	{
-		uint32_t tune_now = HAL_GetTick();
-		static uint16_t telem_decimator = 0;
-		static TuneAxis_t current_tune_axis = AXIS_PITCH;
+		// =========================
+		// SAFETY POLICY
+		// =========================
+		// If you want "bench tune" (no motors), keep this.
+		// If you want "in-air tune", require is_system_armed==1 and props on, etc.
+		const bool allow_motor_output = (is_system_armed != 0);
 
-		if (tune_now - last >= 1) { // 1000Hz Loop
-			float dt = (tune_now - last) / 1000.0f;
-			if (dt <= 0.0f) dt = 0.001f; // Ensure at least 1ms
-			last = tune_now;
+		uint32_t now_ms = HAL_GetTick();
+
+		// Persistent supervisor state
+		static uint8_t entered = 0;
+		static TuneAxis_t axis = AXIS_PITCH;
+		static uint16_t telem_decimator = 0;   // 1kHz -> 100Hz telemetry
+		static uint32_t last_1khz = 0;
+
+		telem_data.flight_mode = 0x07; // TUNING (your groundstation label)
+
+		// -------------------------
+		// One-time entry init
+		// -------------------------
+		if (!entered) {
+			entered = 1;
+			axis = AXIS_PITCH;
+			telem_decimator = 0;
+
+			// Reset logs
+			log_idx = 0;
+			dump_idx = 0;
+			is_logging = false;
+			is_dumping = false;
+
+			// Reset tune FSM + kick it
+			state_tune = TUNE_IDLE;
+			tuning_triggered = 1;
+
+			// Zero setpoints
+			g_target.rate_pitch = 0.0f;
+			g_target.rate_roll  = 0.0f;
+			g_target.rate_yaw   = 0.0f;
+
+			// Optional: force attitude hold targets to 0
+			// g_target.roll = 0; g_target.pitch = 0; g_target.yaw = 0;
+
+			// Timing
+			last_1khz = now_ms;
+
+			printf("TUNE: ENTER (axis=PITCH)\r\n");
+		}
+
+		// -------------------------
+		// 1 kHz loop gate
+		// -------------------------
+		if ((now_ms - last_1khz) >= 1) {
+			float dt = (now_ms - last_1khz) / 1000.0f;
+			if (dt <= 0.0f) dt = 0.001f;
+			last_1khz = now_ms;
+
 			telem_decimator++;
-			if (state_tune == TUNE_INJECT_PULSE) is_logging = true;
 
-			// 1. SENSE: Update data
-			I3GD20_ReadGyro(&i3gd20, &gyro_raw);
-			raw_data.gx = gyro_raw.gx * i3gd20.dps_per_lsb;
-			raw_data.gy = gyro_raw.gy * i3gd20.dps_per_lsb;
+			// =========================
+			// 1) SENSE / UPDATE STATE
+			// =========================
+			if (i3gd20.initialized && I3GD20_ReadGyro(&i3gd20, &gyro_raw)) {
+				raw_data.gx = gyro_raw.gx * i3gd20.dps_per_lsb;
+				raw_data.gy = gyro_raw.gy * i3gd20.dps_per_lsb;
+				raw_data.gz = gyro_raw.gz * i3gd20.dps_per_lsb;
+			}
 
+			// accel helps AHRS stability during pokes
 			LSM303_Process_DMA(&imu);
 			if (imu.accel_ready) {
 				uint8_t snap[6];
@@ -1184,6 +1240,7 @@ void start_control(void) {
 				memcpy(snap, imu.accel_raw, 6);
 				imu.accel_ready = false;
 				__enable_irq();
+
 				raw_data.ax = (int16_t)((snap[1] << 8) | snap[0]) * imu.accel_g_per_lsb;
 				raw_data.ay = (int16_t)((snap[3] << 8) | snap[2]) * imu.accel_g_per_lsb;
 				raw_data.az = (int16_t)((snap[5] << 8) | snap[4]) * imu.accel_g_per_lsb;
@@ -1191,122 +1248,151 @@ void start_control(void) {
 
 			AHRS_Update(&raw_data, &g_state, dt);
 
-			// 2. THINK: Select Axis for the "Poke"
-			float current_gyro_rate = 0.0f;
-			float *active_setpoint = NULL;
+			// =========================
+			// 2) SELECT ACTIVE AXIS
+			// =========================
+			float *sp = NULL;
+			float rate_meas = 0.0f;
 
-			if (current_tune_axis == AXIS_PITCH) {
-				active_setpoint = &g_target.rate_pitch;
-				current_gyro_rate = g_state.pitch_rate; // Fixed typo and pointer
-			}
-			else if (current_tune_axis == AXIS_ROLL) {
-				active_setpoint = &g_target.rate_roll;
-				current_gyro_rate = g_state.roll_rate;  // Fixed pointer
-			}
-
-			// 3. RUN AUTO-TUNE STEP
-			if (current_tune_axis != AXIS_DONE) {
-				// 1. Update the state (IDLE -> INJECT_PULSE)
-				run_autotune_step(active_setpoint, current_gyro_rate);
-
-				// 2. CHECK LOGGING IMMEDIATELY AFTER UPDATE
-				// If state_tune is global, this will catch the transition instantly
-				if (state_tune == TUNE_INJECT_PULSE && !is_logging) {
-					is_logging = true;
-					log_idx = 0;
-					printf("BLACKBOX: Logging Started for Axis %d\r\n", current_tune_axis);
-				}
-
-				// 3. INTERNAL HANDOFF (Pitch -> Roll)
-				if (!tuning_triggered) {
-					current_tune_axis++;
-					if (current_tune_axis != AXIS_DONE) {
-						tuning_triggered = true;
-					}
-				}
+			if (axis == AXIS_PITCH) {
+				sp = &g_target.rate_pitch;
+				rate_meas = g_state.pitch_rate;
+			} else if (axis == AXIS_ROLL) {
+				sp = &g_target.rate_roll;
+				rate_meas = g_state.roll_rate;
 			} else {
-				// All axes tuned! Hand over to mode selection
+				// finished all axes
 				StartControlState = STATE_DATA_DUMP;
+				entered = 0; // so tune can be run again later
+				printf("TUNE: DONE -> DATA_DUMP\r\n");
+				break;
 			}
 
-			// 4. ACT: Stability Loop
-			if (isnan(g_target.rate_pitch) || isnan(g_target.rate_roll)) {
-			    g_target.rate_pitch = 0.0f;
-			    g_target.rate_roll = 0.0f;
-			    g_target.rate_yaw = 0.0f;
+			// =========================
+			// 3) RUN AUTOTUNE STEP (updates *sp)
+			// =========================
+			bool axis_done = run_autotune_step(sp, rate_meas);
+
+			// Start logging when INJECT begins (simple: when tune FSM enters INJECT)
+			if (!is_logging && state_tune == TUNE_INJECT_PULSE) {
+				is_logging = true;
+				log_idx = 0;
 			}
-			FlightLogic_Update(&g_state, &g_target);
-			if (is_logging && log_idx < TUNE_LOG_SIZE) {
-				// Dynamically log the axis currently being tuned
-				if (current_tune_axis == AXIS_PITCH) {
-					gyro_log[log_idx]   = g_state.pitch_rate;
-					target_log[log_idx] = g_target.rate_pitch;
-				} else {
-					gyro_log[log_idx]   = g_state.roll_rate;
-					target_log[log_idx] = g_target.rate_roll;
+
+			// =========================
+			// 4) CONTROL OUTPUT POLICY
+			// =========================
+			// If motors are NOT allowed, we do NOT call FlightLogic_Update.
+			// This still logs gyro response if you physically move the airframe,
+			// but it won't do active excitation.
+			if (allow_motor_output) {
+				// NaN guards
+				if (isnan(g_target.rate_pitch) || isnan(g_target.rate_roll)) {
+					g_target.rate_pitch = 0.0f;
+					g_target.rate_roll  = 0.0f;
+					g_target.rate_yaw   = 0.0f;
 				}
+				FlightLogic_Update(&g_state, &g_target);
+			} else {
+				// hard force motors to 0 while tuning (optional)
+				for (int i = 1; i <= 4; i++) {
+					ESC_SetThrottle(get_timer_channel(i), 0.0f);
+				}
+			}
+
+			// =========================
+			// 5) LOGGING (1kHz, 600 samples)
+			// =========================
+			if (is_logging && log_idx < TUNE_LOG_SIZE) {
+				gyro_log[log_idx]   = rate_meas;  // measured response
+				target_log[log_idx] = *sp;        // commanded poke
 				log_idx++;
 			}
-			if (state_tune == TUNE_COOLDOWN && log_idx >= TUNE_LOG_SIZE) {
+
+			// =========================
+			// 6) AXIS COMPLETE -> ADVANCE
+			// =========================
+			if (axis_done) {
 				is_logging = false;
-				is_dumping = true; // Start the trickle
-				dump_idx = 0;      // Start at the beginning of the log
+
+				// Pad log if we didn’t fill the entire window
+				for (; log_idx < TUNE_LOG_SIZE; log_idx++) {
+					gyro_log[log_idx]   = gyro_log[(log_idx > 0) ? (log_idx - 1) : 0];
+					target_log[log_idx] = 0.0f;
+				}
+
+				// Next axis
+				if (axis == AXIS_PITCH) {
+					axis = AXIS_ROLL;
+					state_tune = TUNE_IDLE;
+					tuning_triggered = 1;
+					log_idx = 0;
+					printf("TUNE: NEXT (axis=ROLL)\r\n");
+				} else {
+					axis = AXIS_DONE;
+					StartControlState = STATE_DATA_DUMP;
+					entered = 0;
+					printf("TUNE: COMPLETE -> DATA_DUMP\r\n");
+				}
 			}
-			// 5. TELEMETER: 100Hz Decimation
+
+			// =========================
+			// 7) TELEMETRY @ 100Hz
+			// =========================
 			if (telem_decimator >= 10) {
 				telem_decimator = 0;
-				telem_data.timestamp = (float)tune_now / 1000.0f;
-				// Map the active poke to voltage for the Ground Station graph
-				telem_data.voltage = (active_setpoint != NULL) ? *active_setpoint : 0.0f;
+
+				// Put useful live signals in packet for your plotter
+				telem_data.timestamp = (float)now_ms / 1000.0f;
+
+				// Use existing fields you already graph:
+				telem_data.pitch   = rate_meas;  // “actual”
+				telem_data.voltage = *sp;        // “target/poke”
+
+				// send one frame
 				SPI5_ArmNextFrame();
 			}
 		}
 	}
 	break;
 
+
 	case STATE_DATA_DUMP:
-		// This case now runs once per call to start_control()
+	{
+		telem_data.flight_mode = 254;
+	    uint32_t now = HAL_GetTick();
+	    if (now - last >= 10) {
+	        last = now;
 
-		uint32_t now = HAL_GetTick();
+	        telem_data.timestamp   = (float)dump_idx;
+	        telem_data.pitch       = gyro_log[dump_idx];
+	        telem_data.voltage     = target_log[dump_idx];
+	        telem_data.flight_mode = 0xFE;
 
-		// 1. Logic for timing the "Trickle" (100Hz)
-		if (now - last >= 10) {
-			last = now;
+	        SPI5_ArmNextFrame();
 
-			// 2. Populate the packet with one specific sample
-			telem_data.timestamp   = (float)dump_idx;
-			telem_data.pitch       = gyro_log[dump_idx];
-			telem_data.voltage     = target_log[dump_idx];
-			telem_data.flight_mode = 0xFE; // Special ID for Ground Station plotting
+	        dump_idx++;
 
-			// 3. PHYSICAL SEND: You must trigger the DMA here
-			SPI5_ArmNextFrame();
+	        if (dump_idx >= TUNE_LOG_SIZE) {
+	            dump_idx = 0;
+	            printf("Dump Complete. Transitioning to Mode Selection.\r\n");
+	            StartControlState = STATE_MODE_SEL;
+	        }
+	    }
+	    break;
+	}
 
-			dump_idx++;
-
-			// 4. Check for Completion
-			if (dump_idx >= TUNE_LOG_SIZE) {
-				is_dumping = false;
-				dump_idx = 0; // Reset for next time
-				printf("Dump Complete. Transitioning to Mode Selection.\r\n");
-				StartControlState = STATE_MODE_SEL;
-			}
+	case STATE_MODE_SEL: {
+		static uint8_t entered = 0;
+		if (!entered) {
+			g_drone_status.drone_mode = 0;
+			entered = 1;
 		}
 
-	case STATE_MODE_SEL:
-		// 1. Set the initial status to 'Standby' or 'Disarmed'
-		g_drone_status.drone_mode = 0; // 0 = IDLE/DISARMED
 		telem_data.flight_mode = 0x06;
-		// 2. Check if a valid mode has been selected by the Ground Station
-		// (e.g., Mode 1 = Manual Level, Mode 2 = Mission)
-		if (g_drone_status.drone_mode != 0) {
-			printf("Handoff Complete. Mode %d Selected. Entering Main Loop.\r\n", g_drone_status.drone_mode);
 
-			// This is the variable the while() loop in main() is watching
-			StartControlState = STATE_MODE_SEL;
-		}
-		if (spi5_frame_done)
-		{
+		// 1) Process command first
+		if (spi5_frame_done) {
 			spi5_frame_done = 0;
 
 			uint8_t cmd_work_buf[sizeof(Telemetry_Packet_t)];
@@ -1314,14 +1400,32 @@ void start_control(void) {
 			memcpy(cmd_work_buf, spi_rx_buffer, sizeof(cmd_work_buf));
 			__enable_irq();
 
-			// Now it’s safe to re-arm (DMA can reuse spi_rx_buffer)
 			SPI5_ArmNextFrame();
 
-			// Only treat as command if it starts with '$'
 			if (cmd_work_buf[0] == '$') {
 				Process_TELEM_Command(cmd_work_buf, sizeof(cmd_work_buf));
 			}
 		}
+
+		if (tune_request) {
+			tune_request = 0;
+			entered = 0;
+
+			printf("MODE_SELECT -> STATE_TUNE\r\n");
+			StartControlState = STATE_TUNE;
+			break;
+		}
+
+		// 2) Then check if mode was selected
+		if (g_drone_status.drone_mode != 0) {
+			printf("Handoff Complete. Mode %d Selected. Entering Main Loop.\r\n", g_drone_status.drone_mode);
+			StartControlState = STATE_MODE_SEL_COMPLETE;
+			entered = 0; // optional: reset so next boot works
+		}
+		break;
+	}
+	case STATE_MODE_SEL_COMPLETE:
+		// do nothing
 		break;
 	}
 
@@ -1330,7 +1434,6 @@ static void SPI5_ArmNextFrame(void)
 {
 	// Ensure telemetry header/footer are always valid before TX
 	telem_data.header = 0xDEADBEEF;
-	telem_data.magic_footer = 0xAB;
 
 	// Clear RX buffer so stale junk doesn’t look like a command
 	spi_rx_buffer[0] = 0;
@@ -1344,7 +1447,6 @@ static void SPI5_ArmNextFrame(void)
 		// If it fails, you can light an LED or set an error flag
 		// printf("SPI5 DMA arm failed: %lu\r\n", hspi5.ErrorCode);
 	}
-
 	spi5_last_arm_tick = HAL_GetTick();
 }
 void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c) {
@@ -1370,7 +1472,24 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 
 	}
 }
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
+	if (hspi->Instance == SPI5) {
+		// 1. Clear the error flag (OVR, MODF, etc.)
+		// Note: HAL_SPI_IRQHandler already clears the hardware flags,
+		// but we must ensure the Handle State is reset to READY.
 
+		// 2. Force the state back to READY so we can restart
+		// (The HAL might leave it in HAL_SPI_STATE_ERROR)
+		if (hspi->State == HAL_SPI_STATE_ERROR) {
+			hspi->State = HAL_SPI_STATE_READY;
+		}
+
+		// 3. Restart the daisy chain!
+		// We use the same Arm function, but we might need a tiny delay
+		// or just fire it immediately.
+		SPI5_ArmNextFrame();
+	}
+}
 void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 	// 1. Create a local string copy so we don't mess with the DMA memory
 	char local_buf[sizeof(Telemetry_Packet_t) + 1];
@@ -1463,6 +1582,14 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 		}
 		memset(Buf, 0, Len);
 		memset(local_buf, 0, Len);
+	} else if (strstr(local_buf, "tune") != NULL || strstr(local_buf, "TUNE") != NULL) {
+
+
+		printf("CMD: TUNE requested\r\n");
+		tune_request = 1;
+
+		memset(Buf, 0, Len);
+		memset(local_buf, 0, Len);
 	}
 }
 /**
@@ -1529,60 +1656,68 @@ void Update_Pulse_Manager(void) {
 	}
 }
 
-void run_autotune_step(float *rate_setpoint, float current_rate) {
-	static uint32_t state_timer;
-	static TuneState_t state_tune = TUNE_IDLE;
-	static float max_rate_observed = 0;
+bool run_autotune_step(float *rate_setpoint, float current_rate)
+{
+	static uint32_t state_timer = 0;
+	static float max_rate_observed = 0.0f;
 
-	switch (state_tune) {
+	switch (state_tune)
+	{
 	case TUNE_IDLE:
+		*rate_setpoint = 0.0f;
 		if (tuning_triggered) {
+			tuning_triggered = 0;          // consume trigger
 			state_tune = TUNE_INJECT_PULSE;
 			state_timer = HAL_GetTick();
-			max_rate_observed = 0;
+			max_rate_observed = 0.0f;
 		}
-		break;
+		return false;
 
 	case TUNE_INJECT_PULSE:
-		*rate_setpoint = 20.0f; // The "Poke"
-		if (fabs(current_rate) > max_rate_observed) max_rate_observed = current_rate;
-
-		if (HAL_GetTick() - state_timer > 80) {
+		*rate_setpoint = 20.0f;            // poke
+		if (fabsf(current_rate) > fabsf(max_rate_observed)) {
+			max_rate_observed = current_rate;
+		}
+		if (HAL_GetTick() - state_timer >= 80) {
 			state_tune = TUNE_MEASURE_WAIT;
 			state_timer = HAL_GetTick();
 			*rate_setpoint = 0.0f;
 		}
-		break;
+		return false;
 
 	case TUNE_MEASURE_WAIT:
 		*rate_setpoint = 0.0f;
-		if (fabs(current_rate) > max_rate_observed) max_rate_observed = current_rate;
-
-		// Wait for movement to stop or timeout after 500ms
-		if (fabs(current_rate) < 1.0f || (HAL_GetTick() - state_timer > 500)) {
+		if (fabsf(current_rate) > fabsf(max_rate_observed)) {
+			max_rate_observed = current_rate;
+		}
+		if (fabsf(current_rate) < 1.0f || (HAL_GetTick() - state_timer >= 500)) {
 			state_tune = TUNE_CALCULATE;
 		}
-		break;
+		return false;
 
 	case TUNE_CALCULATE:
-		// This is where you'd log results:
-		// If max_rate_observed > 25, D is too low.
-		// If max_rate_observed < 15, P is too low.
+		// TODO: update PID gains based on max_rate_observed (or log it)
+		printf("TUNE: max_rate=%.2f deg/s\r\n", max_rate_observed);
 		state_tune = TUNE_COOLDOWN;
 		state_timer = HAL_GetTick();
-		break;
+		*rate_setpoint = 0.0f;
+		return false;
 
 	case TUNE_COOLDOWN:
 		*rate_setpoint = 0.0f;
-		// Force a 1-second "chill out" period so sensors settle
-		if (HAL_GetTick() - state_timer > 1000) {
+		if (HAL_GetTick() - state_timer >= 1000) {
 			state_tune = TUNE_IDLE;
-			tuning_triggered = 0; // Reset trigger
-			printf("Tune Cycle Complete. Max Rate: %.2f\r\n", max_rate_observed);
+			return true;                   // cycle done
 		}
-		break;
+		return false;
+
+	default:
+		state_tune = TUNE_IDLE;
+		*rate_setpoint = 0.0f;
+		return false;
 	}
 }
+
 
 void ESC_ArmAll(void) {
 	// Set all channels to 1000us (0%)
@@ -1602,7 +1737,6 @@ void ESC_ArmAll(void) {
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
 	// Wait for ESC Init Beeps (standard BLHeli startup is ~2-3 seconds)
-	HAL_Delay(3000);
 	is_system_armed = 1;
 	//IDLE Motors
 	target_throttle = 8;
@@ -1619,8 +1753,7 @@ void ESC_ArmAll(void) {
 }
 
 void Process_Lidar_DMA(void) {
-	uint8_t write_idx = (LIDAR_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx)) % LIDAR_BUF_SIZE;
-	telem_data.sensor_status |= 0x08;
+	uint8_t write_idx = (LIDAR_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx)) % LIDAR_BUF_SIZE;	telem_data.sensor_status |= 0x08;
 	while (lidar_read_idx != write_idx) {
 		uint8_t b = lidar_dma_buffer[lidar_read_idx];
 		switch(tf_state) {
