@@ -7,6 +7,7 @@
 extern droneState_t g_drone_status;
 
 static void Navigation_HandleArrival(MissionManager* mgr, float t, Waypoint* wp);
+void Navigation_TakeOff(MissionManager* mgr, float t);
 void Navigation_Advance(MissionManager* mgr, float t);
 void Navigation_GetTarget(MissionManager* mgr, float t, const vehicleState_t* state, targetState_t* target);
 
@@ -101,7 +102,9 @@ void Navigation_GetTarget(MissionManager* mgr, float t, const vehicleState_t* st
 
     mgr->prev_dist = remaining_dist;
 }
+void Navigation_TakeOff(MissionManager* mgr, float t){
 
+}
 static void Navigation_HandleArrival(MissionManager* mgr, float t, Waypoint* wp) {
 	if (wp->action == WP_ACTION_HOVER) {
 		g_drone_status.flight_mode = 2; // 2 = HOVERING

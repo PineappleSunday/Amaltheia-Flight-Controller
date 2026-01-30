@@ -30,6 +30,8 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+#define SPI_FRAME_LEN 40
 typedef struct __attribute__((packed)) {
 	uint32_t header; // 0xDEADBEEF
 	float timestamp;
@@ -48,7 +50,40 @@ typedef struct __attribute__((packed)) {
 	uint8_t motor4_T;
 	uint8_t sensor_status;
 	uint8_t magic_footer;
+	uint8_t pad[SPI_FRAME_LEN - (4 + 6*4 + 8)];
 } Telemetry_Packet_t;
+//_Static_assert(sizeof(Telemetry_Packet_t) == SPI_FRAME_LEN, "Telemetry frame != SPI_FRAME_LEN");
+
+typedef enum {
+	LOG_TYPE_NONE = 0,
+	LOG_TYPE_ROLL_RATE,   // Inner Loop Roll
+	LOG_TYPE_PITCH_RATE,  // Inner Loop Pitch
+	LOG_TYPE_YAW_RATE,    // Inner Loop Yaw
+	LOG_TYPE_ALT_VEL,     // Vertical Velocity Loop
+	LOG_TYPE_POS_X,       // Outer Loop Position X
+	LOG_TYPE_RAW_SENSORS  // Vibration Analysis
+} LogType_t;
+
+
+typedef struct __attribute__((packed)) {
+	uint32_t header;      // 0xCAFEBABE (Distinct from primary)
+	float timestamp;      // Sync with primary packet
+
+	// Generic Float Slots (Content depends on log_type)
+	float setpoint;       // What we want (e.g., Target Rate deg/s)
+	float measurement;    // What we have (e.g., Gyro Rate deg/s)
+	float error;          // setpoint - measurement
+	float p_term;         // Proportional Output
+	float i_term;         // Integral Output
+	float d_term;         // Derivative Output
+	float output_sum;     // Final PID output (to mixer)
+
+	uint8_t magic_footer; // 0xCD
+	uint8_t pad[SPI_FRAME_LEN - (4 + 4 + 7*4 + 1)];
+} Engineer_Packet_t;
+
+//_Static_assert(sizeof(Engineer_Packet_t)  == SPI_FRAME_LEN, "Engineer frame != SPI_FRAME_LEN");
+static volatile uint8_t spi5_need_rearm = 0;
 
 typedef enum {
 	STATE_INIT,
@@ -57,6 +92,14 @@ typedef enum {
 	STATE_MODE_SEL,
 	STATE_MODE_SEL_COMPLETE
 } StartControlState_t;
+
+typedef enum {
+	INIT,
+	SPOOLUP,
+	TAKEOFF,
+	TRANSISTION
+} takeoff_t;
+
 typedef enum {
 	AXIS_PITCH,
 	AXIS_ROLL,
@@ -83,6 +126,7 @@ volatile bool is_logging = false;
 // Now declare the actual variables
 StartControlState_t StartControlState = STATE_INIT;
 TuneState_t state_tune = TUNE_IDLE;
+takeoff_t takeoff_state = INIT;
 
 void Navigation_Init(MissionManager* mgr, Waypoint* waypoints, uint16_t count, const vehicleState_t* current_state) {
 	mgr->waypoints = waypoints;
@@ -166,10 +210,14 @@ volatile float target_throttle = 0.0f; // The throttle we want
 
 
 Telemetry_Packet_t telem_data;
+Engineer_Packet_t tune_pkt;
+uint8_t spi_rx_buffer[SPI_FRAME_LEN];
+uint8_t spi_tx_buf[SPI_FRAME_LEN];
+
 static volatile uint8_t spi5_frame_done = 0;
 static volatile uint32_t spi5_frame_counter = 0;
 static uint32_t spi5_last_arm_tick = 0;
-//uint8_t spi_rx_buffer[sizeof(Telemetry_Packet_t)];
+
 uint8_t command_ready = 0;
 float commandZ = 0;
 //volatile uint8_t spi5_busy = 0;
@@ -229,8 +277,8 @@ uint8_t lidar_read_idx = 0;
 volatile float range_dist_cm = 0.0f;
 
 // Telem Vars
-Telemetry_Packet_t telem_data;
-uint8_t spi_rx_buffer[sizeof(Telemetry_Packet_t)]; // For incoming commands from ESP8266
+
+
 
 // I2C LSM303 Globals
 
@@ -249,6 +297,7 @@ typedef enum {
 } i2c_state_t;
 
 volatile i2c_state_t i2c_state = I2C_IDLE;
+
 
 
 /* USER CODE END PV */
@@ -345,6 +394,9 @@ int main(void)
 	telem_data.armed = 0x00;
 	telem_data.flight_mode = 0x05;
 
+
+
+
 	// Fill with test pattern to verify DMA is reading memory
 	// memset(&telem_data.roll, 0xAA, 12);
 
@@ -392,6 +444,11 @@ int main(void)
 	PID_Reset(&pid_pitch_rate);
 	PID_Reset(&pid_yaw_rate);
 
+	SPI5_ArmNextFrame();
+
+	g_state.offGround = false;
+	float thurst_stand = 300.0f;
+	float flight_leg_height = 0.3f;
 
 	/* USER CODE END 2 */
 
@@ -400,31 +457,40 @@ int main(void)
 	while (1)
 	{
 
-		if (spi5_frame_done)
-		{
+		uint8_t do_rearm = 0;
+
+		if (spi5_need_rearm) {
+			spi5_need_rearm = 0;
+			do_rearm = 1;
+		}
+
+		if (spi5_frame_done) {
 			spi5_frame_done = 0;
 
-			uint8_t cmd_work_buf[sizeof(Telemetry_Packet_t)];
+			uint8_t cmd_work_buf[SPI_FRAME_LEN];
 			__disable_irq();
-			memcpy(cmd_work_buf, spi_rx_buffer, sizeof(cmd_work_buf));
+			memcpy(cmd_work_buf, spi_rx_buffer, SPI_FRAME_LEN);
 			__enable_irq();
 
-			// Now it’s safe to re-arm (DMA can reuse spi_rx_buffer)
-			SPI5_ArmNextFrame();
-
-			// Only treat as command if it starts with '$'
 			if (cmd_work_buf[0] == '$') {
-				Process_TELEM_Command(cmd_work_buf, sizeof(cmd_work_buf));
+				Process_TELEM_Command(cmd_work_buf, SPI_FRAME_LEN);
 			}
+
+			do_rearm = 1;
+		}
+
+		if (do_rearm) {
+			SPI5_ArmNextFrame();
 		}
 		// 1. Process Lidar
 		Process_Lidar_DMA();
 
 		uint32_t now = HAL_GetTick();
-		// 2. Run Control Loop at 100Hz (10ms)
-		if (now - main_last >= 10) {
+
+		// 2. Run Control Loop at 500Hz
+		if (now - main_last >= 2) {
 			float dt_sec = (now - main_last) / 1000.0f;
-			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.01f;
+			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.00f;
 			main_last = now;
 
 			LSM303_Process_DMA(&imu);
@@ -477,7 +543,51 @@ int main(void)
 			// 2. STATE ESTIMATION (AHRS & Kalman)
 			// This internally runs the Kalman Predict/Update and populates g_state
 			AHRS_Update(&raw_data, &g_state, dt_sec);
+			static uint32_t state_timer = 0;
+			if ((!g_state.offGround) && (is_system_armed)){
+				switch(takeoff_state) {
+				case INIT:
+					ESC_ArmAll();
+					state_timer = now;
+					takeoff_state = SPOOLUP;
+					break;
 
+				case SPOOLUP:
+					// Give motors 500ms to reach idle speed
+					ESC_SetThrottle(TIM_CHANNEL_1, 8.0f);
+					ESC_SetThrottle(TIM_CHANNEL_2, 8.0f);
+					ESC_SetThrottle(TIM_CHANNEL_3, 8.0f);
+					ESC_SetThrottle(TIM_CHANNEL_4, 8.0f);
+					if (now - state_timer > 500) {
+						state_timer = now;
+						takeoff_state = TAKEOFF;
+					}
+					break;
+
+				case TAKEOFF:
+					// CLOSED LOOP TAKEOFF: Use PID but with limited I-term
+					float base_throttle = 40.0f;
+					// Run your PID logic here so the drone stays level while rising!
+					g_target.rate_roll = 0.0f;
+					g_target.rate_pitch = 0.0f;
+					g_target.rate_yaw = 0.0f;
+					g_target.rate_roll = 0.0f;
+					g_target.rate_pitch = 0.0f;
+					g_target.rate_yaw = 0.0f;
+					ESC_SetThrottle(TIM_CHANNEL_1, base_throttle);
+					ESC_SetThrottle(TIM_CHANNEL_2, base_throttle);
+					ESC_SetThrottle(TIM_CHANNEL_3, base_throttle);
+					ESC_SetThrottle(TIM_CHANNEL_4, base_throttle);
+					if (g_state.z > flight_leg_height) {
+						takeoff_state = TRANSISTION;
+					}
+					break;
+
+				case TRANSISTION:
+					g_state.offGround = true; // Hand over to main flight controller
+					break;
+				}
+			}
 			// Update altitude in the state struct from Lidar (converted to meters)
 			g_state.z = range_dist_cm / 100.0f;
 
@@ -496,13 +606,14 @@ int main(void)
 				g_target.ff_vz = -descent_rate;
 
 				// Auto-disarm once on the ground
-				if (g_state.z <= 0.3f) {
+				if (g_state.z <= thurst_stand) {
 					PID_Reset(&pid_roll);
 					PID_Reset(&pid_pitch);
 					PID_Reset(&pid_yaw);
 					PID_Reset(&pid_pos_z);
 					PID_Reset(&pid_vel_z);
 					g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
+					g_state.offGround = false;
 					// Force immediate hardware override to 0%
 					for(int i = 1; i <= 4; i++) {
 						ESC_SetThrottle(get_timer_channel(i), 0.0f);
@@ -571,6 +682,20 @@ int main(void)
 
 			telem_data.magic_footer = 0xAB;       // UINT8
 			telem_data.header = 0xDEADBEEF;       // Redundant header as per your code
+
+			tune_pkt.header      = 0xCAFEBABE;
+			tune_pkt.timestamp   = dt_sec;
+			tune_pkt.setpoint    = g_target.rate_pitch;
+			tune_pkt.measurement = g_state.pitch_rate;
+			tune_pkt.error       = pid_pitch_rate.previous_error;
+			tune_pkt.p_term      = pid_pitch_rate.p_out;
+			tune_pkt.i_term      = pid_pitch_rate.i_out;
+			tune_pkt.d_term      = pid_pitch_rate.d_out;
+			tune_pkt.output_sum  = pid_pitch_rate.output;
+			tune_pkt.magic_footer = 0xCD;
+
+
+
 		}
 	}
 	/* USER CODE END WHILE */
@@ -1022,18 +1147,20 @@ void start_control(void) {
 	case STATE_INIT:
 		g_drone_status.flight_mode = 5;
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---
-		PID_Init(&pid_roll,  1.0f, 0.0f, 0.0f, 0.01f, 10.0f);
-		PID_Init(&pid_pitch, 1.0f, 0.0f, 0.0f, 0.01f, 10.0f);
-		PID_Init(&pid_yaw,   1.0f, 0.0f, 0.0f, 0.01f, 10.0f);
+		PID_Init(&pid_roll,  0.5f, 0.0f, 0.0f, 0.002f, 10.0f);
+		PID_Init(&pid_pitch, 0.5f, 0.0f, 0.0f, 0.002f, 10.0f);
+		PID_Init(&pid_yaw,   3.0f, 0.0f, 0.0f, 0.002f, 10.0f);
 
-		PID_Init(&pid_roll_rate, 0.1f, 0.0f, 0.01f, 0.01f, 10.0f);
-		PID_Init(&pid_pitch_rate, 0.1f, 0.0f, 0.01f, 0.01f, 10.0f);
-		PID_Init(&pid_yaw_rate, 0.1f, 0.0f, 0.01f, 0.01f, 10.0f);
+		PID_Init(&pid_roll_rate, 0.07f, 0.15f, 0.005f, 0.000f, 0.5f);
+		PID_Init(&pid_pitch_rate, 0.07f, 0.15f, 0.005f, 0.000f, 0.5f);
+		PID_Init(&pid_yaw_rate, 0.25f, 0.15f, 0.000f, 0.002f, 0.3f);
 
-		PID_Init(&pid_pos_z, 1.5f, 0.0f, 0.0f, 0.01f, 0.0f);   // Position P gain
-		PID_Init(&pid_vel_z, 2.0f, 0.5f, 0.1f, 0.01f, 50.0f); // Velocity PID with I-limit
+		PID_Init(&pid_pos_z, 1.5f, 0.0f, 0.0f, 0.002f, 0.0f);   // Position P gain
+		PID_Init(&pid_vel_z, 2.0f, 1.0f, 0.5f, 0.002f, 50.0f); // Velocity PID with I-limit
 
-
+		float d_alpha = PID_Calculate_Alpha(20.0f, 0.002f);
+		pid_roll_rate.d_low_pass_alpha = d_alpha;
+		pid_pitch_rate.d_low_pass_alpha = d_alpha;
 
 		Kalman_Init(&kf_roll,  0.003f, 0.03f);
 		Kalman_Init(&kf_pitch, 0.003f, 0.03f);
@@ -1055,7 +1182,7 @@ void start_control(void) {
 		printf("SPI5 DMA armed (per-frame mode)\r\n");
 		// --- 2. HARDWARE INITIALIZATION LOOP ---
 		uint8_t sensorInit = 0;
-
+		uint8_t cal_samples = 0;
 		while (sensorInit == 0)
 		{
 			g_drone_status.flight_mode = 5;
@@ -1074,9 +1201,9 @@ void start_control(void) {
 			{
 				spi5_frame_done = 0;
 
-				uint8_t cmd_work_buf[sizeof(Telemetry_Packet_t)];
+				uint8_t cmd_work_buf[SPI_FRAME_LEN];
 				__disable_irq();
-				memcpy(cmd_work_buf, spi_rx_buffer, sizeof(cmd_work_buf));
+				memcpy(cmd_work_buf, spi_rx_buffer, SPI_FRAME_LEN);
 				__enable_irq();
 
 				// Now it’s safe to re-arm (DMA can reuse spi_rx_buffer)
@@ -1084,10 +1211,13 @@ void start_control(void) {
 
 				// Only treat as command if it starts with '$'
 				if (cmd_work_buf[0] == '$') {
-					Process_TELEM_Command(cmd_work_buf, sizeof(cmd_work_buf));
+					Process_TELEM_Command(cmd_work_buf, SPI_FRAME_LEN);
 				}
 			}
-
+			if (spi5_need_rearm) {
+				spi5_need_rearm = 0;
+				SPI5_ArmNextFrame();
+			}
 
 			// 3. Update data only if the hardware has provided a fresh packet
 			if (imu.accel_ready) {
@@ -1125,8 +1255,28 @@ void start_control(void) {
 				// This bit confirms we are receiving data packets
 				telem_data.sensor_status |= 0x10; // Let's use Bit 4 (0x10) for Mag Health
 			}
+			// Inside while(sensorInit == 0)
+			if (!g_offsets.is_calibrated && cal_samples < 200) {
+			    // 1. Accumulate raw gyro data
+			    static float r_sum = 0, p_sum = 0, y_sum = 0;
+
+			    r_sum += raw_data.gy;
+			    p_sum += raw_data.gx;
+			    y_sum += (-raw_data.gz);
+
+			    cal_samples++;
+			    HAL_Delay(10); // Maintain 100Hz timing for calibration
+
+			    if (cal_samples == 200) {
+			    	g_offsets.roll_bias  = r_sum / 200.0f;
+			    	g_offsets.pitch_bias = p_sum / 200.0f;
+			    	g_offsets.yaw_bias   = y_sum / 200.0f;
+			    	g_offsets.is_calibrated = true;
+			    }
+			}
+
 			// 4. Verification Gate
-			if (telem_data.sensor_status == 0x1B) { // 0x1B = Mag + Lidar + Accel + Gyro
+			if ((telem_data.sensor_status == 0x1B) && (g_offsets.is_calibrated)) { // 0x1B = Mag + Lidar + Accel + Gyro
 
 				// Gravity Vector Check
 				float accel_mag = sqrtf(raw_data.ax*raw_data.ax + raw_data.ay*raw_data.ay + raw_data.az*raw_data.az);
@@ -1360,26 +1510,26 @@ void start_control(void) {
 	case STATE_DATA_DUMP:
 	{
 		telem_data.flight_mode = 254;
-	    uint32_t now = HAL_GetTick();
-	    if (now - last >= 10) {
-	        last = now;
+		uint32_t now = HAL_GetTick();
+		if (now - last >= 10) {
+			last = now;
 
-	        telem_data.timestamp   = (float)dump_idx;
-	        telem_data.pitch       = gyro_log[dump_idx];
-	        telem_data.voltage     = target_log[dump_idx];
-	        telem_data.flight_mode = 0xFE;
+			telem_data.timestamp   = (float)dump_idx;
+			telem_data.pitch       = gyro_log[dump_idx];
+			telem_data.voltage     = target_log[dump_idx];
+			telem_data.flight_mode = 0xFE;
 
-	        SPI5_ArmNextFrame();
+			SPI5_ArmNextFrame();
 
-	        dump_idx++;
+			dump_idx++;
 
-	        if (dump_idx >= TUNE_LOG_SIZE) {
-	            dump_idx = 0;
-	            printf("Dump Complete. Transitioning to Mode Selection.\r\n");
-	            StartControlState = STATE_MODE_SEL;
-	        }
-	    }
-	    break;
+			if (dump_idx >= TUNE_LOG_SIZE) {
+				dump_idx = 0;
+				printf("Dump Complete. Transitioning to Mode Selection.\r\n");
+				StartControlState = STATE_MODE_SEL;
+			}
+		}
+		break;
 	}
 
 	case STATE_MODE_SEL: {
@@ -1387,24 +1537,34 @@ void start_control(void) {
 		if (!entered) {
 			g_drone_status.drone_mode = 0;
 			entered = 1;
+			SPI5_ArmNextFrame();
 		}
 
 		telem_data.flight_mode = 0x06;
-
+		uint8_t do_rearm = 0;
 		// 1) Process command first
+		if (spi5_need_rearm) {
+			spi5_need_rearm = 0;
+			do_rearm = 1;
+		}
+
 		if (spi5_frame_done) {
 			spi5_frame_done = 0;
 
-			uint8_t cmd_work_buf[sizeof(Telemetry_Packet_t)];
+			uint8_t cmd_work_buf[SPI_FRAME_LEN];
 			__disable_irq();
-			memcpy(cmd_work_buf, spi_rx_buffer, sizeof(cmd_work_buf));
+			memcpy(cmd_work_buf, spi_rx_buffer, SPI_FRAME_LEN);
 			__enable_irq();
 
-			SPI5_ArmNextFrame();
-
 			if (cmd_work_buf[0] == '$') {
-				Process_TELEM_Command(cmd_work_buf, sizeof(cmd_work_buf));
+				Process_TELEM_Command(cmd_work_buf, SPI_FRAME_LEN);
 			}
+
+			do_rearm = 1;
+		}
+
+		if (do_rearm) {
+			SPI5_ArmNextFrame();
 		}
 
 		if (tune_request) {
@@ -1432,23 +1592,36 @@ void start_control(void) {
 }
 static void SPI5_ArmNextFrame(void)
 {
-	// Ensure telemetry header/footer are always valid before TX
-	telem_data.header = 0xDEADBEEF;
 
-	// Clear RX buffer so stale junk doesn’t look like a command
-	spi_rx_buffer[0] = 0;
+    // --------------------------------
 
-	// Start one DMA transaction for exactly one frame
-	if (HAL_SPI_TransmitReceive_DMA(&hspi5,
-			(uint8_t*)&telem_data,
-			spi_rx_buffer,
-			sizeof(Telemetry_Packet_t)) != HAL_OK)
-	{
-		// If it fails, you can light an LED or set an error flag
-		// printf("SPI5 DMA arm failed: %lu\r\n", hspi5.ErrorCode);
-	}
-	spi5_last_arm_tick = HAL_GetTick();
+    // 2. RE-INIT HEADERS (You MUST do this every frame)
+    telem_data.header = 0xDEADBEEF;
+    telem_data.magic_footer = 0xAB;
+
+    tune_pkt.header = 0xCAFEBABE;
+    tune_pkt.magic_footer = 0xCD;
+
+    // 3. Clear RX buffer
+    spi_rx_buffer[0] = 0;
+
+    // 5. Arm the DMA
+    HAL_StatusTypeDef status = HAL_SPI_TransmitReceive_DMA(&hspi5,
+    		(uint8_t*)&telem_data,
+            spi_rx_buffer,
+            SPI_FRAME_LEN);
+
+    // 6. VISUAL DEBUG
+    if (status != HAL_OK) {
+        // If this lights up, the OVR clear didn't work or DMA is broken
+        HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_SET);
+    } else {
+        HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_RESET);
+    }
+
+    spi5_last_arm_tick = HAL_GetTick();
 }
+
 void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c) {
 	if (hi2c == &hi2c1) {
 		LSM303_XferCpltCallback(&imu, false); // false = This was a Transmit (TX)
@@ -1472,32 +1645,25 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 
 	}
 }
-void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
 	if (hspi->Instance == SPI5) {
-		// 1. Clear the error flag (OVR, MODF, etc.)
-		// Note: HAL_SPI_IRQHandler already clears the hardware flags,
-		// but we must ensure the Handle State is reset to READY.
-
-		// 2. Force the state back to READY so we can restart
-		// (The HAL might leave it in HAL_SPI_STATE_ERROR)
+		// Force READY so HAL will accept a restart later
 		if (hspi->State == HAL_SPI_STATE_ERROR) {
 			hspi->State = HAL_SPI_STATE_READY;
 		}
-
-		// 3. Restart the daisy chain!
-		// We use the same Arm function, but we might need a tiny delay
-		// or just fire it immediately.
-		SPI5_ArmNextFrame();
+		spi5_need_rearm = 1;
 	}
 }
+
 void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 	// 1. Create a local string copy so we don't mess with the DMA memory
-	char local_buf[sizeof(Telemetry_Packet_t) + 1];
-	memcpy(local_buf, Buf, (Len > sizeof(Telemetry_Packet_t)) ? sizeof(Telemetry_Packet_t) : Len);
-	local_buf[sizeof(Telemetry_Packet_t)] = '\0'; // Force null termination
-	// If the buffer is floating high (0xFF) or empty, ignore it
-	if (local_buf[0] == 0xFF || local_buf[0] == 0x00) return;
-	// 2. Check for empty buffer - if byte 0 is 0, nothing new arrived
+	char local_buf[SPI_FRAME_LEN + 1];
+	uint32_t n = (Len > SPI_FRAME_LEN) ? SPI_FRAME_LEN : Len;
+	memcpy(local_buf, Buf, n);
+	local_buf[n] = '\0';
+
+	if (local_buf[0] == (char)0xFF || local_buf[0] == 0x00) return;
 	if (local_buf[0] == 0) return;
 
 	last_heartbeat_tick = HAL_GetTick();
@@ -1737,6 +1903,7 @@ void ESC_ArmAll(void) {
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
 	// Wait for ESC Init Beeps (standard BLHeli startup is ~2-3 seconds)
+	HAL_Delay(3000);
 	is_system_armed = 1;
 	//IDLE Motors
 	target_throttle = 8;
@@ -1749,6 +1916,7 @@ void ESC_ArmAll(void) {
 	telem_data.motor2_T = target_throttle;
 	telem_data.motor3_T = target_throttle;
 	telem_data.motor4_T = target_throttle;
+	HAL_Delay(3000);
 
 }
 

@@ -9,11 +9,17 @@ extern Kalman_t kf_roll;
 extern Kalman_t kf_pitch;
 extern Kalman_t kf_yaw;
 
+
+AHRS_Offsets_t g_offsets = {0.0f, 0.0f, 0.0f, false};
+
+
 static float wrap_deg(float a) {
-    a = fmodf(a + 180.0f, 360.0f);
-    if (a < 0) a += 360.0f;
-    return a - 180.0f;
+	a = fmodf(a + 180.0f, 360.0f);
+	if (a < 0) a += 360.0f;
+	return a - 180.0f;
 }
+
+float bias_roll = 0, bias_pitch = 0, bias_yaw = 0;
 
 /**
  * @brief Performs sensor fusion to update the global VehicleState.
@@ -21,12 +27,13 @@ static float wrap_deg(float a) {
  */
 void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 {
-	/* -------------------------------------------------
+	/* ---------
+	 * ----------------------------------------
 	 * 1. Gyro axis mapping (matches working main.c)
 	 * ------------------------------------------------- */
-	float gx =  raw->gy;
-	float gy =  raw->gx;
-	float gz = -raw->gz;
+	float gx = raw->gy - g_offsets.roll_bias;
+	float gy = raw->gx - g_offsets.pitch_bias;
+	float gz = (-raw->gz) - g_offsets.yaw_bias;
 
 	Kalman_Predict(&kf_roll,  gx, dt);
 	Kalman_Predict(&kf_pitch, gy, dt);
@@ -36,11 +43,11 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	 * 2. Accelerometer observation (DO NOT TOUCH)
 	 * ------------------------------------------------- */
 	float accel_roll =
-	    atan2f(raw->ay, raw->az) * 57.29578f;
+			atan2f(raw->ay, raw->az) * 57.29578f;
 
 	float accel_pitch =
-	    atan2f(-raw->ax,
-	           sqrtf(raw->ay*raw->ay + raw->az*raw->az)) * 57.29578f;
+			atan2f(-raw->ax,
+					sqrtf(raw->ay*raw->ay + raw->az*raw->az)) * 57.29578f;
 
 	/* -------------------------------------------------
 	 * 3. Magnetometer (tilt compensated yaw)
@@ -54,7 +61,7 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 
 	float By = my * cosf(phi) - mz * sinf(phi);
 	float Bx = mx * cosf(theta) +
-	           (my * sinf(phi) + mz * cosf(phi)) * sinf(theta);
+			(my * sinf(phi) + mz * cosf(phi)) * sinf(theta);
 
 	float mag_yaw = atan2f(-By, Bx) * 57.29578f;
 
@@ -80,3 +87,4 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	state->pitch_rate = gy;
 	state->yaw_rate   = gz;
 }
+

@@ -19,6 +19,7 @@ typedef struct {
     // Add these for the Rate PID
     float gyro_x, gyro_y, gyro_z;
     float roll_rate, pitch_rate, yaw_rate;
+    bool offGround;
 } vehicleState_t;
 
 // Desired State (from Navigation/Mission Manager)

@@ -6,7 +6,17 @@
 
 #include <stdint.h>
 #include "state.h"
+#include <stdbool.h>
 
+typedef struct {
+    float roll_bias;
+    float pitch_bias;
+    float yaw_bias;
+    bool is_calibrated;
+} AHRS_Offsets_t;
+
+// This tells main.c "There is a variable named g_offsets defined somewhere else"
+extern AHRS_Offsets_t g_offsets;
 /**
  * @brief Raw and processed sensor data from the IMU.
  */
