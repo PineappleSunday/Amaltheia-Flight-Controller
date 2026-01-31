@@ -1,0 +1,41 @@
+# ========================
+# Build artifacts
+# ========================
+Debug/
+Release/
+build/
+
+*.o
+*.a
+*.elf
+*.map
+*.d
+*.su
+*.cyclo
+*.lst
+
+# ========================
+# CubeIDE metadata
+# ========================
+.settings/
+*.launch
+
+# ========================
+# VSCode / IDE noise
+# ========================
+.vscode/
+*.code-workspace
+
+# ========================
+# OS junk
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# Python plots / logs
+# ========================
+*.csv
+*.log
+__pycache__/
+*.pyc
