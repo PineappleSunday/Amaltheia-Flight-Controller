@@ -1,2 +1,3 @@
-../FlightControl/flight_logic.c:16:6:FlightLogic_Update	1
-../FlightControl/flight_logic.c:50:7:wrap_deg	3
+../FlightControl/flight_logic.c:16:7:clampf	3
+../FlightControl/flight_logic.c:23:6:FlightLogic_Update	3
+../FlightControl/flight_logic.c:83:7:wrap_deg	3

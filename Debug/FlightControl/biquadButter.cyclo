@@ -1,0 +1,3 @@
+../FlightControl/biquadButter.c:10:6:Biquad_Init	2
+../FlightControl/biquadButter.c:17:7:Biquad_Process	1
+../FlightControl/biquadButter.c:30:6:Biquad_Set_Lowpass	1

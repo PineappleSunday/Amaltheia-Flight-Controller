@@ -6,6 +6,7 @@
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
 ../FlightControl/AHRS.c \
+../FlightControl/biquadButter.c \
 ../FlightControl/flight_logic.c \
 ../FlightControl/mixer.c \
 ../FlightControl/navigation.c \
@@ -13,6 +14,7 @@ C_SRCS += \
 
 OBJS += \
 ./FlightControl/AHRS.o \
+./FlightControl/biquadButter.o \
 ./FlightControl/flight_logic.o \
 ./FlightControl/mixer.o \
 ./FlightControl/navigation.o \
@@ -20,6 +22,7 @@ OBJS += \
 
 C_DEPS += \
 ./FlightControl/AHRS.d \
+./FlightControl/biquadButter.d \
 ./FlightControl/flight_logic.d \
 ./FlightControl/mixer.d \
 ./FlightControl/navigation.d \
@@ -33,7 +36,7 @@ FlightControl/%.o FlightControl/%.su FlightControl/%.cyclo: ../FlightControl/%.c
 clean: clean-FlightControl
 
 clean-FlightControl:
-	-$(RM) ./FlightControl/AHRS.cyclo ./FlightControl/AHRS.d ./FlightControl/AHRS.o ./FlightControl/AHRS.su ./FlightControl/flight_logic.cyclo ./FlightControl/flight_logic.d ./FlightControl/flight_logic.o ./FlightControl/flight_logic.su ./FlightControl/mixer.cyclo ./FlightControl/mixer.d ./FlightControl/mixer.o ./FlightControl/mixer.su ./FlightControl/navigation.cyclo ./FlightControl/navigation.d ./FlightControl/navigation.o ./FlightControl/navigation.su ./FlightControl/state.cyclo ./FlightControl/state.d ./FlightControl/state.o ./FlightControl/state.su
+	-$(RM) ./FlightControl/AHRS.cyclo ./FlightControl/AHRS.d ./FlightControl/AHRS.o ./FlightControl/AHRS.su ./FlightControl/biquadButter.cyclo ./FlightControl/biquadButter.d ./FlightControl/biquadButter.o ./FlightControl/biquadButter.su ./FlightControl/flight_logic.cyclo ./FlightControl/flight_logic.d ./FlightControl/flight_logic.o ./FlightControl/flight_logic.su ./FlightControl/mixer.cyclo ./FlightControl/mixer.d ./FlightControl/mixer.o ./FlightControl/mixer.su ./FlightControl/navigation.cyclo ./FlightControl/navigation.d ./FlightControl/navigation.o ./FlightControl/navigation.su ./FlightControl/state.cyclo ./FlightControl/state.d ./FlightControl/state.o ./FlightControl/state.su
 
 .PHONY: clean-FlightControl
 

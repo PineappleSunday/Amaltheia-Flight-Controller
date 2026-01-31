@@ -33,6 +33,8 @@ typedef struct {
     float previous_i;          // Required for the Integral term
     float previous_d_filtered; // Required for the Low Pass Filter iteration
 
+
+    float previous_actual; //Actual measurement
     // --- Telemetry & Debugging (Logging) ---
     // These allow you to see which term is causing motor heat or oscillation
     float p_out;               // Last calculated Proportional contribution

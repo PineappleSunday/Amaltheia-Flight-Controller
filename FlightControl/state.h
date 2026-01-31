@@ -7,6 +7,7 @@
 
 #define MODE_MANUAL_LEVEL  1  // Auto-level on, but user controls vertical
 #define MODE_MISSION       2  // Following your mission_plan[64] string
+#define MODE_THRUST_STAND  3
 
 #define SUBMODE_STABLE     0
 #define SUBMODE_TAKEOFF    1
@@ -20,13 +21,15 @@ typedef struct {
     float gyro_x, gyro_y, gyro_z;
     float roll_rate, pitch_rate, yaw_rate;
     bool offGround;
+    bool isTuning;
+    float dt_sec;
 } vehicleState_t;
 
 // Desired State (from Navigation/Mission Manager)
 typedef struct {
     float x, y, z, yaw;
     float roll, pitch;         // Target Angles
-    float rate_roll, rate_pitch, rate_yaw; // Target Rates (Add these!)
+    float rate_roll, rate_pitch, rate_yaw; // Target Rates
     float ff_vx, ff_vy, ff_vz;
 } targetState_t;
 

@@ -17,7 +17,7 @@ void PID_Init(PIDController* pid, float kp, float ki, float kd, float cycle_time
     pid->kd = kd;
     pid->cycle_time_seconds = cycle_time_seconds;
     pid->i_limit = i_limit;
-
+    pid->previous_actual = 0.0f;
     // Reset state
     PID_Reset(pid);
 }
@@ -44,10 +44,18 @@ float PID_Calculate(PIDController* pid, float actual, float goal) {
 
     // 3. Derivative term calculation
     // Calculate the raw derivative first
-    float D_raw = pid->kd * (error - pid->previous_error) / pid->cycle_time_seconds;
-    float D_final = D_raw;
+    //float D_raw = pid->kd * (error - pid->previous_error) / pid->cycle_time_seconds;
+
+    //Derivative on measurement
+    float dt = pid->cycle_time_seconds;
+    if (dt <= 0.0f) dt = 0.002f;
+    pid->cycle_time_seconds = dt;
+    if (dt <= 0.0f) dt = 0.002f;
+    float D_raw = -pid->kd * (actual - pid->previous_actual) / dt;
 
     // Apply Low Pass Filter if alpha is set (0.0 to 1.0)
+    float D_final = D_raw;   // default
+
     if (pid->d_low_pass_alpha > 0.0f && pid->d_low_pass_alpha < 1.0f) {
         D_final = (pid->d_low_pass_alpha * D_raw) +
                   ((1.0f - pid->d_low_pass_alpha) * pid->previous_d_filtered);
@@ -61,6 +69,7 @@ float PID_Calculate(PIDController* pid, float actual, float goal) {
     pid->previous_i = I;
     pid->previous_d_filtered = D_final; // Store filtered value for next iteration
 
+    pid->previous_actual = actual;
     // 6. Store Terms for Logging
     pid->p_out = P;
     pid->i_out = I;
