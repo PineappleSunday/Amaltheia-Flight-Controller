@@ -1,4 +1,0 @@
-../FlightControl/navigation.c:14:6:Navigation_GetTarget	64	static
-../FlightControl/navigation.c:105:6:Navigation_TakeOff	16	static
-../FlightControl/navigation.c:108:13:Navigation_HandleArrival	24	static
-../FlightControl/navigation.c:128:6:Navigation_Advance	24	static

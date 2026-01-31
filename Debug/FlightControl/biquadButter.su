@@ -1,3 +1,0 @@
-../FlightControl/biquadButter.c:10:6:Biquad_Init	24	static
-../FlightControl/biquadButter.c:17:7:Biquad_Process	24	static
-../FlightControl/biquadButter.c:30:6:Biquad_Set_Lowpass	48	static

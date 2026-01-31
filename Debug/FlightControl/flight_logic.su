@@ -1,3 +1,0 @@
-../FlightControl/flight_logic.c:16:7:clampf	24	static
-../FlightControl/flight_logic.c:23:6:FlightLogic_Update	72	static
-../FlightControl/flight_logic.c:83:7:wrap_deg	16	static
