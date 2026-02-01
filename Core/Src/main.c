@@ -438,9 +438,9 @@ int main(void)
 
 
 
-	PID_Reset(&pid_roll);
-	PID_Reset(&pid_pitch);
-	PID_Reset(&pid_yaw);
+	PID_Reset(&pid_roll_angle);
+	PID_Reset(&pid_pitch_angle);
+	PID_Reset(&pid_yaw_angle);
 	PID_Reset(&pid_pos_z);
 	PID_Reset(&pid_vel_z);
 	PID_Reset(&pid_roll_rate);
@@ -494,7 +494,7 @@ int main(void)
 		// 2. Run Control Loop at 500Hz
 		if (now - main_last >= 2) {
 			float dt_sec = (now - main_last) / 1000.0f;
-			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.00f;
+			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.002f;
 			main_last = now;
 			g_state.dt_sec = dt_sec;
 			LSM303_Process_DMA(&imu);
@@ -592,6 +592,14 @@ int main(void)
 					break;
 
 				case TRANSISTION:
+					PID_Reset(&pid_roll_angle);
+					PID_Reset(&pid_pitch_angle);
+					PID_Reset(&pid_yaw_angle);
+					PID_Reset(&pid_pos_z);
+					PID_Reset(&pid_vel_z);
+					PID_Reset(&pid_roll_rate);
+					PID_Reset(&pid_pitch_rate);
+					PID_Reset(&pid_yaw_rate);
 					g_state.offGround = true; // Hand over to main flight controller
 					break;
 				}
@@ -1169,8 +1177,8 @@ void start_control(void) {
 		pid_roll_rate.d_low_pass_alpha = d_alpha;
 		pid_pitch_rate.d_low_pass_alpha = d_alpha;
 
-		Kalman_Init(&kf_roll,  0.03f, 0.03f);
-		Kalman_Init(&kf_pitch, 0.03f, 0.03f);
+		Kalman_Init(&kf_roll,  0.03f, 1.0f);
+		Kalman_Init(&kf_pitch, 0.03f, 1.0f);
 		Kalman_Init(&kf_yaw,   0.005f, 0.1f);
 
 		// Setup filters for Roll, Pitch, and Yaw Gyros

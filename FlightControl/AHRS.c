@@ -2,6 +2,7 @@
 
 #include "AHRS.h"
 #include "kalman.h"
+#include <stdbool.h>
 #include <math.h>
 
 // Global Kalman instances defined in main.c
@@ -9,6 +10,7 @@ extern Kalman_t kf_roll;
 extern Kalman_t kf_pitch;
 extern Kalman_t kf_yaw;
 
+static bool accel_trust = true;
 
 AHRS_Offsets_t g_offsets = {0.0f, 0.0f, 0.0f, false};
 
@@ -27,10 +29,10 @@ float bias_roll = 0, bias_pitch = 0, bias_yaw = 0;
  */
 void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 {
-	/* ---------
-	 * ----------------------------------------
-	 * 1. Gyro axis mapping (matches working main.c)
-	 * ------------------------------------------------- */
+
+	if (dt < 0.001f) dt = 0.001f;
+	if (dt > 0.010f) dt = 0.010f;
+
 	float gx = raw->gy - g_offsets.roll_bias;
 	float gy = raw->gx - g_offsets.pitch_bias;
 	float gz = (-raw->gz) - g_offsets.yaw_bias;
@@ -42,12 +44,19 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	/* -------------------------------------------------
 	 * 2. Accelerometer observation (DO NOT TOUCH)
 	 * ------------------------------------------------- */
-	float accel_roll =
-			atan2f(raw->ay, raw->az) * 57.29578f;
+	float accel_roll  = atan2f(raw->ay, raw->az) * 57.29578f;
+	float accel_pitch = atan2f(-raw->ax, sqrtf(raw->ay*raw->ay + raw->az*raw->az)) * 57.29578f;
 
-	float accel_pitch =
-			atan2f(-raw->ax,
-					sqrtf(raw->ay*raw->ay + raw->az*raw->az)) * 57.29578f;
+	float a_mag = sqrtf(raw->ax*raw->ax + raw->ay*raw->ay + raw->az*raw->az);
+
+	// Hysteresis latch
+	static bool accel_trust = true;
+	float amag_err = fabsf(a_mag - 1.0f);
+	if (accel_trust) {
+		if (amag_err > 0.25f) accel_trust = false;
+	} else {
+		if (amag_err < 0.15f) accel_trust = true;
+	}
 
 	/* -------------------------------------------------
 	 * 3. Magnetometer (tilt compensated yaw)
@@ -71,9 +80,17 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	/* -------------------------------------------------
 	 * 4. Kalman updates
 	 * ------------------------------------------------- */
-	state->roll  = Kalman_Update(&kf_roll,  accel_roll);
-	state->pitch = Kalman_Update(&kf_pitch, accel_pitch);
-	state->yaw   = Kalman_Update(&kf_yaw,   mag_yaw);
+    if (accel_trust) {
+        state->roll  = Kalman_Update(&kf_roll,  accel_roll);
+        state->pitch = Kalman_Update(&kf_pitch, accel_pitch);
+    } else {
+        state->roll  = kf_roll.angle;
+        state->pitch = kf_pitch.angle;
+    }
+    float yaw_pred = kf_yaw.angle;
+    float yaw_err  = wrap_deg(mag_yaw - yaw_pred);
+    float yaw_meas = yaw_pred + yaw_err;
+    state->yaw = Kalman_Update(&kf_yaw, yaw_meas);
 
 	/* -------------------------------------------------
 	 * 5. Body rates (rad/s)
