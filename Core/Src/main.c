@@ -53,12 +53,22 @@ typedef struct __attribute__((packed)) {
 	float setpoint;       // What we want (e.g., Target Rate deg/s)
 	float measurement;    // What we have (e.g., Gyro Rate deg/s)
 	float error;          // setpoint - measurement
-	float p_term;         // Proportional Output
-	float i_term;         // Integral Output
-	float d_term;         // Derivative Output
+	float p_term;         // Proportional Output Pitch Rate
+	float i_term;         // Integral Output Pitch Rate
+	float d_term;         // Derivative Output Pitch Rate
 	float output_sum;     // Final PID output (to mixer)
+	int16_t cmd_roll_deg_x100;
+	int16_t cmd_pitch_deg_x100;
+	int16_t cmd_yaw_deg_x100;
+
+    uint8_t sat_flags;   // bits for motor hi/lo clamp or PID clamp
+
+    int16_t i_state;     // active integrator (or roll only)
+
+    int16_t gyro_p;      // deg/s*100
+    int16_t gyro_q;      // deg/s*100
+    int16_t gyro_r;      // deg/s*100
 	uint8_t magic_footer;
-	uint8_t pad[15];
 } Telemetry_Packet_t;
 _Static_assert(sizeof(Telemetry_Packet_t) == 80, "Telemetry Struct size mismatch!");
 
@@ -92,6 +102,9 @@ typedef enum {
 	TAKEOFF,
 	TRANSISTION
 } takeoff_t;
+float take_off_thrust = 50.0f;
+
+uint32_t takeoff_count = 1;
 
 typedef enum {
 	AXIS_PITCH,
@@ -324,6 +337,7 @@ bool run_autotune_step(float *rate_setpoint, float current_rate);
 
 /* Custom ESC Control Functions */
 void ESC_ArmAll(void);
+void ESC_Disarm(void);
 void ESC_SetThrottle(uint32_t channel, float percentage);
 uint32_t get_timer_channel(int motor_num);
 void Process_TELEM_Command(uint8_t* Buf, uint32_t Len);
@@ -452,6 +466,8 @@ int main(void)
 	g_state.offGround = false;
 	float thurst_stand = 300.0f;
 	float flight_leg_height = 0.3f;
+	static uint8_t takeoff_yaw_latched = 0;
+	static float takeoff_yaw = 0.0f;
 
 	/* USER CODE END 2 */
 
@@ -488,6 +504,7 @@ int main(void)
 		}
 		// 1. Process Lidar
 		Process_Lidar_DMA();
+		g_state.z = range_dist_cm / 100.0f;
 
 		uint32_t now = HAL_GetTick();
 
@@ -498,9 +515,10 @@ int main(void)
 			main_last = now;
 			g_state.dt_sec = dt_sec;
 			LSM303_Process_DMA(&imu);
+
 			// 1. DATA ACQUISITION
 			// Read raw sensor bits into your ahrsSensor_t struct
-
+			uint8_t control_ran_this_tick = 0;
 
 			// ACCELEROMETER Parsing
 			if (imu.accel_ready) {
@@ -553,14 +571,15 @@ int main(void)
 			// This internally runs the Kalman Predict/Update and populates g_state
 			AHRS_Update(&raw_data, &g_state, dt_sec);
 			static uint32_t state_timer = 0;
+
 			if ((!g_state.offGround) && (is_system_armed)){
 				switch(takeoff_state) {
 				case INIT:
 					g_drone_status.flight_mode = 8;
-					ESC_ArmAll();
 					PID_Reset(&pid_pos_z); // Clear old errors
 					PID_Reset(&pid_vel_z);
 					state_timer = now;
+					takeoff_yaw_latched = 0;
 					takeoff_state = SPOOLUP;
 					break;
 
@@ -577,19 +596,25 @@ int main(void)
 					break;
 
 				case TAKEOFF:
-					// CLOSED LOOP TAKEOFF: Use PID but with limited I-term
+				    if (!takeoff_yaw_latched) {
+				        takeoff_yaw = g_state.yaw;
+				        takeoff_yaw_latched = 1;
+				    }
 
-					// Run your PID logic here so the drone stays level while rising
-					g_target.roll = 0.0f;
-					g_target.pitch = 0.0f;
-					g_target.yaw = g_state.yaw;
+				    g_target.roll  = 0.0f;
+				    g_target.pitch = 0.0f;
+				    g_target.yaw   = takeoff_yaw;
 
-					FlightLogic_Update(&g_state, &g_target);
+				    // IMPORTANT: prevent second call later in loop
+				    control_ran_this_tick = 1;
 
-					if (g_state.z > flight_leg_height) {
-						takeoff_state = TRANSISTION;
-					}
-					break;
+				    if (g_state.z > flight_leg_height + 0.2f) {
+				        takeoff_state = TRANSISTION;
+				        takeoff_count = 0;
+				    } else {
+				    	takeoff_count++;
+				    }
+				    break;
 
 				case TRANSISTION:
 					PID_Reset(&pid_roll_angle);
@@ -601,11 +626,16 @@ int main(void)
 					PID_Reset(&pid_pitch_rate);
 					PID_Reset(&pid_yaw_rate);
 					g_state.offGround = true; // Hand over to main flight controller
+					takeoff_yaw_latched = 0;
+					g_drone_status.flight_mode = 0x08; //Stabilize
 					break;
 				}
 			}
-			// Update altitude in the state struct from Lidar (converted to meters)
-			g_state.z = range_dist_cm / 100.0f;
+			printf("IMU,%ld,AX=%f,AY=%f,AZ=%f,MX=%f,MY=%f,MZ=%f,GX=%f,GY=%f,GZ=%f\r\n",
+			       HAL_GetTick(),
+			       raw_data.ax, raw_data.ay, raw_data.az,
+			       raw_data.mx, raw_data.my, raw_data.mz,
+			       raw_data.gx, raw_data.gy, raw_data.gz);
 
 			// 3. NAVIGATION (Mission Manager)
 			// 2. MISSION LOGIC
@@ -622,7 +652,7 @@ int main(void)
 				g_target.ff_vz = -descent_rate;
 
 				// Auto-disarm once on the ground
-				if (g_state.z <= thurst_stand) {
+				if (g_state.z <= 300.0f){//flight_leg_height) {
 					PID_Reset(&pid_roll);
 					PID_Reset(&pid_pitch);
 					PID_Reset(&pid_yaw);
@@ -637,8 +667,9 @@ int main(void)
 					is_system_armed = 0;
 					is_estop_active = 0; // Reset for next boot
 				}
-			} else if (g_drone_status.drone_mode == MODE_MANUAL_LEVEL){
-				telem_data.flight_mode = 0x08;
+			} else if ((g_drone_status.drone_mode == MODE_MANUAL_LEVEL) && (takeoff_state != TAKEOFF)){
+				g_drone_status.flight_mode = 0x08; //Stabilize
+				g_drone_status.drone_mode = 1; // Signal Manual Mode
 				if (isnan(g_state.roll) || isnan(g_state.pitch) || isnan(g_state.yaw)) {
 					// Force reset the state so the math can recover
 					g_state.roll = 0.0f;
@@ -650,12 +681,14 @@ int main(void)
 					g_target.rate_pitch = 0.0f;
 					g_target.rate_yaw = 0.0f;
 				}
-				g_target.z = commandZ + 0.2;
-				g_drone_status.drone_mode = 1; // Signal Manual Mode
+				g_target.z = commandZ + flight_leg_height;
+
 			} else if (g_drone_status.drone_mode == MODE_MISSION) {
 				// Normal Navigation logic
 				g_drone_status.drone_mode = 2;
+				g_drone_status.flight_mode = 0x08; //Stabilize
 				Navigation_GetTarget(&g_mission, (float)now / 1000.0f, &g_state, &g_target);
+
 			} else if (g_drone_status.drone_mode == MODE_THRUST_STAND) {
 				g_drone_status.drone_mode = 3;
 				continue;
@@ -671,8 +704,7 @@ int main(void)
 				g_target.rate_yaw = 0.0f;
 			}
 			if (is_system_armed) {
-
-				FlightLogic_Update(&g_state, &g_target);
+			    telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target);
 			}
 			// Check if the system is disarmed AND if any motor has a non-zero throttle
 			else if (telem_data.motor1_T > 0 || telem_data.motor2_T > 0 ||
@@ -686,33 +718,34 @@ int main(void)
 
 			// 5. UPDATE TELEMETRY (Your Exact Atomic Block)
 			// Mapping g_state back to your required telemetry variables
-			telem_data.header = 0xDEADBEEF;       // UINT32
-			telem_data.timestamp = dt_sec;        // float 1
-			telem_data.roll = g_state.roll;       // float 2 (Estimated Roll)
-			telem_data.pitch = g_state.pitch;     // float 3 (Estimated Pitch)
-			telem_data.yaw = g_state.yaw;         // float 4 (Estimated Yaw)
-			telem_data.altitude = range_dist_cm;  // float 5 (Raw Lidar in cm)
-			telem_data.voltage = commandZ;           // float 6
-			telem_data.armed = is_system_armed ? 0xFF : 0x00;
+			telem_data.header 				= 0xDEADBEEF;       // UINT32
+			telem_data.timestamp 			= dt_sec;        // float 1
+			telem_data.roll 				= g_state.roll;       // float 2 (Estimated Roll)
+			telem_data.pitch 				= g_state.pitch;     // float 3 (Estimated Pitch)
+			telem_data.yaw 					= g_state.yaw;         // float 4 (Estimated Yaw)
+			telem_data.altitude 			= range_dist_cm;  // float 5 (Raw Lidar in cm)
+			telem_data.voltage 				= commandZ;           // float 6
+			telem_data.armed 				= is_system_armed ? 0xFF : 0x00;
 			// Map the modes to the telemetry packet
-			telem_data.drone_mode  = g_drone_status.drone_mode;
-			telem_data.flight_mode = g_drone_status.flight_mode;
-			telem_data.setpoint    = g_target.rate_pitch;
-			telem_data.measurement = g_state.pitch_rate;
-			telem_data.error       = pid_pitch_rate.previous_error;
-			telem_data.p_term      = pid_pitch_rate.p_out;
-			telem_data.i_term      = pid_pitch_rate.i_out;
-			telem_data.d_term      = pid_pitch_rate.d_out;
-			telem_data.output_sum  = pid_pitch_rate.output;
-			telem_data.magic_footer = 0xAB;       // UINT8
-			telem_data.header = 0xDEADBEEF;       // Redundant header as per your code
+			telem_data.drone_mode  			= g_drone_status.drone_mode;
+			telem_data.flight_mode 			= g_drone_status.flight_mode;
+			telem_data.setpoint    			= g_target.rate_pitch;
+			telem_data.measurement 			= g_state.pitch_rate;
+			telem_data.error       			= pid_pitch_rate.previous_error;
+			telem_data.p_term      			= pid_pitch_rate.p_out;
+			telem_data.i_term      			= pid_pitch_rate.i_out;
+			telem_data.d_term      			= pid_pitch_rate.d_out;
+			telem_data.output_sum  			= pid_pitch_rate.output;
+			telem_data.cmd_roll_deg_x100 	= (int16_t)(g_target.roll  * 100.0f);
+			telem_data.cmd_pitch_deg_x100 	= (int16_t)(g_target.pitch * 100.0f);
+			telem_data.cmd_yaw_deg_x100   	= (int16_t)(g_target.yaw   * 100.0f);
 
+			telem_data.i_state 				= (int16_t)(pid_pitch_rate.i_out * 100.0f);
 
-
-
-
-
-
+			telem_data.gyro_p 				= (int16_t)(g_state.roll_rate  * 100.0f);
+			telem_data.gyro_q 				= (int16_t)(g_state.pitch_rate * 100.0f);
+			telem_data.gyro_r 				= (int16_t)(g_state.yaw_rate   * 100.0f);
+			telem_data.magic_footer 		= 0xAB;       // UINT8
 		}
 	}
 	/* USER CODE END WHILE */
@@ -1162,16 +1195,16 @@ void start_control(void) {
 	case STATE_INIT:
 		g_drone_status.flight_mode = 5;
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---
-		PID_Init(&pid_roll_angle,  0.15f, 0.001f, 0.000f, 0.002f, 10.0f);
-		PID_Init(&pid_pitch_angle, 0.1f, 0.001f, 0.000f, 0.002f, 10.0f);
-		PID_Init(&pid_yaw_angle,   3.0f, 0.001f, 0.00f, 0.002f, 10.0f);
+		PID_Init(&pid_roll_angle,  0.15f, 0.003f, 0.002f, 0.002f, 10.0f);
+		PID_Init(&pid_pitch_angle, 0.1f, 0.003f, 0.002f, 0.002f, 10.0f);
+		PID_Init(&pid_yaw_angle,   1.0f, 0.000f, 0.000f, 0.002f, 10.0f);
 
 		PID_Init(&pid_roll_rate, 0.1f, 0.001f, 0.000f, 0.002f, 0.5f);
 		PID_Init(&pid_pitch_rate, 0.1f, 0.001f, 0.000f, 0.002f, 0.5f);
 		PID_Init(&pid_yaw_rate, 0.25f, 0.15f, 0.000f, 0.002f, 0.3f);
 
-		PID_Init(&pid_pos_z, 1.5f, 0.0f, 0.0f, 0.002f, 0.0f);   // Position P gain
-		PID_Init(&pid_vel_z, 2.0f, 1.0f, 0.5f, 0.002f, 50.0f); // Velocity PID with I-limit
+		PID_Init(&pid_pos_z, 0.75f, 0.0f, 0.0f, 0.002f, 0.0f);   // Position P gain
+		PID_Init(&pid_vel_z, 0.5f, 0.5f, 0.05f, 0.002f, 50.0f); // Velocity PID with I-limit
 
 		float d_alpha = PID_Calculate_Alpha(20.0f, 0.002f);
 		pid_roll_rate.d_low_pass_alpha = d_alpha;
@@ -1186,6 +1219,9 @@ void start_control(void) {
 		Biquad_Set_Lowpass(&filter_gyro_roll,  80.0f, 500.0f);
 		Biquad_Set_Lowpass(&filter_gyro_yaw,   80.0f, 500.0f);
 
+		// Turn off the ESC Beep...usafelly, but oh well
+		ESC_ArmAll();
+		ESC_Disarm();
 
 
 		// Accel/Mag (I2C1) - Configure Registers
@@ -1333,6 +1369,7 @@ void start_control(void) {
 			telem_data.magic_footer = 0xAB;       // UINT8
 			telem_data.header = 0xDEADBEEF;       // Redundant header as per your code
 		}
+
 		StartControlState = STATE_MODE_SEL;
 		break;
 
@@ -1469,7 +1506,7 @@ void start_control(void) {
 			// 4) CONTROL OUTPUT POLICY
 			// =========================
 			if (allow_motor_output) {
-				FlightLogic_Update(&g_state, &g_target);
+				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target);
 			} else {
 				// hard force motors to 0 while tuning (optional)
 				for (int i = 1; i <= 4; i++) {
@@ -1770,14 +1807,9 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
             }
             break;
 
-        case 'l': // --- ALTITUDE (Matches 'alt' via first letter 'l' if we shift)
-            if (strstr(cmd, "alt") != NULL) {
-                char* t_ptr = strchr(cmd, 't');
-                g_drone_status.drone_mode = 1; // Manual Level
-                if (t_ptr != NULL) {
-                    commandZ = (strtof(t_ptr + 1, NULL) / 100.0f) * 2.0f;
-                }
-            }
+        case 'z': case 'Z':
+            g_drone_status.drone_mode = 1;
+            commandZ = (strtof(cmd + 1, NULL) / 100.0f) * 2.0f;
             break;
 
         case 't': // --- TUNE ---
@@ -1949,7 +1981,17 @@ void ESC_ArmAll(void) {
 	HAL_Delay(3000);
 
 }
-
+void ESC_Disarm(void) {
+	// Turn off the ESC Beep
+	g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
+	g_state.offGround = false;
+	// Force immediate hardware override to 0%
+	for(int i = 1; i <= 4; i++) {
+		ESC_SetThrottle(get_timer_channel(i), 0.0f);
+	}
+	is_system_armed = 0;
+	HAL_Delay(100);
+}
 void Process_Lidar_DMA(void) {
 	uint8_t write_idx = (LIDAR_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx)) % LIDAR_BUF_SIZE;	telem_data.sensor_status |= 0x08;
 	while (lidar_read_idx != write_idx) {

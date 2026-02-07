@@ -7,6 +7,6 @@
 
 #include <stdint.h>
 
-void Mixer_Apply(float thrust, float roll, float pitch, float yaw, float* motor_percentages);
+uint8_t Mixer_Apply(float thrust, float roll, float pitch, float yaw, float* motor_percentages);
 
 #endif // MIXER_H

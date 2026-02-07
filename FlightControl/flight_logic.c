@@ -20,7 +20,8 @@ float clampf(float x, float lo, float hi)
     return x;
 }
 
-void FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
+uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
+	uint8_t sat = 0;
 
 	float dt = state->dt_sec; // from MCU_dT seconds, clamped
 	dt = clampf(dt, 0.001f, 0.01f);
@@ -43,9 +44,9 @@ void FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
 	// 2. BASE THRUST SELECTION
 	float base_thrust = 0.0f;
 	if (state->offGround == false) { // Fixed: Use state instance, not type name
-		base_thrust = 40.0f;        // Controlled takeoff thrust
+		base_thrust = 65.0f;        // Controlled takeoff thrust
 	} else {
-		base_thrust = 30.0f + thrust_adj; // Normal hover/NAV thrust
+		base_thrust = 40.0f + thrust_adj; // Normal hover/NAV thrust
 	}
 
 	// 2. ATTITUDE OUTER LOOP (Angle -> Rate)
@@ -71,13 +72,15 @@ void FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
 
 	// 4. MOTOR MIXING (Plus Configuration)
 	float motor_pcts[4];
-	Mixer_Apply(base_thrust, roll_torque, pitch_torque, yaw_torque, motor_pcts);
+	sat = Mixer_Apply(base_thrust, roll_torque, pitch_torque, yaw_torque, motor_pcts);
 
 	// 5. HARDWARE ACTUATION
 	ESC_SetThrottle(TIM_CHANNEL_1, motor_pcts[0]); // Front
 	ESC_SetThrottle(TIM_CHANNEL_2, motor_pcts[1]); // Right
 	ESC_SetThrottle(TIM_CHANNEL_3, motor_pcts[2]); // Rear
 	ESC_SetThrottle(TIM_CHANNEL_4, motor_pcts[3]); // Left
+
+	return sat;
 }
 
 float wrap_deg(float a) {
