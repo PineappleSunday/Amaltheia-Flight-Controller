@@ -15,7 +15,6 @@
 #include "lsm303.h"
 #include "i3gd20.h"
 #include "PID.h"
-#include "kalman.h"
 #include <math.h>
 #include <stdio.h>   // For printf
 #include <stdlib.h>  // For atof, atoi
@@ -246,10 +245,6 @@ uint8_t tf_state = 0;
 uint8_t tf_buf[9];
 uint8_t tf_idx = 0;
 uint16_t tf_checksum = 0;
-
-Kalman_t kf_roll;
-Kalman_t kf_pitch;
-Kalman_t kf_yaw;
 
 static ahrsSensor_t raw_data;
 
@@ -1278,9 +1273,7 @@ void start_control(void) {
 		pid_roll_rate.d_low_pass_alpha = d_alpha;
 		pid_pitch_rate.d_low_pass_alpha = d_alpha;
 
-		Kalman_Init(&kf_roll,  0.03f, 1.0f);
-		Kalman_Init(&kf_pitch, 0.03f, 1.0f);
-		Kalman_Init(&kf_yaw,   0.005f, 0.1f);
+		AHRS_Init();
 
 		// Setup filters for Roll, Pitch, and Yaw Gyros
 		Biquad_Set_Lowpass(&filter_gyro_pitch, 80.0f, 500.0f);
@@ -1389,9 +1382,11 @@ void start_control(void) {
 				// 1. Accumulate raw gyro data
 				static float r_sum = 0, p_sum = 0, y_sum = 0;
 
-				r_sum += raw_data.gy;
+				// Keep bias accumulation in the same mapped frame used by AHRS:
+				// body rates = [-Gy, Gx, Gz]
+				r_sum += (-raw_data.gy);
 				p_sum += raw_data.gx;
-				y_sum += (-raw_data.gz);
+				y_sum += raw_data.gz;
 
 				cal_samples++;
 				HAL_Delay(10); // Maintain 100Hz timing for calibration

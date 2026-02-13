@@ -8,6 +8,16 @@
 #include "state.h"
 #include <stdbool.h>
 
+#ifndef AHRS_MADGWICK_BETA
+#define AHRS_MADGWICK_BETA 0.06f
+#endif
+
+// Set to 1 if accel axes must be mapped with the same transform as gyro:
+// [ax_body, ay_body, az_body] = [-ay_sensor, ax_sensor, az_sensor]
+#ifndef AHRS_MAP_ACCEL_WITH_GYRO_FRAME
+#define AHRS_MAP_ACCEL_WITH_GYRO_FRAME 1
+#endif
+
 typedef struct {
     float roll_bias;
     float pitch_bias;
@@ -37,5 +47,6 @@ typedef struct {
 // Function prototypes
 void AHRS_Init(void);
 void AHRS_Update(ahrsSensor_t* raw_data, vehicleState_t* state, float dt);
+void AHRS_SetBeta(float beta);
 
 #endif // AHRS_H

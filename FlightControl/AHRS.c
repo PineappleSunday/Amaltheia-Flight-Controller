@@ -1,113 +1,197 @@
-// AHRS.c
-
 #include "AHRS.h"
-#include "kalman.h"
 #include <stdbool.h>
 #include <math.h>
 
-// Global Kalman instances defined in main.c
-extern Kalman_t kf_roll;
-extern Kalman_t kf_pitch;
-extern Kalman_t kf_yaw;
-
-static bool accel_trust = true;
-
 AHRS_Offsets_t g_offsets = {0.0f, 0.0f, 0.0f, false};
+static bool accel_trust = true;
+static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // [w, x, y, z]
+static float beta = AHRS_MADGWICK_BETA;
 
-
-static float wrap_deg(float a) {
-	a = fmodf(a + 180.0f, 360.0f);
-	if (a < 0) a += 360.0f;
-	return a - 180.0f;
+static float wrap_deg(float a)
+{
+    a = fmodf(a + 180.0f, 360.0f);
+    if (a < 0) a += 360.0f;
+    return a - 180.0f;
 }
 
-float bias_roll = 0, bias_pitch = 0, bias_yaw = 0;
+static float clampf(float x, float lo, float hi)
+{
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static float vec3_norm(float x, float y, float z)
+{
+    return sqrtf(x * x + y * y + z * z);
+}
+
+static void quat_normalize(float* qv)
+{
+    float n = sqrtf(qv[0] * qv[0] + qv[1] * qv[1] + qv[2] * qv[2] + qv[3] * qv[3]);
+    if (n < 1e-9f) {
+        qv[0] = 1.0f;
+        qv[1] = 0.0f;
+        qv[2] = 0.0f;
+        qv[3] = 0.0f;
+        return;
+    }
+    qv[0] /= n;
+    qv[1] /= n;
+    qv[2] /= n;
+    qv[3] /= n;
+}
+
+static void quat_to_euler_deg(const float* qv, float* roll_deg, float* pitch_deg, float* yaw_deg)
+{
+    const float q0 = qv[0], q1 = qv[1], q2 = qv[2], q3 = qv[3];
+
+    float sinr_cosp = 2.0f * (q0 * q1 + q2 * q3);
+    float cosr_cosp = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
+    float roll = atan2f(sinr_cosp, cosr_cosp);
+
+    float sinp = 2.0f * (q0 * q2 - q3 * q1);
+    sinp = clampf(sinp, -1.0f, 1.0f);
+    float pitch = asinf(sinp);
+
+    float siny_cosp = 2.0f * (q0 * q3 + q1 * q2);
+    float cosy_cosp = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
+    float yaw = atan2f(siny_cosp, cosy_cosp);
+
+    const float r2d = 57.2957795f;
+    *roll_deg = roll * r2d;
+    *pitch_deg = pitch * r2d;
+    *yaw_deg = yaw * r2d;
+}
+
+void AHRS_Init(void)
+{
+    q[0] = 1.0f;
+    q[1] = 0.0f;
+    q[2] = 0.0f;
+    q[3] = 0.0f;
+    accel_trust = true;
+}
+
+void AHRS_SetBeta(float b)
+{
+    if (b > 0.0f && b < 1.0f) {
+        beta = b;
+    }
+}
 
 /**
  * @brief Performs sensor fusion to update the global VehicleState.
- * Replicates logic from main.c 100Hz loop.
  */
 void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 {
+    if (dt < 0.001f) dt = 0.001f;
+    if (dt > 0.010f) dt = 0.010f;
 
-	if (dt < 0.001f) dt = 0.001f;
-	if (dt > 0.010f) dt = 0.010f;
+    // Gyro mapping aligned to body frame with accel/mag already aligned:
+    // [gx_body, gy_body, gz_body] = [-Gy_sensor, Gx_sensor, Gz_sensor]
+    float gx_dps = -raw->gy - g_offsets.roll_bias;  // body X
+    float gy_dps =  raw->gx - g_offsets.pitch_bias; // body Y
+    float gz_dps =  raw->gz - g_offsets.yaw_bias;   // body Z
+    // Remap gyro to Accel/Mag Frame, also Body Frame
+    float ax = raw->ax;
+    float ay = raw->ay;
+    float az = raw->az;
 
-	float gx =  -raw->gy - g_offsets.roll_bias;   // body X
-	float gy =  raw->gx - g_offsets.pitch_bias;  // body Y
-	float gz =  raw->gz - g_offsets.yaw_bias;    // body Z (no flip)
-
-	float ax = raw->ax;
-	float ay = raw->ay;
-	float az = raw->az;
-
-	Kalman_Predict(&kf_roll,  gx, dt);
-	Kalman_Predict(&kf_pitch, gy, dt);
-	Kalman_Predict(&kf_yaw,   gz, dt);
-
-	/* -------------------------------------------------
-	 * 2. Accelerometer observation (DO NOT TOUCH)
-	 * ------------------------------------------------- */
-	float accel_roll  = atan2f(-ay, az) * 57.29578f;
-	float accel_pitch = atan2f( ax, sqrtf(ay*ay + az*az)) * 57.29578f;
-
-	float a_mag = sqrtf(raw->ax*raw->ax + raw->ay*raw->ay + raw->az*raw->az);
-
-	// Hysteresis latch
-	static bool accel_trust = true;
-	float amag_err = fabsf(a_mag - 1.0f);
-	if (accel_trust) {
-		if (amag_err > 0.25f) accel_trust = false;
-	} else {
-		if (amag_err < 0.15f) accel_trust = true;
-	}
-
-	/* -------------------------------------------------
-	 * 3. Magnetometer (tilt compensated yaw)
-	 * ------------------------------------------------- */
-	float phi   = kf_roll.angle  * 0.0174533f;
-	float theta = kf_pitch.angle * 0.0174533f;
-
-	float mx = raw->mx - 0.24f;
-	float my = raw->my - 0.24f;
-	float mz = raw->mz + 0.08f;
-
-	float By = my * cosf(phi) - mz * sinf(phi);
-	float Bx = mx * cosf(theta) +
-			(my * sinf(phi) + mz * cosf(phi)) * sinf(theta);
-
-	float mag_yaw = atan2f(-By, Bx) * 57.29578f;
-
-	while (mag_yaw > 180.0f) mag_yaw -= 360.0f;
-	while (mag_yaw < -180.0f) mag_yaw += 360.0f;
-
-	/* -------------------------------------------------
-	 * 4. Kalman updates
-	 * ------------------------------------------------- */
+    float a_mag = vec3_norm(ax, ay, az);
+    float amag_err = fabsf(a_mag - 1.0f);
     if (accel_trust) {
-        state->roll  = Kalman_Update(&kf_roll,  accel_roll);
-        state->pitch = Kalman_Update(&kf_pitch, accel_pitch);
+        if (amag_err > 0.25f) accel_trust = false;
     } else {
-        state->roll  = kf_roll.angle;
-        state->pitch = kf_pitch.angle;
+        if (amag_err < 0.15f) accel_trust = true;
     }
-    float yaw_pred = kf_yaw.angle;
-    float yaw_err  = wrap_deg(mag_yaw - yaw_pred);
-    float yaw_meas = yaw_pred + yaw_err;
-    state->yaw = Kalman_Update(&kf_yaw, yaw_meas);
 
-	/* -------------------------------------------------
-	 * 5. Body rates (rad/s)
-	 * ------------------------------------------------- */
-	state->gyro_x = gx * 0.0174533f; // converting deg/s to rad/s
-	state->gyro_y = gy * 0.0174533f;
-	state->gyro_z = gz * 0.0174533f;
+    if (a_mag > 1e-6f) {
+        ax /= a_mag;
+        ay /= a_mag;
+        az /= a_mag;
+    } else {
+        ax = 0.0f;
+        ay = 0.0f;
+        az = 0.0f;
+    }
 
-	state->roll  = -state->roll;
-	state->pitch = -state->pitch;
-	// Also map to your rate members for the PID
-	state->roll_rate  = gx;
-	state->pitch_rate = gy;
-	state->yaw_rate   = gz;
+    const float d2r = 0.0174532925f;
+    float gx = gx_dps * d2r;
+    float gy = gy_dps * d2r;
+    float gz = gz_dps * d2r;
+
+    float q0 = q[0];
+    float q1 = q[1];
+    float q2 = q[2];
+    float q3 = q[3];
+
+    // Quaternion derivative from gyro
+    float qDot0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    float qDot1 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
+    float qDot2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
+    float qDot3 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
+
+    if (accel_trust) {
+        float f1 = 2.0f * (q1 * q3 - q0 * q2) - ax;
+        float f2 = 2.0f * (q0 * q1 + q2 * q3) - ay;
+        float f3 = 2.0f * (0.5f - q1 * q1 - q2 * q2) - az;
+
+        // Canonical Madgwick IMU gradient: s = J^T * f
+        float s0 = (-2.0f * q2) * f1 + ( 2.0f * q1) * f2;
+        float s1 = ( 2.0f * q3) * f1 + ( 2.0f * q0) * f2 + (-4.0f * q1) * f3;
+        float s2 = (-2.0f * q0) * f1 + ( 2.0f * q3) * f2 + (-4.0f * q2) * f3;
+        float s3 = ( 2.0f * q1) * f1 + ( 2.0f * q2) * f2;
+
+        float s_norm = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        if (s_norm > 1e-9f) {
+            s0 /= s_norm;
+            s1 /= s_norm;
+            s2 /= s_norm;
+            s3 /= s_norm;
+            qDot0 -= beta * s0;
+            qDot1 -= beta * s1;
+            qDot2 -= beta * s2;
+            qDot3 -= beta * s3;
+        }
+    }
+
+    q[0] += qDot0 * dt;
+    q[1] += qDot1 * dt;
+    q[2] += qDot2 * dt;
+    q[3] += qDot3 * dt;
+    quat_normalize(q);
+
+    float yaw_deg = 0.0f;
+    float dummy_roll = 0.0f, dummy_pitch = 0.0f;
+    quat_to_euler_deg(q, &dummy_roll, &dummy_pitch, &yaw_deg);
+
+    // Build roll/pitch from predicted gravity in body frame using the same
+    // convention as legacy accel equations:
+    // accel_roll  = atan2(-ay, az)
+    // accel_pitch = atan2(ax, sqrt(ay^2 + az^2))
+    float g_bx = 2.0f * (q[0] * q[1] + q[2] * q[3]);
+    float g_by = 2.0f * (q[1] * q[3] - q[0] * q[2]);
+    float g_bz = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
+    const float r2d = 57.2957795f;
+    float roll_deg = atan2f(-g_by, g_bz) * r2d;
+    float pitch_deg = atan2f(g_bx, sqrtf(g_by * g_by + g_bz * g_bz)) * r2d;
+
+    state->roll  = roll_deg;
+    state->pitch = pitch_deg;
+    state->yaw   = wrap_deg(yaw_deg);
+
+    state->q0 = q[0];
+    state->q1 = q[1];
+    state->q2 = q[2];
+    state->q3 = q[3];
+
+    state->gyro_x = gx;
+    state->gyro_y = gy;
+    state->gyro_z = gz;
+
+    state->roll_rate  = gx_dps;
+    state->pitch_rate = gy_dps;
+    state->yaw_rate   = gz_dps;
 }
 

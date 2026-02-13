@@ -17,6 +17,7 @@ typedef struct {
     float x, y, z;
     float vx, vy, vz;
     float roll, pitch, yaw;
+    float q0, q1, q2, q3;
     // Add these for the Rate PID
     float gyro_x, gyro_y, gyro_z;
     float roll_rate, pitch_rate, yaw_rate;
