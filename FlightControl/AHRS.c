@@ -33,9 +33,13 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	if (dt < 0.001f) dt = 0.001f;
 	if (dt > 0.010f) dt = 0.010f;
 
-	float gx = raw->gy - g_offsets.roll_bias;
-	float gy = raw->gx - g_offsets.pitch_bias;
-	float gz = (-raw->gz) - g_offsets.yaw_bias;
+	float gx =  -raw->gy - g_offsets.roll_bias;   // body X
+	float gy =  raw->gx - g_offsets.pitch_bias;  // body Y
+	float gz =  raw->gz - g_offsets.yaw_bias;    // body Z (no flip)
+
+	float ax = raw->ax;
+	float ay = raw->ay;
+	float az = raw->az;
 
 	Kalman_Predict(&kf_roll,  gx, dt);
 	Kalman_Predict(&kf_pitch, gy, dt);
@@ -44,8 +48,8 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	/* -------------------------------------------------
 	 * 2. Accelerometer observation (DO NOT TOUCH)
 	 * ------------------------------------------------- */
-	float accel_roll  = atan2f(raw->ay, raw->az) * 57.29578f;
-	float accel_pitch = atan2f(-raw->ax, sqrtf(raw->ay*raw->ay + raw->az*raw->az)) * 57.29578f;
+	float accel_roll  = atan2f(-ay, az) * 57.29578f;
+	float accel_pitch = atan2f( ax, sqrtf(ay*ay + az*az)) * 57.29578f;
 
 	float a_mag = sqrtf(raw->ax*raw->ax + raw->ay*raw->ay + raw->az*raw->az);
 
@@ -65,8 +69,8 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	float theta = kf_pitch.angle * 0.0174533f;
 
 	float mx = raw->mx - 0.24f;
-	float my = -(raw->my - 0.24f);
-	float mz = -(raw->mz + 0.08f);
+	float my = raw->my - 0.24f;
+	float mz = raw->mz + 0.08f;
 
 	float By = my * cosf(phi) - mz * sinf(phi);
 	float Bx = mx * cosf(theta) +
@@ -99,6 +103,8 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
 	state->gyro_y = gy * 0.0174533f;
 	state->gyro_z = gz * 0.0174533f;
 
+	state->roll  = -state->roll;
+	state->pitch = -state->pitch;
 	// Also map to your rate members for the PID
 	state->roll_rate  = gx;
 	state->pitch_rate = gy;

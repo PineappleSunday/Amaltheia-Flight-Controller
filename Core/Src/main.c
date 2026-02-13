@@ -61,16 +61,19 @@ typedef struct __attribute__((packed)) {
 	int16_t cmd_pitch_deg_x100;
 	int16_t cmd_yaw_deg_x100;
 
-    uint8_t sat_flags;   // bits for motor hi/lo clamp or PID clamp
+	uint8_t sat_flags;   // bits for motor hi/lo clamp or PID clamp
 
-    int16_t i_state;     // active integrator (or roll only)
+	int16_t i_state;     // active integrator (or roll only)
 
-    int16_t gyro_p;      // deg/s*100
-    int16_t gyro_q;      // deg/s*100
-    int16_t gyro_r;      // deg/s*100
+	int16_t gyro_p;      // deg/s*100
+	int16_t gyro_q;      // deg/s*100
+	int16_t gyro_r;      // deg/s*100
 	uint8_t magic_footer;
 } Telemetry_Packet_t;
 _Static_assert(sizeof(Telemetry_Packet_t) == 80, "Telemetry Struct size mismatch!");
+
+static bool normal_telem = true;
+static uint8_t dbg_axis = 1;   // 0=roll, 1=pitch, 2=yaw
 
 
 typedef enum {
@@ -596,25 +599,25 @@ int main(void)
 					break;
 
 				case TAKEOFF:
-				    if (!takeoff_yaw_latched) {
-				        takeoff_yaw = g_state.yaw;
-				        takeoff_yaw_latched = 1;
-				    }
+					if (!takeoff_yaw_latched) {
+						takeoff_yaw = g_state.yaw;
+						takeoff_yaw_latched = 1;
+					}
 
-				    g_target.roll  = 0.0f;
-				    g_target.pitch = 0.0f;
-				    g_target.yaw   = takeoff_yaw;
+					g_target.roll  = 0.0f;
+					g_target.pitch = 0.0f;
+					g_target.yaw   = takeoff_yaw;
 
-				    // IMPORTANT: prevent second call later in loop
-				    control_ran_this_tick = 1;
+					// IMPORTANT: prevent second call later in loop
+					control_ran_this_tick = 1;
 
-				    if (g_state.z > flight_leg_height + 0.2f) {
-				        takeoff_state = TRANSISTION;
-				        takeoff_count = 0;
-				    } else {
-				    	takeoff_count++;
-				    }
-				    break;
+					if (g_state.z > flight_leg_height + 0.2f) {
+						takeoff_state = TRANSISTION;
+						takeoff_count = 0;
+					} else {
+						takeoff_count++;
+					}
+					break;
 
 				case TRANSISTION:
 					PID_Reset(&pid_roll_angle);
@@ -631,12 +634,12 @@ int main(void)
 					break;
 				}
 			}
-			printf("IMU,%ld,AX=%f,AY=%f,AZ=%f,MX=%f,MY=%f,MZ=%f,GX=%f,GY=%f,GZ=%f\r\n",
+			/*printf("IMU,%ld,AX=%f,AY=%f,AZ=%f,MX=%f,MY=%f,MZ=%f,GX=%f,GY=%f,GZ=%f\r\n",
 			       HAL_GetTick(),
 			       raw_data.ax, raw_data.ay, raw_data.az,
 			       raw_data.mx, raw_data.my, raw_data.mz,
 			       raw_data.gx, raw_data.gy, raw_data.gz);
-
+			 */
 			// 3. NAVIGATION (Mission Manager)
 			// 2. MISSION LOGIC
 			if (is_estop_active) {
@@ -704,7 +707,7 @@ int main(void)
 				g_target.rate_yaw = 0.0f;
 			}
 			if (is_system_armed) {
-			    telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target);
+				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target);
 			}
 			// Check if the system is disarmed AND if any motor has a non-zero throttle
 			else if (telem_data.motor1_T > 0 || telem_data.motor2_T > 0 ||
@@ -718,34 +721,99 @@ int main(void)
 
 			// 5. UPDATE TELEMETRY (Your Exact Atomic Block)
 			// Mapping g_state back to your required telemetry variables
-			telem_data.header 				= 0xDEADBEEF;       // UINT32
-			telem_data.timestamp 			= dt_sec;        // float 1
-			telem_data.roll 				= g_state.roll;       // float 2 (Estimated Roll)
-			telem_data.pitch 				= g_state.pitch;     // float 3 (Estimated Pitch)
-			telem_data.yaw 					= g_state.yaw;         // float 4 (Estimated Yaw)
-			telem_data.altitude 			= range_dist_cm;  // float 5 (Raw Lidar in cm)
-			telem_data.voltage 				= commandZ;           // float 6
-			telem_data.armed 				= is_system_armed ? 0xFF : 0x00;
-			// Map the modes to the telemetry packet
-			telem_data.drone_mode  			= g_drone_status.drone_mode;
-			telem_data.flight_mode 			= g_drone_status.flight_mode;
-			telem_data.setpoint    			= g_target.rate_pitch;
-			telem_data.measurement 			= g_state.pitch_rate;
-			telem_data.error       			= pid_pitch_rate.previous_error;
-			telem_data.p_term      			= pid_pitch_rate.p_out;
-			telem_data.i_term      			= pid_pitch_rate.i_out;
-			telem_data.d_term      			= pid_pitch_rate.d_out;
-			telem_data.output_sum  			= pid_pitch_rate.output;
-			telem_data.cmd_roll_deg_x100 	= (int16_t)(g_target.roll  * 100.0f);
-			telem_data.cmd_pitch_deg_x100 	= (int16_t)(g_target.pitch * 100.0f);
-			telem_data.cmd_yaw_deg_x100   	= (int16_t)(g_target.yaw   * 100.0f);
 
-			telem_data.i_state 				= (int16_t)(pid_pitch_rate.i_out * 100.0f);
+			if (normal_telem){
+				telem_data.header 				= 0xDEADBEEF;       // UINT32
+				telem_data.timestamp 			= dt_sec;        // float 1
+				telem_data.roll 				= g_state.roll;       // float 2 (Estimated Roll)
+				telem_data.pitch 				= g_state.pitch;     // float 3 (Estimated Pitch)
+				telem_data.yaw 					= g_state.yaw;         // float 4 (Estimated Yaw)
+				telem_data.altitude 			= range_dist_cm;  // float 5 (Raw Lidar in cm)
+				telem_data.voltage 				= commandZ;           // float 6
+				telem_data.armed 				= is_system_armed ? 0xFF : 0x00;
+				// Map the modes to the telemetry packet
+				telem_data.drone_mode  			= g_drone_status.drone_mode;
+				telem_data.flight_mode 			= g_drone_status.flight_mode;
+				telem_data.setpoint    			= g_target.rate_pitch;
+				telem_data.measurement 			= g_state.pitch_rate;
+				telem_data.error       			= pid_pitch_rate.previous_error;
+				telem_data.p_term      			= pid_pitch_rate.p_out;
+				telem_data.i_term      			= pid_pitch_rate.i_out;
+				telem_data.d_term      			= pid_pitch_rate.d_out;
+				telem_data.output_sum  			= pid_pitch_rate.output;
+				telem_data.cmd_roll_deg_x100 	= (int16_t)(g_target.roll  * 100.0f);
+				telem_data.cmd_pitch_deg_x100 	= (int16_t)(g_target.pitch * 100.0f);
+				telem_data.cmd_yaw_deg_x100   	= (int16_t)(g_target.yaw   * 100.0f);
 
-			telem_data.gyro_p 				= (int16_t)(g_state.roll_rate  * 100.0f);
-			telem_data.gyro_q 				= (int16_t)(g_state.pitch_rate * 100.0f);
-			telem_data.gyro_r 				= (int16_t)(g_state.yaw_rate   * 100.0f);
-			telem_data.magic_footer 		= 0xAB;       // UINT8
+				telem_data.i_state 				= (int16_t)(pid_pitch_rate.i_out * 100.0f);
+
+				telem_data.gyro_p 				= (int16_t)(g_state.roll_rate  * 100.0f);
+				telem_data.gyro_q 				= (int16_t)(g_state.pitch_rate * 100.0f);
+				telem_data.gyro_r 				= (int16_t)(g_state.yaw_rate   * 100.0f);
+				telem_data.magic_footer 		= 0xAB;       // UINT8
+			} else {
+			    // DEBUG TELEMETRY (multiplex roll/pitch/yaw rate loops)
+			    static uint8_t dbg_axis = 0;         // 0=roll, 1=pitch, 2=yaw
+			    dbg_axis = (dbg_axis + 1) % 3;
+
+			    telem_data.header              = 0xDEADBEEF;   // UINT32
+			    telem_data.timestamp           = dt_sec;
+
+			    // Keep these exactly as-is
+			    telem_data.roll                = g_state.roll;
+			    telem_data.pitch               = g_state.pitch;
+			    telem_data.yaw                 = g_state.yaw;
+			    telem_data.altitude            = range_dist_cm;
+			    telem_data.voltage             = commandZ;
+
+			    telem_data.armed               = is_system_armed ? 0xFF : 0x00;
+
+			    telem_data.flight_mode         = g_drone_status.flight_mode;
+
+			    telem_data.cmd_roll_deg_x100   = (int16_t)(g_target.roll  * 100.0f);
+			    telem_data.cmd_pitch_deg_x100  = (int16_t)(g_target.pitch * 100.0f);
+			    telem_data.cmd_yaw_deg_x100    = (int16_t)(g_target.yaw   * 100.0f);
+
+			    // Tag which axis this packet is (use sensor_status low 2 bits)
+			    telem_data.sensor_status       = (telem_data.sensor_status & 0xFC) | (dbg_axis & 0x03);
+
+			    // MUX the PID debug fields by axis
+			    if (dbg_axis == 0) { // Roll rate loop
+			        telem_data.setpoint     = g_target.rate_roll;
+			        telem_data.measurement  = g_state.roll_rate;
+			        telem_data.error        = pid_roll_rate.previous_error;
+			        telem_data.p_term       = pid_roll_rate.p_out;
+			        telem_data.i_term       = pid_roll_rate.i_out;
+			        telem_data.d_term       = pid_roll_rate.d_out;
+			        telem_data.output_sum   = pid_roll_rate.output;
+			        telem_data.i_state      = (int16_t)(pid_roll_rate.i_out * 100.0f);
+			    } else if (dbg_axis == 1) { // Pitch rate loop
+			        telem_data.setpoint     = g_target.rate_pitch;
+			        telem_data.measurement  = g_state.pitch_rate;
+			        telem_data.error        = pid_pitch_rate.previous_error;
+			        telem_data.p_term       = pid_pitch_rate.p_out;
+			        telem_data.i_term       = pid_pitch_rate.i_out;
+			        telem_data.d_term       = pid_pitch_rate.d_out;
+			        telem_data.output_sum   = pid_pitch_rate.output;
+			        telem_data.i_state      = (int16_t)(pid_pitch_rate.i_out * 100.0f);
+			    } else { // Yaw rate loop
+			        telem_data.setpoint     = g_target.rate_yaw;
+			        telem_data.measurement  = g_state.yaw_rate;
+			        telem_data.error        = pid_yaw_rate.previous_error;
+			        telem_data.p_term       = pid_yaw_rate.p_out;
+			        telem_data.i_term       = pid_yaw_rate.i_out;
+			        telem_data.d_term       = pid_yaw_rate.d_out;
+			        telem_data.output_sum   = pid_yaw_rate.output;
+			        telem_data.i_state      = (int16_t)(pid_yaw_rate.i_out * 100.0f);
+			    }
+
+			    telem_data.gyro_p              = (int16_t)(g_state.roll_rate  * 100.0f);
+			    telem_data.gyro_q              = (int16_t)(g_state.pitch_rate * 100.0f);
+			    telem_data.gyro_r              = (int16_t)(g_state.yaw_rate   * 100.0f);
+
+			    telem_data.magic_footer        = 0xAB;
+			}
+
 		}
 	}
 	/* USER CODE END WHILE */
@@ -1195,16 +1263,16 @@ void start_control(void) {
 	case STATE_INIT:
 		g_drone_status.flight_mode = 5;
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---
-		PID_Init(&pid_roll_angle,  0.15f, 0.003f, 0.002f, 0.002f, 10.0f);
-		PID_Init(&pid_pitch_angle, 0.1f, 0.003f, 0.002f, 0.002f, 10.0f);
+		PID_Init(&pid_roll_angle,  0.15f, 0.000f, 0.000f, 0.002f, 10.0f);
+		PID_Init(&pid_pitch_angle, 0.1f, 0.000f, 0.000f, 0.002f, 10.0f);
 		PID_Init(&pid_yaw_angle,   1.0f, 0.000f, 0.000f, 0.002f, 10.0f);
 
 		PID_Init(&pid_roll_rate, 0.1f, 0.001f, 0.000f, 0.002f, 0.5f);
 		PID_Init(&pid_pitch_rate, 0.1f, 0.001f, 0.000f, 0.002f, 0.5f);
-		PID_Init(&pid_yaw_rate, 0.25f, 0.15f, 0.000f, 0.002f, 0.3f);
+		PID_Init(&pid_yaw_rate, 0.25f, 0.001f, 0.000f, 0.002f, 0.3f);
 
 		PID_Init(&pid_pos_z, 0.75f, 0.0f, 0.0f, 0.002f, 0.0f);   // Position P gain
-		PID_Init(&pid_vel_z, 0.5f, 0.5f, 0.05f, 0.002f, 50.0f); // Velocity PID with I-limit
+		PID_Init(&pid_vel_z, 0.5f, 0.0f, 0.00f, 0.002f, 50.0f); // Velocity PID with I-limit
 
 		float d_alpha = PID_Calculate_Alpha(20.0f, 0.002f);
 		pid_roll_rate.d_low_pass_alpha = d_alpha;
@@ -1428,11 +1496,11 @@ void start_control(void) {
 		// 1 kHz loop gate
 		// -------------------------
 		if ((now_ms - last_1khz) >= 1) {
-		    float dt = (now_ms - last_1khz) * 0.001f;
-		    dt = clampf(dt, 0.001f, 0.01f);
-		    last_1khz = now_ms;
+			float dt = (now_ms - last_1khz) * 0.001f;
+			dt = clampf(dt, 0.001f, 0.01f);
+			last_1khz = now_ms;
 
-		    g_state.dt_sec = dt;
+			g_state.dt_sec = dt;
 
 			telem_decimator++;
 
@@ -1475,13 +1543,13 @@ void start_control(void) {
 			if (axis == AXIS_PITCH) {
 				sp = &g_target.rate_pitch;
 				rate_meas = g_state.pitch_rate;
-			    g_target.rate_roll = 0.0f;
-			    g_target.rate_yaw  = 0.0f;
+				g_target.rate_roll = 0.0f;
+				g_target.rate_yaw  = 0.0f;
 			} else if (axis == AXIS_ROLL) {
 				sp = &g_target.rate_roll;
 				rate_meas = g_state.roll_rate;
-			    g_target.rate_pitch = 0.0f;
-			    g_target.rate_yaw   = 0.0f;
+				g_target.rate_pitch = 0.0f;
+				g_target.rate_yaw   = 0.0f;
 			} else {
 				// finished all axes
 				g_state.isTuning = false;
@@ -1728,96 +1796,97 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 }
 
 void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
-    // 1. ESP8266 marks all valid commands with '$' at index 0
-    if (Buf[0] != '$') return;
+	// 1. ESP8266 marks all valid commands with '$' at index 0
+	if (Buf[0] != '$') return;
 
-    // 2. Create local copy and IMMEDIATELY clear the hardware buffer
-    // This prevents race conditions and "echoed" commands.
-    char local_buf[SPI_FRAME_LEN + 1];
-    uint32_t n = (Len > SPI_FRAME_LEN) ? SPI_FRAME_LEN : Len;
-    memcpy(local_buf, Buf, n);
-    local_buf[n] = '\0';
-    memset(Buf, 0, Len);
+	// 2. Create local copy and IMMEDIATELY clear the hardware buffer
+	// This prevents race conditions and "echoed" commands.
+	char local_buf[SPI_FRAME_LEN + 1];
+	uint32_t n = (Len > SPI_FRAME_LEN) ? SPI_FRAME_LEN : Len;
+	memcpy(local_buf, Buf, n);
+	local_buf[n] = '\0';
+	memset(Buf, 0, Len);
 
-    last_heartbeat_tick = HAL_GetTick();
+	last_heartbeat_tick = HAL_GetTick();
 
-    // The actual command string starts at index 1 (after the '$')
-    char* cmd = &local_buf[1];
+	// The actual command string starts at index 1 (after the '$')
+	char* cmd = &local_buf[1];
 
-    // 3. Token-Based Switch Switchboard
-    switch (cmd[0]) {
+	// 3. Token-Based Switch Switchboard
+	switch (cmd[0]) {
 
-        case 'x': case 'X': // --- EMERGENCY STOP ---
-            for(uint32_t ch = 1; ch <= 4; ch++) {
-                ESC_SetThrottle(get_timer_channel(ch), 0.0f);
-            }
-            is_estop_active = 1;
-            g_mission.landing_start_t = (float)HAL_GetTick() / 1000.0f;
-            if (g_mission.current_index < g_mission.total_waypoints) {
-                g_mission.waypoints[g_mission.current_index].action = WP_ACTION_LAND;
-            }
-            break;
+	case 'x': case 'X': // --- EMERGENCY STOP ---
+		for(uint32_t ch = 1; ch <= 4; ch++) {
+			ESC_SetThrottle(get_timer_channel(ch), 0.0f);
+		}
+		is_estop_active = 1;
+		is_system_armed = 0;
+		g_mission.landing_start_t = (float)HAL_GetTick() / 1000.0f;
+		if (g_mission.current_index < g_mission.total_waypoints) {
+			g_mission.waypoints[g_mission.current_index].action = WP_ACTION_LAND;
+		}
+		break;
 
-        case 'a': // --- ARM or ALL ---
-            if (cmd[1] == 'r' && cmd[2] == 'm') { // "arm"
-                ESC_ArmAll();
-            }
-            else if (cmd[1] == 'l' && cmd[2] == 'l') { // "all t25.0"
-                char* t_ptr = strchr(cmd, 'p');
-                if (t_ptr != NULL) {
-                    char* val_start = t_ptr + 1;
-                    while (*val_start == ' ') val_start++;
+	case 'a': // --- ARM or ALL ---
+		if (cmd[1] == 'r' && cmd[2] == 'm') { // "arm"
+			ESC_ArmAll();
+		}
+		else if (cmd[1] == 'l' && cmd[2] == 'l') { // "all t25.0"
+			char* t_ptr = strchr(cmd, 'p');
+			if (t_ptr != NULL) {
+				char* val_start = t_ptr + 1;
+				while (*val_start == ' ') val_start++;
 
-                    float throttle = strtof(val_start, NULL);
-                    ESC_SetThrottle(TIM_CHANNEL_1, throttle);
-                    ESC_SetThrottle(TIM_CHANNEL_2, throttle);
-                    ESC_SetThrottle(TIM_CHANNEL_3, throttle);
-                    ESC_SetThrottle(TIM_CHANNEL_4, throttle);
-                }
-            }
-            break;
+				float throttle = strtof(val_start, NULL);
+				ESC_SetThrottle(TIM_CHANNEL_1, throttle);
+				ESC_SetThrottle(TIM_CHANNEL_2, throttle);
+				ESC_SetThrottle(TIM_CHANNEL_3, throttle);
+				ESC_SetThrottle(TIM_CHANNEL_4, throttle);
+			}
+		}
+		break;
 
-        case 'm': // --- MOTOR or MODE ---
-            // Check if it's "mode"
-            if (cmd[1] == 'o' && cmd[2] == 'd') { // "mode 2"
-                char* val_ptr = strchr(cmd, ' ');
-                if (val_ptr != NULL) {
-                    g_drone_status.drone_mode = (uint8_t)atoi(val_ptr + 1);
-                }
-            }
-            // Check if it's "motor X tY" (e.g. "m1 t10" or "motor 1 t10")
-            else {
-                // Find the first digit in the string to identify motor number
-                int motor_num = 0;
-                for(int i=0; i<10; i++) {
-                    if(isdigit((unsigned char)cmd[i])) {
-                        motor_num = cmd[i] - '0';
-                        break;
-                    }
-                }
-                char* t_ptr = strchr(cmd, 'p');
-                if (t_ptr != NULL && motor_num >= 1 && motor_num <= 4) {
-                    // Move pointer past 't', then skip any spaces
-                    char* val_start = t_ptr + 1;
-                    while (*val_start == ' ') val_start++;
+	case 'm': // --- MOTOR or MODE ---
+		// Check if it's "mode"
+		if (cmd[1] == 'o' && cmd[2] == 'd') { // "mode 2"
+			char* val_ptr = strchr(cmd, ' ');
+			if (val_ptr != NULL) {
+				g_drone_status.drone_mode = (uint8_t)atoi(val_ptr + 1);
+			}
+		}
+		// Check if it's "motor X tY" (e.g. "m1 t10" or "motor 1 t10")
+		else {
+			// Find the first digit in the string to identify motor number
+			int motor_num = 0;
+			for(int i=0; i<10; i++) {
+				if(isdigit((unsigned char)cmd[i])) {
+					motor_num = cmd[i] - '0';
+					break;
+				}
+			}
+			char* t_ptr = strchr(cmd, 'p');
+			if (t_ptr != NULL && motor_num >= 1 && motor_num <= 4) {
+				// Move pointer past 't', then skip any spaces
+				char* val_start = t_ptr + 1;
+				while (*val_start == ' ') val_start++;
 
-                    float throttle = strtof(val_start, NULL);
-                    ESC_SetThrottle(get_timer_channel(motor_num), throttle);
-                }
-            }
-            break;
+				float throttle = strtof(val_start, NULL);
+				ESC_SetThrottle(get_timer_channel(motor_num), throttle);
+			}
+		}
+		break;
 
-        case 'z': case 'Z':
-            g_drone_status.drone_mode = 1;
-            commandZ = (strtof(cmd + 1, NULL) / 100.0f) * 2.0f;
-            break;
+	case 'z': case 'Z':
+		g_drone_status.drone_mode = 1;
+		commandZ = (strtof(cmd + 1, NULL) / 100.0f) * 2.0f;
+		break;
 
-        case 't': // --- TUNE ---
-            if (cmd[1] == 'u') {
-                tune_request = 1;
-            }
-            break;
-    }
+	case 't': // --- TUNE ---
+		if (cmd[1] == 'u') {
+			tune_request = 1;
+		}
+		break;
+	}
 }
 /**
  * @brief Helper to map Motor ID 1-4 to TIM_CHANNEL_x
