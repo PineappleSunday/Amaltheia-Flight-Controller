@@ -20,6 +20,6 @@ typedef struct {
 void FlightLogic_Init(void);
 float clampf(float x, float lo, float hi);
 // Replaces updateFlightLogic to align with 100Hz timing requirements
-uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target);
+uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneState_t* drone);
 
 #endif

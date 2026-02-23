@@ -4,6 +4,7 @@
 
 AHRS_Offsets_t g_offsets = {0.0f, 0.0f, 0.0f, false};
 static bool accel_trust = true;
+static bool mag_trust = true;
 static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // [w, x, y, z]
 static float beta = AHRS_MADGWICK_BETA;
 
@@ -41,6 +42,22 @@ static void quat_normalize(float* qv)
     qv[2] /= n;
     qv[3] /= n;
 }
+static float wrap_rad(float a)
+{
+    a = fmodf(a + (float)M_PI, 2.0f*(float)M_PI);
+    if (a < 0) a += 2.0f*(float)M_PI;
+    return a - (float)M_PI;
+}
+
+
+static void quat_mul(const float a[4], const float b[4], float out[4])
+{
+    out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
+    out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
+    out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
+    out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+}
+
 
 static void quat_to_euler_deg(const float* qv, float* roll_deg, float* pitch_deg, float* yaw_deg)
 {
@@ -71,6 +88,8 @@ void AHRS_Init(void)
     q[2] = 0.0f;
     q[3] = 0.0f;
     accel_trust = true;
+    mag_trust = true;
+
 }
 
 void AHRS_SetBeta(float b)
@@ -98,6 +117,16 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     float ay = raw->ay;
     float az = raw->az;
 
+    float mx = raw->mx;
+    float my = raw->my;
+    float mz = raw->mz;
+
+    static bool mag_trust = true;
+    static float mag_ref = 0.0f;   // nominal |m| in your units (learned)
+    static bool mag_ref_set = false;
+
+
+
     float a_mag = vec3_norm(ax, ay, az);
     float amag_err = fabsf(a_mag - 1.0f);
     if (accel_trust) {
@@ -115,6 +144,39 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
         ay = 0.0f;
         az = 0.0f;
     }
+
+    float m_mag_raw = vec3_norm(mx, my, mz);
+    // magnitude-based trust (raw)
+    if (m_mag_raw < 1e-6f) {
+        mag_trust = false;
+    } else {
+        if (!mag_ref_set && accel_trust) {
+            mag_ref = m_mag_raw;
+            mag_ref_set = true;
+            mag_trust = true;
+        } else if (mag_ref_set && accel_trust) {
+            mag_ref = 0.999f*mag_ref + 0.001f*m_mag_raw;
+        }
+
+        if (mag_ref_set) {
+            float mm_err = fabsf(m_mag_raw - mag_ref) / (mag_ref + 1e-6f);
+            if (mag_trust) { if (mm_err > 0.25f) mag_trust = false; }
+            else           { if (mm_err < 0.15f) mag_trust = true;  }
+        } else {
+            mag_trust = false;
+        }
+    }
+
+
+    // normalize for heading use
+
+    float mx_u=0, my_u=0, mz_u=0;
+    if (m_mag_raw > 1e-6f) {
+        mx_u = mx / m_mag_raw;
+        my_u = my/ m_mag_raw;
+        mz_u = mz / m_mag_raw;
+    }
+
 
     const float d2r = 0.0174532925f;
     float gx = gx_dps * d2r;
@@ -161,6 +223,58 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     q[2] += qDot2 * dt;
     q[3] += qDot3 * dt;
     quat_normalize(q);
+
+    if (mag_trust) {
+
+        // 1) roll/pitch from quaternion (rad)
+        float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+
+        float sinr_cosp = 2.0f*(q0*q1 + q2*q3);
+        float cosr_cosp = 1.0f - 2.0f*(q1*q1 + q2*q2);
+        float roll = atan2f(sinr_cosp, cosr_cosp);
+
+        float sinp = 2.0f*(q0*q2 - q3*q1);
+        sinp = clampf(sinp, -1.0f, 1.0f);
+        float pitch = asinf(sinp);
+
+        // 2) tilt-comp mag (body -> horizontal)
+        float cr = cosf(roll),  sr = sinf(roll);
+        float cp = cosf(pitch), sp = sinf(pitch);
+
+        float mxh = mx_u*cp + mz_u*sp;
+        float myh = mx_u*sr*sp + my_u*cr - mz_u*sr*cp;
+
+        // 3) yaw from mag (rad)  (may need sign flip depending on your frame)
+        float yaw_mag = atan2f(-myh, mxh);
+
+        // 4) yaw estimate from quaternion (rad)
+        float siny_cosp = 2.0f*(q0*q3 + q1*q2);
+        float cosy_cosp = 1.0f - 2.0f*(q2*q2 + q3*q3);
+        float yaw_est = atan2f(siny_cosp, cosy_cosp);
+
+        // 5) innovation (rad!)
+        float yaw_err = wrap_rad(yaw_mag - yaw_est);
+
+        // gate
+        if (fabsf(yaw_err) > 1.0f) {
+            mag_trust = false;
+        } else {
+            const float K0 = 2.5f;
+            float yaw_rate = fabsf(gz);                // rad/s
+            float K = K0 / (1.0f + 2.0f*yaw_rate);
+
+            float delta = K * yaw_err * dt;
+            delta = clampf(delta, -0.05f, 0.05f);
+
+            float half = 0.5f * delta;
+            float qcorr[4] = { cosf(half), 0.0f, 0.0f, sinf(half) };
+
+            float qnew[4];
+            quat_mul(qcorr, q, qnew);
+            q[0]=qnew[0]; q[1]=qnew[1]; q[2]=qnew[2]; q[3]=qnew[3];
+            quat_normalize(q);
+        }
+    }
 
     float yaw_deg = 0.0f;
     float dummy_roll = 0.0f, dummy_pitch = 0.0f;

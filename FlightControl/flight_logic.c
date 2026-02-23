@@ -20,7 +20,7 @@ float clampf(float x, float lo, float hi)
     return x;
 }
 
-uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
+uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneState_t* drone) {
 	uint8_t sat = 0;
 
 	float dt = state->dt_sec; // from MCU_dT seconds, clamped
@@ -38,16 +38,12 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
 	pid_vel_z.cycle_time_seconds = dt;
 
 	// 1. ALTITUDE CONTROL (Cascaded)
-	float corr_vel_z = PID_Calculate(&pid_pos_z, state->z, target->z); // Setpoint first
+	float corr_vel_z = PID_Calculate(&pid_pos_z, state->z, target->z); // Setpoint last
 	float target_vz  = corr_vel_z + target->ff_vz;
 	float thrust_adj = PID_Calculate(&pid_vel_z, state->vz, target_vz);
 	// 2. BASE THRUST SELECTION
-	float base_thrust = 0.0f;
-	if (state->offGround == false) { // Fixed: Use state instance, not type name
-		base_thrust = 65.0f;        // Controlled takeoff thrust
-	} else {
-		base_thrust = 40.0f + thrust_adj; // Normal hover/NAV thrust
-	}
+	float base_thrust = 50.0f + thrust_adj;
+	base_thrust = clampf(base_thrust, 15.0f, 85.0f);
 
 	// 2. ATTITUDE OUTER LOOP (Angle -> Rate)
 	// We wrap the Yaw error to ensure we take the shortest path
@@ -72,14 +68,18 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target) {
 
 	// 4. MOTOR MIXING (Plus Configuration)
 	float motor_pcts[4];
-	sat = Mixer_Apply(base_thrust, roll_torque, pitch_torque, yaw_torque, motor_pcts);
+	if (drone->drone_mode == 4) {
+		return sat;
+	} else {
 
-	// 5. HARDWARE ACTUATION
-	ESC_SetThrottle(TIM_CHANNEL_1, motor_pcts[0]); // Front
-	ESC_SetThrottle(TIM_CHANNEL_2, motor_pcts[1]); // Right
-	ESC_SetThrottle(TIM_CHANNEL_3, motor_pcts[2]); // Rear
-	ESC_SetThrottle(TIM_CHANNEL_4, motor_pcts[3]); // Left
+		sat = Mixer_Apply(base_thrust, roll_torque, pitch_torque, yaw_torque, motor_pcts);
 
+		// 5. HARDWARE ACTUATION
+		ESC_SetThrottle(TIM_CHANNEL_1, motor_pcts[0]); // Front
+		ESC_SetThrottle(TIM_CHANNEL_2, motor_pcts[1]); // Right
+		ESC_SetThrottle(TIM_CHANNEL_3, motor_pcts[2]); // Rear
+		ESC_SetThrottle(TIM_CHANNEL_4, motor_pcts[3]); // Left
+	}
 	return sat;
 }
 

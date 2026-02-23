@@ -34,10 +34,10 @@ uint8_t Mixer_Apply(float thrust, float roll, float pitch, float yaw, float* mot
 	if (m3 >= 90.0f) sat |= (1<<6);
 	if (m4 >= 90.0f) sat |= (1<<7);
 
-	motor_percentages[0] = constrain(m1, 0.0f, 90.0f);
-	motor_percentages[1] = constrain(m2, 0.0f, 90.0f);
-	motor_percentages[2] = constrain(m3, 0.0f, 90.0f);
-	motor_percentages[3] = constrain(m4, 0.0f, 90.0f);
+	motor_percentages[0] = constrain(m1, 20.0f, 90.0f);
+	motor_percentages[1] = constrain(m2, 20.0f, 90.0f);
+	motor_percentages[2] = constrain(m3, 20.0f, 90.0f);
+	motor_percentages[3] = constrain(m4, 20.0f, 90.0f);
 
 	return sat;
 

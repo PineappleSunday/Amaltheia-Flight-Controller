@@ -8,6 +8,7 @@
 #define MODE_MANUAL_LEVEL  1  // Auto-level on, but user controls vertical
 #define MODE_MISSION       2  // Following your mission_plan[64] string
 #define MODE_THRUST_STAND  3
+#define MODE_AHRS_ONLY 	   4
 
 #define SUBMODE_STABLE     0
 #define SUBMODE_TAKEOFF    1
