@@ -3,12 +3,12 @@
 #define STATE_H
 
 #include <stdint.h>
-
+#include <stdbool.h>
 
 #define MODE_MANUAL_LEVEL  1  // Auto-level on, but user controls vertical
 #define MODE_MISSION       2  // Following your mission_plan[64] string
 #define MODE_THRUST_STAND  3
-#define MODE_AHRS_ONLY 	   4
+// Mode ID 4 is reserved/unsupported (obsolete AHRS-only mode)
 
 #define SUBMODE_STABLE     0
 #define SUBMODE_TAKEOFF    1
@@ -33,6 +33,7 @@ typedef struct {
     float roll, pitch;         // Target Angles
     float rate_roll, rate_pitch, rate_yaw; // Target Rates
     float ff_vx, ff_vy, ff_vz;
+    bool yaw_hold_enabled;
 } targetState_t;
 
 // Drone Status and Telemetry Metadata

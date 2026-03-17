@@ -32,6 +32,8 @@
 /* USER CODE BEGIN PTD */
 
 #define SPI_FRAME_LEN 80
+#define TELEMETRY_HEADER_NORMAL 0xDEADBEEFUL
+#define TELEMETRY_HEADER_PID_TUNE 0x54554E45UL
 typedef struct __attribute__((packed)) {
 	uint32_t header; // 0xDEADBEEF
 	float timestamp;
@@ -71,8 +73,53 @@ typedef struct __attribute__((packed)) {
 } Telemetry_Packet_t;
 _Static_assert(sizeof(Telemetry_Packet_t) == 80, "Telemetry Struct size mismatch!");
 
+typedef struct __attribute__((packed)) {
+	uint32_t header;
+	float timestamp;
+	uint16_t sequence;
+	uint8_t packet_type;
+	uint8_t loop_id;
+	uint8_t axis_id;
+	uint8_t flags;
+	uint8_t sat_flags;
+	uint8_t reserved0;
+	float setpoint;
+	float measurement;
+	float error;
+	float p_term;
+	float i_term;
+	float d_term;
+	float output_sum;
+	float kp;
+	float ki;
+	float kd;
+	float reference_cmd;
+	float plant_state;
+	int16_t motor1_T_x100;
+	int16_t motor2_T_x100;
+	int16_t motor3_T_x100;
+	int16_t motor4_T_x100;
+	int16_t gyro_p_x100;
+	int16_t gyro_q_x100;
+	int16_t gyro_r_x100;
+	uint8_t magic_footer;
+	uint8_t reserved1;
+} PIDTune_Packet_t;
+_Static_assert(sizeof(PIDTune_Packet_t) == 80, "PID Tune Struct size mismatch!");
+
 static bool normal_telem = true;
 static uint8_t dbg_axis = 1;   // 0=roll, 1=pitch, 2=yaw
+
+typedef enum {
+	TELEM_MODE_NORMAL = 0,
+	TELEM_MODE_PID_TUNE = 1
+} telemetryMode_t;
+
+typedef enum {
+	PID_TUNE_LOOP_ROLL_RATE = 1,
+	PID_TUNE_LOOP_PITCH_RATE = 2,
+	PID_TUNE_LOOP_YAW_RATE = 3
+} pidTuneLoop_t;
 
 
 typedef enum {
@@ -175,7 +222,10 @@ BiquadFilter_t filter_gyro_yaw;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c3;
 DMA_HandleTypeDef hdma_i2c1_tx;
 DMA_HandleTypeDef hdma_i2c1_rx;
 
@@ -223,6 +273,7 @@ volatile float target_throttle = 0.0f; // The throttle we want
 
 
 Telemetry_Packet_t telem_data;
+PIDTune_Packet_t pid_tune_data;
 
 uint8_t spi_rx_buffer[SPI_FRAME_LEN];
 uint8_t spi_tx_buf[SPI_FRAME_LEN];
@@ -230,6 +281,9 @@ uint8_t spi_tx_buf[SPI_FRAME_LEN];
 static volatile uint8_t spi5_frame_done = 0;
 static volatile uint32_t spi5_frame_counter = 0;
 static uint32_t spi5_last_arm_tick = 0;
+static telemetryMode_t g_telem_mode = TELEM_MODE_NORMAL;
+static pidTuneLoop_t g_pid_tune_loop = PID_TUNE_LOOP_PITCH_RATE;
+static uint16_t g_pid_tune_sequence = 0;
 
 uint8_t command_ready = 0;
 float commandZ = 0;
@@ -328,11 +382,17 @@ static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_SPI5_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_I2C3_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 void Vehicle_State_Init(droneState_t* state);
 static void SPI5_ArmNextFrame(void);
 void start_control(void);
 bool run_autotune_step(float *rate_setpoint, float current_rate);
+static void ResetActiveFlightPIDsFromState(const vehicleState_t* state);
+static void AcquireSensorsAndUpdateState(float dt_sec);
+static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags);
+static void StageActiveTelemetryFrame(void);
 
 //SPI1 GYRO
 //I2C1 ACCEL/MAG
@@ -378,45 +438,255 @@ static float median5f(const float v[5]) {
 	}
 	return t[2];
 }
+
+static void ResetActiveFlightPIDsFromState(const vehicleState_t* state) {
+	const float roll = (state != NULL) ? state->roll : 0.0f;
+	const float pitch = (state != NULL) ? state->pitch : 0.0f;
+	const float z = (state != NULL) ? state->z : 0.0f;
+	const float vz = (state != NULL) ? state->vz : 0.0f;
+	const float roll_rate = (state != NULL) ? state->roll_rate : 0.0f;
+	const float pitch_rate = (state != NULL) ? state->pitch_rate : 0.0f;
+	const float yaw_rate = (state != NULL) ? state->yaw_rate : 0.0f;
+
+	PID_ResetWithMeasurement(&pid_roll_angle, roll);
+	PID_ResetWithMeasurement(&pid_pitch_angle, pitch);
+	// Yaw-angle loop uses wrapped yaw error with actual=0.0f in FlightLogic_Update.
+	PID_ResetWithMeasurement(&pid_yaw_angle, 0.0f);
+
+	PID_ResetWithMeasurement(&pid_pos_z, z);
+	PID_ResetWithMeasurement(&pid_vel_z, vz);
+
+	PID_ResetWithMeasurement(&pid_roll_rate, roll_rate);
+	PID_ResetWithMeasurement(&pid_pitch_rate, pitch_rate);
+	PID_ResetWithMeasurement(&pid_yaw_rate, yaw_rate);
+}
+
+static void AcquireSensorsAndUpdateState(float dt_sec) {
+	LSM303_Process_DMA(&imu);
+
+	// ACCELEROMETER Parsing
+	if (imu.accel_ready) {
+		// Atomic snapshot of the 6-byte buffer
+		uint8_t accel_snap[6];
+		__disable_irq();
+		memcpy(accel_snap, imu.accel_raw, 6);
+		imu.accel_ready = false; // Clear flag in struct
+		__enable_irq();
+
+		// Parse from snapshot (Little Endian: L, H)
+		raw_data.ax = (int16_t)((accel_snap[1] << 8) | accel_snap[0]) * imu.accel_g_per_lsb;
+		raw_data.ay = (int16_t)((accel_snap[3] << 8) | accel_snap[2]) * imu.accel_g_per_lsb;
+		raw_data.az = (int16_t)((accel_snap[5] << 8) | accel_snap[4]) * imu.accel_g_per_lsb;
+	}
+
+	// MAGNETOMETER Parsing
+	if (imu.mag_ready) {
+		uint8_t mag_snap[6];
+		__disable_irq();
+		memcpy(mag_snap, imu.mag_raw, 6);
+		imu.mag_ready = false; // Clear flag in struct
+		__enable_irq();
+
+		if (imu.variant == LSM303_DLHC) {
+			// DLHC: Big Endian and X-Z-Y order
+			raw_data.mx = (int16_t)((mag_snap[0] << 8) | mag_snap[1]) * imu.mag_gauss_per_lsb;
+			raw_data.mz = (int16_t)((mag_snap[2] << 8) | mag_snap[3]) * imu.mag_gauss_per_lsb;
+			raw_data.my = (int16_t)((mag_snap[4] << 8) | mag_snap[5]) * imu.mag_gauss_per_lsb;
+		} else {
+			// AGR: Little Endian and X-Y-Z order
+			raw_data.mx = (int16_t)((mag_snap[1] << 8) | mag_snap[0]) * imu.mag_gauss_per_lsb;
+			raw_data.my = (int16_t)((mag_snap[3] << 8) | mag_snap[2]) * imu.mag_gauss_per_lsb;
+			raw_data.mz = (int16_t)((mag_snap[5] << 8) | mag_snap[4]) * imu.mag_gauss_per_lsb;
+		}
+	}
+
+	// --- GYROSCOPE ---
+	if (i3gd20.initialized && I3GD20_ReadGyro(&i3gd20, &gyro_raw)) {
+		float gx_raw = gyro_raw.gx * i3gd20.dps_per_lsb;
+		float gy_raw = gyro_raw.gy * i3gd20.dps_per_lsb;
+		float gz_raw = gyro_raw.gz * i3gd20.dps_per_lsb;
+
+		// BIQUAD FILTERING
+		raw_data.gx = Biquad_Process(&filter_gyro_roll,  gx_raw);
+		raw_data.gy = Biquad_Process(&filter_gyro_pitch, gy_raw);
+		raw_data.gz = Biquad_Process(&filter_gyro_yaw,   gz_raw);
+	}
+
+	// Lidar-based altitude/vertical-velocity estimator.
+	// - Innovation gate rejects one-sample spikes unless accel indicates real motion.
+	// - Median-of-5 removes impulse outliers.
+	// - LPF + derivative provides a stable vz estimate for the vertical controller.
+	float z_raw = range_dist_cm * 0.01f; // meters
+	float z_candidate = z_raw;
+	if (lidar_est_initialized) {
+		float dz = z_candidate - lidar_z_prev;
+		float max_step = 0.40f * dt_sec + 0.02f; // m/sample gate
+		float a_norm = sqrtf(raw_data.ax * raw_data.ax + raw_data.ay * raw_data.ay + raw_data.az * raw_data.az);
+		bool accel_event = fabsf(a_norm - 1.0f) > 0.25f;
+		if (fabsf(dz) > max_step && !accel_event) {
+			z_candidate = lidar_z_prev;
+		}
+	}
+
+	lidar_z_hist[lidar_hist_idx] = z_candidate;
+	lidar_hist_idx = (lidar_hist_idx + 1) % 5;
+	if (lidar_hist_count < 5) lidar_hist_count++;
+
+	float z_med = (lidar_hist_count < 5) ? z_candidate : median5f(lidar_z_hist);
+
+	if (!lidar_est_initialized) {
+		lidar_z_filt = z_med;
+		lidar_z_prev = z_med;
+		lidar_vz_filt = 0.0f;
+		lidar_est_initialized = 1;
+	} else {
+		float alpha_z = dt_sec / (0.08f + dt_sec);
+		lidar_z_filt += alpha_z * (z_med - lidar_z_filt);
+
+		float vz_raw = (lidar_z_filt - lidar_z_prev) / dt_sec;
+		lidar_z_prev = lidar_z_filt;
+
+		float alpha_v = dt_sec / (0.12f + dt_sec);
+		lidar_vz_filt += alpha_v * (vz_raw - lidar_vz_filt);
+	}
+
+	g_state.z = range_dist_cm / 100;
+	g_state.vz = lidar_vz_filt;
+
+	// STATE ESTIMATION (AHRS & Kalman)
+	AHRS_Update(&raw_data, &g_state, dt_sec);
+}
+
+static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags) {
+	PIDController* pid_active = &pid_pitch_rate;
+	float setpoint = g_target.rate_pitch;
+	float measurement = g_state.pitch_rate;
+	float reference_cmd = g_target.pitch;
+	float plant_state = g_state.pitch;
+	uint8_t axis_id = 1;
+
+	switch (g_pid_tune_loop) {
+	case PID_TUNE_LOOP_ROLL_RATE:
+		pid_active = &pid_roll_rate;
+		setpoint = g_target.rate_roll;
+		measurement = g_state.roll_rate;
+		reference_cmd = g_target.roll;
+		plant_state = g_state.roll;
+		axis_id = 0;
+		break;
+
+	case PID_TUNE_LOOP_YAW_RATE:
+		pid_active = &pid_yaw_rate;
+		setpoint = g_target.rate_yaw;
+		measurement = g_state.yaw_rate;
+		reference_cmd = g_target.yaw;
+		plant_state = g_state.yaw;
+		axis_id = 2;
+		break;
+
+	case PID_TUNE_LOOP_PITCH_RATE:
+	default:
+		break;
+	}
+
+	uint8_t flags = 0;
+	if (is_system_armed) {
+		flags |= (1U << 0);
+	}
+	if (g_drone_status.drone_mode != MODE_MANUAL_LEVEL &&
+			g_drone_status.drone_mode != MODE_MISSION &&
+			g_drone_status.drone_mode != MODE_THRUST_STAND) {
+		flags |= (1U << 1);
+	}
+	if (g_state.isTuning) {
+		flags |= (1U << 2);
+	}
+
+	pid_tune_data.header = TELEMETRY_HEADER_PID_TUNE;
+	pid_tune_data.timestamp = dt_sec;
+	pid_tune_data.sequence = g_pid_tune_sequence++;
+	pid_tune_data.packet_type = 1;
+	pid_tune_data.loop_id = (uint8_t)g_pid_tune_loop;
+	pid_tune_data.axis_id = axis_id;
+	pid_tune_data.flags = flags;
+	pid_tune_data.sat_flags = sat_flags;
+	pid_tune_data.reserved0 = 0;
+	pid_tune_data.setpoint = setpoint;
+	pid_tune_data.measurement = measurement;
+	pid_tune_data.error = pid_active->previous_error;
+	pid_tune_data.p_term = pid_active->p_out;
+	pid_tune_data.i_term = pid_active->i_out;
+	pid_tune_data.d_term = pid_active->d_out;
+	pid_tune_data.output_sum = pid_active->output;
+	pid_tune_data.kp = pid_active->kp;
+	pid_tune_data.ki = pid_active->ki;
+	pid_tune_data.kd = pid_active->kd;
+	pid_tune_data.reference_cmd = reference_cmd;
+	pid_tune_data.plant_state = plant_state;
+	pid_tune_data.motor1_T_x100 = (int16_t)(telem_data.motor1_T * 100);
+	pid_tune_data.motor2_T_x100 = (int16_t)(telem_data.motor2_T * 100);
+	pid_tune_data.motor3_T_x100 = (int16_t)(telem_data.motor3_T * 100);
+	pid_tune_data.motor4_T_x100 = (int16_t)(telem_data.motor4_T * 100);
+	pid_tune_data.gyro_p_x100 = (int16_t)(g_state.roll_rate * 100.0f);
+	pid_tune_data.gyro_q_x100 = (int16_t)(g_state.pitch_rate * 100.0f);
+	pid_tune_data.gyro_r_x100 = (int16_t)(g_state.yaw_rate * 100.0f);
+	pid_tune_data.magic_footer = 0xAB;
+	pid_tune_data.reserved1 = 0;
+}
+
+static void StageActiveTelemetryFrame(void) {
+	if (g_telem_mode == TELEM_MODE_PID_TUNE &&
+			StartControlState == STATE_MODE_SEL_COMPLETE) {
+		BuildPIDTunePacket(g_state.dt_sec, telem_data.sat_flags);
+		memcpy(spi_tx_buf, &pid_tune_data, SPI_FRAME_LEN);
+		return;
+	}
+
+	telem_data.header = TELEMETRY_HEADER_NORMAL;
+	telem_data.magic_footer = 0xAB;
+	memcpy(spi_tx_buf, &telem_data, SPI_FRAME_LEN);
+}
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
 
-	/* USER CODE BEGIN 1 */
+  /* USER CODE BEGIN 1 */
 
-	/* USER CODE END 1 */
+  /* USER CODE END 1 */
 
-	/* MCU Configuration--------------------------------------------------------*/
+  /* MCU Configuration--------------------------------------------------------*/
 
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-	HAL_Init();
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
 
-	/* USER CODE BEGIN Init */
+  /* USER CODE BEGIN Init */
 
-	/* USER CODE END Init */
+  /* USER CODE END Init */
 
-	/* Configure the system clock */
-	SystemClock_Config();
+  /* Configure the system clock */
+  SystemClock_Config();
 
-	/* USER CODE BEGIN SysInit */
+  /* USER CODE BEGIN SysInit */
 
-	/* USER CODE END SysInit */
+  /* USER CODE END SysInit */
 
-	/* Initialize all configured peripherals */
-	MX_GPIO_Init();
-	MX_DMA_Init();
-	MX_I2C1_Init();
-	MX_USART2_UART_Init();
-	MX_SPI1_Init();
-	MX_USART1_UART_Init();
-	MX_SPI5_Init();
-	MX_TIM3_Init();
-	/* USER CODE BEGIN 2 */
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_I2C1_Init();
+  MX_USART2_UART_Init();
+  MX_SPI1_Init();
+  MX_USART1_UART_Init();
+  MX_SPI5_Init();
+  MX_TIM3_Init();
+  MX_I2C3_Init();
+  MX_ADC1_Init();
+  /* USER CODE BEGIN 2 */
 
 
 
@@ -474,27 +744,20 @@ int main(void)
 
 
 
-	PID_Reset(&pid_roll_angle);
-	PID_Reset(&pid_pitch_angle);
-	PID_Reset(&pid_yaw_angle);
-	PID_Reset(&pid_pos_z);
-	PID_Reset(&pid_vel_z);
-	PID_Reset(&pid_roll_rate);
-	PID_Reset(&pid_pitch_rate);
-	PID_Reset(&pid_yaw_rate);
+	ResetActiveFlightPIDsFromState(&g_state);
+	g_target.yaw = g_state.yaw;
+	g_target.yaw_hold_enabled = true;
+	g_target.rate_yaw = 0.0f;
 
 	SPI5_ArmNextFrame();
 
 	g_state.offGround = false;
-	float thurst_stand = 300.0f;
 	float flight_leg_height = 0.2f;
-	static uint8_t takeoff_yaw_latched = 0;
-	static float takeoff_yaw = 0.0f;
 
-	/* USER CODE END 2 */
+  /* USER CODE END 2 */
 
-	/* Infinite loop */
-	/* USER CODE BEGIN WHILE */
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
 	while (1)
 	{
 
@@ -542,110 +805,14 @@ int main(void)
 		// 2. Run Control Loop at 500Hz
 		if (now - main_last >= 2) {
 
-			float dt_sec = (now - main_last) / 1000.0f;
-			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.002f;
-			main_last = now;
-			g_state.dt_sec = dt_sec;
-			LSM303_Process_DMA(&imu);
+				float dt_sec = (now - main_last) / 1000.0f;
+				if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.002f;
+				main_last = now;
+				g_state.dt_sec = dt_sec;
 
-			uint8_t takeoff_override_this_tick = 0;
-
-			// 1. DATA ACQUISITION
-			// Read raw sensor bits into your ahrsSensor_t struct
-
-
-			// ACCELEROMETER Parsing
-			if (imu.accel_ready) {
-				// Atomic snapshot of the 6-byte buffer
-				uint8_t accel_snap[6];
-				__disable_irq();
-				memcpy(accel_snap, imu.accel_raw, 6);
-				imu.accel_ready = false; // Clear flag in struct
-				__enable_irq();
-
-				// Parse from snapshot (Little Endian: L, H)
-				raw_data.ax = (int16_t)((accel_snap[1] << 8) | accel_snap[0]) * imu.accel_g_per_lsb;
-				raw_data.ay = (int16_t)((accel_snap[3] << 8) | accel_snap[2]) * imu.accel_g_per_lsb;
-				raw_data.az = (int16_t)((accel_snap[5] << 8) | accel_snap[4]) * imu.accel_g_per_lsb;
-			}
-
-			// MAGNETOMETER Parsing
-			if (imu.mag_ready) {
-				uint8_t mag_snap[6];
-				__disable_irq();
-				memcpy(mag_snap, imu.mag_raw, 6);
-				imu.mag_ready = false; // Clear flag in struct
-				__enable_irq();
-
-				if (imu.variant == LSM303_DLHC) {
-					// DLHC: Big Endian and X-Z-Y order
-					raw_data.mx = (int16_t)((mag_snap[0] << 8) | mag_snap[1]) * imu.mag_gauss_per_lsb;
-					raw_data.mz = (int16_t)((mag_snap[2] << 8) | mag_snap[3]) * imu.mag_gauss_per_lsb;
-					raw_data.my = (int16_t)((mag_snap[4] << 8) | mag_snap[5]) * imu.mag_gauss_per_lsb;
-				} else {
-					// AGR: Little Endian and X-Y-Z order
-					raw_data.mx = (int16_t)((mag_snap[1] << 8) | mag_snap[0]) * imu.mag_gauss_per_lsb;
-					raw_data.my = (int16_t)((mag_snap[3] << 8) | mag_snap[2]) * imu.mag_gauss_per_lsb;
-					raw_data.mz = (int16_t)((mag_snap[5] << 8) | mag_snap[4]) * imu.mag_gauss_per_lsb;
-				}
-			}
-			// --- 3. GYROSCOPE  ---
-			if (i3gd20.initialized && I3GD20_ReadGyro(&i3gd20, &gyro_raw)) {
-				float gx_raw = gyro_raw.gx * i3gd20.dps_per_lsb;
-				float gy_raw = gyro_raw.gy * i3gd20.dps_per_lsb;
-				float gz_raw = gyro_raw.gz * i3gd20.dps_per_lsb;
-
-				// 2. BIQUAD FILTERING (THE NEW STEP)
-				raw_data.gx = Biquad_Process(&filter_gyro_roll,  gx_raw);
-				raw_data.gy = Biquad_Process(&filter_gyro_pitch, gy_raw);
-				raw_data.gz = Biquad_Process(&filter_gyro_yaw,   gz_raw);
-			}
-
-			// 3.5 Lidar-based altitude/vertical-velocity estimator.
-			// - Innovation gate rejects one-sample spikes unless accel indicates real motion.
-			// - Median-of-5 removes impulse outliers.
-			// - LPF + derivative provides a stable vz estimate for the vertical controller.
-			float z_raw = range_dist_cm * 0.01f; // meters
-			float z_candidate = z_raw;
-			if (lidar_est_initialized) {
-				float dz = z_candidate - lidar_z_prev;
-				float max_step = 0.40f * dt_sec + 0.02f; // m/sample gate
-				float a_norm = sqrtf(raw_data.ax * raw_data.ax + raw_data.ay * raw_data.ay + raw_data.az * raw_data.az);
-				bool accel_event = fabsf(a_norm - 1.0f) > 0.25f;
-				if (fabsf(dz) > max_step && !accel_event) {
-					z_candidate = lidar_z_prev;
-				}
-			}
-
-			lidar_z_hist[lidar_hist_idx] = z_candidate;
-			lidar_hist_idx = (lidar_hist_idx + 1) % 5;
-			if (lidar_hist_count < 5) lidar_hist_count++;
-
-			float z_med = (lidar_hist_count < 5) ? z_candidate : median5f(lidar_z_hist);
-
-			if (!lidar_est_initialized) {
-				lidar_z_filt = z_med;
-				lidar_z_prev = z_med;
-				lidar_vz_filt = 0.0f;
-				lidar_est_initialized = 1;
-			} else {
-				float alpha_z = dt_sec / (0.08f + dt_sec);
-				lidar_z_filt += alpha_z * (z_med - lidar_z_filt);
-
-				float vz_raw = (lidar_z_filt - lidar_z_prev) / dt_sec;
-				lidar_z_prev = lidar_z_filt;
-
-				float alpha_v = dt_sec / (0.12f + dt_sec);
-				lidar_vz_filt += alpha_v * (vz_raw - lidar_vz_filt);
-			}
-
-			g_state.z = range_dist_cm/100;
-			g_state.vz = lidar_vz_filt;
-
-			// 2. STATE ESTIMATION (AHRS & Kalman)
-			// This internally runs the Kalman Predict/Update and populates g_state
-			AHRS_Update(&raw_data, &g_state, dt_sec);
-			static uint32_t state_timer = 0;
+				uint8_t takeoff_override_this_tick = 0;
+				AcquireSensorsAndUpdateState(dt_sec);
+				static uint32_t state_timer = 0;
 
 			if ((!g_state.offGround) && (is_system_armed)){
 				switch(takeoff_state) {
@@ -653,6 +820,9 @@ int main(void)
 					g_drone_status.flight_mode = 81;
 					PID_Reset(&pid_pos_z); // Clear old errors
 					PID_Reset(&pid_vel_z);
+					g_target.yaw = g_state.yaw;
+					g_target.yaw_hold_enabled = false;
+					g_target.rate_yaw = 0.0f;
 					// Startup guard: keep motors at idle and freeze nav/control this tick
 					ESC_SetThrottle(TIM_CHANNEL_1, 10.0f);
 					ESC_SetThrottle(TIM_CHANNEL_2, 10.0f);
@@ -660,13 +830,15 @@ int main(void)
 					ESC_SetThrottle(TIM_CHANNEL_4, 10.0f);
 					takeoff_override_this_tick = 1;
 					state_timer = now;
-					takeoff_yaw_latched = 0;
 					takeoff_state = SPOOLUP;
 					break;
 
 				case SPOOLUP:
 					// Give motors 500ms to reach idle speed
 					g_drone_status.flight_mode = 82;
+					g_target.yaw = g_state.yaw;
+					g_target.yaw_hold_enabled = false;
+					g_target.rate_yaw = 0.0f;
 					ESC_SetThrottle(TIM_CHANNEL_1, 15.0f);
 					ESC_SetThrottle(TIM_CHANNEL_2, 15.0f);
 					ESC_SetThrottle(TIM_CHANNEL_3, 15.0f);
@@ -680,15 +852,12 @@ int main(void)
 
 				case TAKEOFF:
 					g_drone_status.flight_mode = 83;
-					if (!takeoff_yaw_latched) {
-						takeoff_yaw = g_state.yaw;
-						takeoff_yaw_latched = 1;
-					}
-
 					g_target.roll  = 0.0f;
 					g_target.pitch = 0.0f;
-					g_target.yaw   = takeoff_yaw;
-					g_target.z     = flight_leg_height + 0.2 ;
+					g_target.yaw = g_state.yaw;
+					g_target.yaw_hold_enabled = false;
+					g_target.rate_yaw = 0.0f;
+					g_target.z     = flight_leg_height + 0.2f;
 					g_target.ff_vz = 0.5f;
 
 					// Allow control update in TAKEOFF to climb toward z target
@@ -703,16 +872,11 @@ int main(void)
 
 				case TRANSISTION:
 					g_drone_status.flight_mode = 84;
-					PID_Reset(&pid_roll_angle);
-					PID_Reset(&pid_pitch_angle);
-					PID_Reset(&pid_yaw_angle);
-					PID_Reset(&pid_pos_z);
-					PID_Reset(&pid_vel_z);
-					PID_Reset(&pid_roll_rate);
-					PID_Reset(&pid_pitch_rate);
-					PID_Reset(&pid_yaw_rate);
+					g_target.yaw = g_state.yaw;
+					g_target.yaw_hold_enabled = true;
+					g_target.rate_yaw = 0.0f;
+					ResetActiveFlightPIDsFromState(&g_state);
 					g_state.offGround = true; // Hand over to main flight controller
-					takeoff_yaw_latched = 0;
 					g_drone_status.flight_mode = 0x08; //Stabilize
 					break;
 				}
@@ -725,6 +889,14 @@ int main(void)
 			 */
 			// 3. NAVIGATION (Mission Manager)
 			// 2. MISSION LOGIC
+			uint8_t invalid_mode_requested = 0;
+			if (!takeoff_override_this_tick &&
+					(g_drone_status.drone_mode != MODE_MANUAL_LEVEL) &&
+					(g_drone_status.drone_mode != MODE_MISSION) &&
+					(g_drone_status.drone_mode != MODE_THRUST_STAND)) {
+				invalid_mode_requested = 1;
+			}
+
 			if (is_estop_active){
 				// Force a landing setpoint: Stay at current X/Y, but descend Z
 				g_target.x = g_state.x;
@@ -738,11 +910,7 @@ int main(void)
 				g_target.ff_vz = -descent_rate;
 
 				// Auto-disarm immediately
-				PID_Reset(&pid_roll);
-				PID_Reset(&pid_pitch);
-				PID_Reset(&pid_yaw);
-				PID_Reset(&pid_pos_z);
-				PID_Reset(&pid_vel_z);
+				ResetActiveFlightPIDsFromState(&g_state);
 				g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
 				g_state.offGround = false;
 				// Force immediate hardware override to 0%
@@ -767,11 +935,7 @@ int main(void)
 
 				// Auto-disarm once on the ground
 				if (g_state.z <= flight_leg_height){//flight_leg_height) {
-					PID_Reset(&pid_roll);
-					PID_Reset(&pid_pitch);
-					PID_Reset(&pid_yaw);
-					PID_Reset(&pid_pos_z);
-					PID_Reset(&pid_vel_z);
+					ResetActiveFlightPIDsFromState(&g_state);
 					g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
 					g_state.offGround = false;
 					// Force immediate hardware override to 0%
@@ -782,11 +946,24 @@ int main(void)
 					is_estop_active = 0; // Reset for next boot
 				}
 
+			} else if (!takeoff_override_this_tick && invalid_mode_requested) {
+				// Safety fallback for unsupported/reserved modes: inhibit control outputs
+				g_target.rate_roll = 0.0f;
+				g_target.rate_pitch = 0.0f;
+				g_target.rate_yaw = 0.0f;
+				g_target.ff_vz = 0.0f;
+
+				if (is_system_armed) {
+					for(int i = 1; i <= 4; i++) {
+						ESC_SetThrottle(get_timer_channel(i), 0.0f);
+					}
+				}
 			} else if (!takeoff_override_this_tick &&
 					(g_drone_status.drone_mode == MODE_MANUAL_LEVEL) &&
 					(takeoff_state != TAKEOFF)){
 				g_drone_status.flight_mode = 8; //Stabilize
 				g_drone_status.drone_mode = 1; // Signal Manual Mode
+				g_target.yaw_hold_enabled = true;
 				if (isnan(g_state.roll) || isnan(g_state.pitch) || isnan(g_state.yaw)) {
 					// Force reset the state so the math can recover
 					g_state.roll = 0.0f;
@@ -806,6 +983,7 @@ int main(void)
 				g_drone_status.drone_mode = 2;
 				g_drone_status.flight_mode = 0x08; //Stabilize
 				Navigation_GetTarget(&g_mission, (float)now / 1000.0f, &g_state, &g_target);
+				g_target.yaw_hold_enabled = true;
 
 			} else if (g_drone_status.drone_mode == MODE_THRUST_STAND) {
 				g_drone_status.drone_mode = 3;
@@ -821,7 +999,10 @@ int main(void)
 				g_target.rate_roll = 0.0f;
 				g_target.rate_yaw = 0.0f;
 			}
-			if (is_system_armed && !takeoff_override_this_tick) {
+			if (invalid_mode_requested) {
+				telem_data.sat_flags = 0;
+			}
+			else if (is_system_armed && !takeoff_override_this_tick) {
 				g_drone_status.flight_mode = 8;
 				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target, &g_drone_status);
 			}
@@ -932,444 +1113,530 @@ int main(void)
 
 		}
 	}
-	/* USER CODE END WHILE */
+    /* USER CODE END WHILE */
 
-	/* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
 
-	/* USER CODE END 3 */
+  /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
-	RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-	RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-	/** Configure the main internal regulator output voltage
-	 */
-	__HAL_RCC_PWR_CLK_ENABLE();
-	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-	/** Initializes the RCC Oscillators according to the specified parameters
-	 * in the RCC_OscInitTypeDef structure.
-	 */
-	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-	RCC_OscInitStruct.PLL.PLLM = 4;
-	RCC_OscInitStruct.PLL.PLLN = 96;
-	RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-	RCC_OscInitStruct.PLL.PLLQ = 3;
-	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-	{
-		Error_Handler();
-	}
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 3;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-	/** Initializes the CPU, AHB and APB buses clocks
-	 */
-	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-			|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV8;
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV8;
 
-	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-	{
-		Error_Handler();
-	}
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
- * @brief I2C1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV8;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_I2C1_Init(void)
 {
 
-	/* USER CODE BEGIN I2C1_Init 0 */
+  /* USER CODE BEGIN I2C1_Init 0 */
 
-	/* USER CODE END I2C1_Init 0 */
+  /* USER CODE END I2C1_Init 0 */
 
-	/* USER CODE BEGIN I2C1_Init 1 */
+  /* USER CODE BEGIN I2C1_Init 1 */
 
-	/* USER CODE END I2C1_Init 1 */
-	hi2c1.Instance = I2C1;
-	hi2c1.Init.ClockSpeed = 100000;
-	hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-	hi2c1.Init.OwnAddress1 = 0;
-	hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-	hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-	hi2c1.Init.OwnAddress2 = 0;
-	hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-	hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-	if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN I2C1_Init 2 */
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
 
-	/* USER CODE END I2C1_Init 2 */
+  /* USER CODE END I2C1_Init 2 */
 
 }
 
 /**
- * @brief SPI1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief I2C3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C3_Init(void)
+{
+
+  /* USER CODE BEGIN I2C3_Init 0 */
+
+  /* USER CODE END I2C3_Init 0 */
+
+  /* USER CODE BEGIN I2C3_Init 1 */
+
+  /* USER CODE END I2C3_Init 1 */
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.ClockSpeed = 100000;
+  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C3_Init 2 */
+
+  /* USER CODE END I2C3_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_SPI1_Init(void)
 {
 
-	/* USER CODE BEGIN SPI1_Init 0 */
+  /* USER CODE BEGIN SPI1_Init 0 */
 
-	/* USER CODE END SPI1_Init 0 */
+  /* USER CODE END SPI1_Init 0 */
 
-	/* USER CODE BEGIN SPI1_Init 1 */
+  /* USER CODE BEGIN SPI1_Init 1 */
 
-	/* USER CODE END SPI1_Init 1 */
-	/* SPI1 parameter configuration*/
-	hspi1.Instance = SPI1;
-	hspi1.Init.Mode = SPI_MODE_MASTER;
-	hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-	hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-	hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
-	hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
-	hspi1.Init.NSS = SPI_NSS_SOFT;
-	hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-	hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-	hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-	hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-	hspi1.Init.CRCPolynomial = 10;
-	if (HAL_SPI_Init(&hspi1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN SPI1_Init 2 */
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
 
-	/* USER CODE END SPI1_Init 2 */
+  /* USER CODE END SPI1_Init 2 */
 
 }
 
 /**
- * @brief SPI5 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief SPI5 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_SPI5_Init(void)
 {
 
-	/* USER CODE BEGIN SPI5_Init 0 */
+  /* USER CODE BEGIN SPI5_Init 0 */
 
-	/* USER CODE END SPI5_Init 0 */
+  /* USER CODE END SPI5_Init 0 */
 
-	/* USER CODE BEGIN SPI5_Init 1 */
+  /* USER CODE BEGIN SPI5_Init 1 */
 
-	/* USER CODE END SPI5_Init 1 */
-	/* SPI5 parameter configuration*/
-	hspi5.Instance = SPI5;
-	hspi5.Init.Mode = SPI_MODE_SLAVE;
-	hspi5.Init.Direction = SPI_DIRECTION_2LINES;
-	hspi5.Init.DataSize = SPI_DATASIZE_8BIT;
-	hspi5.Init.CLKPolarity = SPI_POLARITY_LOW;
-	hspi5.Init.CLKPhase = SPI_PHASE_2EDGE;
-	hspi5.Init.NSS = SPI_NSS_HARD_INPUT;
-	hspi5.Init.FirstBit = SPI_FIRSTBIT_MSB;
-	hspi5.Init.TIMode = SPI_TIMODE_DISABLE;
-	hspi5.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-	hspi5.Init.CRCPolynomial = 10;
-	if (HAL_SPI_Init(&hspi5) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN SPI5_Init 2 */
+  /* USER CODE END SPI5_Init 1 */
+  /* SPI5 parameter configuration*/
+  hspi5.Instance = SPI5;
+  hspi5.Init.Mode = SPI_MODE_SLAVE;
+  hspi5.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi5.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi5.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi5.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi5.Init.NSS = SPI_NSS_HARD_INPUT;
+  hspi5.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi5.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi5.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi5.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI5_Init 2 */
 
-	/* USER CODE END SPI5_Init 2 */
+  /* USER CODE END SPI5_Init 2 */
 
 }
 
 /**
- * @brief TIM3 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_TIM3_Init(void)
 {
 
-	/* USER CODE BEGIN TIM3_Init 0 */
+  /* USER CODE BEGIN TIM3_Init 0 */
 
-	/* USER CODE END TIM3_Init 0 */
+  /* USER CODE END TIM3_Init 0 */
 
-	TIM_MasterConfigTypeDef sMasterConfig = {0};
-	TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
-	/* USER CODE BEGIN TIM3_Init 1 */
+  /* USER CODE BEGIN TIM3_Init 1 */
 
-	/* USER CODE END TIM3_Init 1 */
-	htim3.Instance = TIM3;
-	htim3.Init.Prescaler = 47;
-	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-	htim3.Init.Period = 2499;
-	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-	if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	sConfigOC.OCMode = TIM_OCMODE_PWM1;
-	sConfigOC.Pulse = 1000;
-	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-	if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN TIM3_Init 2 */
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 47;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 2499;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1000;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
 
-	/* USER CODE END TIM3_Init 2 */
-	HAL_TIM_MspPostInit(&htim3);
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
 
 }
 
 /**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART1_UART_Init(void)
 {
 
-	/* USER CODE BEGIN USART1_Init 0 */
+  /* USER CODE BEGIN USART1_Init 0 */
 
-	/* USER CODE END USART1_Init 0 */
+  /* USER CODE END USART1_Init 0 */
 
-	/* USER CODE BEGIN USART1_Init 1 */
+  /* USER CODE BEGIN USART1_Init 1 */
 
-	/* USER CODE END USART1_Init 1 */
-	huart1.Instance = USART1;
-	huart1.Init.BaudRate = 115200;
-	huart1.Init.WordLength = UART_WORDLENGTH_8B;
-	huart1.Init.StopBits = UART_STOPBITS_1;
-	huart1.Init.Parity = UART_PARITY_NONE;
-	huart1.Init.Mode = UART_MODE_TX_RX;
-	huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-	huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart1) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN USART1_Init 2 */
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
 
-	/* USER CODE END USART1_Init 2 */
+  /* USER CODE END USART1_Init 2 */
 
 }
 
 /**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_USART2_UART_Init(void)
 {
 
-	/* USER CODE BEGIN USART2_Init 0 */
+  /* USER CODE BEGIN USART2_Init 0 */
 
-	/* USER CODE END USART2_Init 0 */
+  /* USER CODE END USART2_Init 0 */
 
-	/* USER CODE BEGIN USART2_Init 1 */
+  /* USER CODE BEGIN USART2_Init 1 */
 
-	/* USER CODE END USART2_Init 1 */
-	huart2.Instance = USART2;
-	huart2.Init.BaudRate = 115200;
-	huart2.Init.WordLength = UART_WORDLENGTH_8B;
-	huart2.Init.StopBits = UART_STOPBITS_1;
-	huart2.Init.Parity = UART_PARITY_NONE;
-	huart2.Init.Mode = UART_MODE_TX_RX;
-	huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-	huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-	if (HAL_UART_Init(&huart2) != HAL_OK)
-	{
-		Error_Handler();
-	}
-	/* USER CODE BEGIN USART2_Init 2 */
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
 
-	/* USER CODE END USART2_Init 2 */
+  /* USER CODE END USART2_Init 2 */
 
 }
 
 /**
- * Enable DMA controller clock
- */
+  * Enable DMA controller clock
+  */
 static void MX_DMA_Init(void)
 {
 
-	/* DMA controller clock enable */
-	__HAL_RCC_DMA2_CLK_ENABLE();
-	__HAL_RCC_DMA1_CLK_ENABLE();
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
-	/* DMA interrupt init */
-	/* DMA1_Stream0_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
-	/* DMA1_Stream1_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
-	/* DMA2_Stream2_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
-	/* DMA2_Stream3_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
-	/* DMA2_Stream4_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
-	/* DMA2_Stream7_IRQn interrupt configuration */
-	HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
-	HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+  /* DMA1_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+  /* DMA2_Stream2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+  /* DMA2_Stream4_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
+  /* DMA2_Stream7_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
 
 }
 
 /**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
-	GPIO_InitTypeDef GPIO_InitStruct = {0};
-	/* USER CODE BEGIN MX_GPIO_Init_1 */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-	/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
-	/* GPIO Ports Clock Enable */
-	__HAL_RCC_GPIOE_CLK_ENABLE();
-	__HAL_RCC_GPIOC_CLK_ENABLE();
-	__HAL_RCC_GPIOH_CLK_ENABLE();
-	__HAL_RCC_GPIOA_CLK_ENABLE();
-	__HAL_RCC_GPIOB_CLK_ENABLE();
-	__HAL_RCC_GPIOD_CLK_ENABLE();
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
-	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
 
-	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
 
-	/*Configure GPIO pin Output Level */
-	HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-			|Audio_RST_Pin, GPIO_PIN_RESET);
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
+                          |Audio_RST_Pin, GPIO_PIN_RESET);
 
-	/*Configure GPIO pin : PE2 */
-	GPIO_InitStruct.Pin = GPIO_PIN_2;
-	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  /*Configure GPIO pin : PE2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : CS_I2C_SPI_Pin */
-	GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : CS_I2C_SPI_Pin */
+  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
 
-	/*Configure GPIO pins : PE4 PE5 MEMS_INT2_Pin */
-	GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|MEMS_INT2_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  /*Configure GPIO pins : PE4 PE5 MEMS_INT2_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|MEMS_INT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
-	GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
+  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : PDM_OUT_Pin */
-	GPIO_InitStruct.Pin = PDM_OUT_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-	HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : PDM_OUT_Pin */
+  GPIO_InitStruct.Pin = PDM_OUT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : PA0 */
-	GPIO_InitStruct.Pin = GPIO_PIN_0;
-	GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  /*Configure GPIO pin : PA0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-	/*Configure GPIO pins : CLK_IN_Pin PB12 */
-	GPIO_InitStruct.Pin = CLK_IN_Pin|GPIO_PIN_12;
-	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  /*Configure GPIO pins : CLK_IN_Pin PB12 */
+  GPIO_InitStruct.Pin = CLK_IN_Pin|GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : PB14 */
-	GPIO_InitStruct.Pin = GPIO_PIN_14;
-	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-	GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  /*Configure GPIO pin : PB14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-	/*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
+  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
                            Audio_RST_Pin */
-	GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-			|Audio_RST_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
+                          |Audio_RST_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-	/*Configure GPIO pins : I2S3_MCK_Pin I2S3_SCK_Pin I2S3_SD_Pin */
-	GPIO_InitStruct.Pin = I2S3_MCK_Pin|I2S3_SCK_Pin|I2S3_SD_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-	GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
-	HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  /*Configure GPIO pins : I2S3_MCK_Pin I2S3_SCK_Pin I2S3_SD_Pin */
+  GPIO_InitStruct.Pin = I2S3_MCK_Pin|I2S3_SCK_Pin|I2S3_SD_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : VBUS_FS_Pin */
-	GPIO_InitStruct.Pin = VBUS_FS_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(VBUS_FS_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : VBUS_FS_Pin */
+  GPIO_InitStruct.Pin = VBUS_FS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(VBUS_FS_GPIO_Port, &GPIO_InitStruct);
 
-	/*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
-	GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStruct.Pull = GPIO_NOPULL;
-	HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+  /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
+  GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
 
-	/* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-	/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -1378,17 +1645,22 @@ void start_control(void) {
 	switch (StartControlState) {
 	case STATE_INIT:
 		g_drone_status.flight_mode = 5;
-		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---
+		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---\
+
+		PID_Init(&pid_pos_z, 0.3f, 0.0f, 0.0f, 0.002f, 5.0f);   // Position P gain
+
+		PID_Init(&pid_vel_z, 0.2f, 0.01f, 0.0f, 0.002f, 10.0f); // Velocity PID with I-limit
+
 		PID_Init(&pid_roll_angle,  0.4f, 0.000f, 0.000f, 0.002f, 10.0f);
 		PID_Init(&pid_pitch_angle, 0.4f, 0.000f, 0.000f, 0.002f, 10.0f);
 		PID_Init(&pid_yaw_angle,   0.3f, 0.000f, 0.000f, 0.002f, 10.0f);
 
-		PID_Init(&pid_roll_rate, 0.1f, 0.001f, 0.000f, 0.002f, 0.35f);
-		PID_Init(&pid_pitch_rate, 0.1f, 0.001f, 0.000f, 0.002f, 0.35f);
-		PID_Init(&pid_yaw_rate, 0.12f, 0.001f, 0.000f, 0.002f, 0.20f);
+		PID_Init(&pid_roll_rate, 0.1f, 0.0f, 0.000f, 0.002f, 0.35f);
+		PID_Init(&pid_pitch_rate, 0.1f, 0.0f, 0.000f, 0.002f, 0.35f);
+		PID_Init(&pid_yaw_rate, 0.12f, 0.0f, 0.000f, 0.002f, 0.12f);
 
-		PID_Init(&pid_pos_z, 0.3f, 0.0f, 0.0f, 0.002f, 0.0f);   // Position P gain
-		PID_Init(&pid_vel_z, 0.2f, 0.01f, 0.01f, 0.002f, 5.0f); // Velocity PID with I-limit
+		
+		
 
 		float d_alpha = PID_Calculate_Alpha(20.0f, 0.002f);
 		pid_roll_rate.d_low_pass_alpha = d_alpha;
@@ -1401,7 +1673,7 @@ void start_control(void) {
 		Biquad_Set_Lowpass(&filter_gyro_roll,  80.0f, 500.0f);
 		Biquad_Set_Lowpass(&filter_gyro_yaw,   80.0f, 500.0f);
 
-		// Turn off the ESC Beep...usafelly, but oh well
+		// Turn off the ESC Beep...un-safe, but oh well
 		ESC_ArmAll();
 		ESC_Disarm();
 
@@ -1419,7 +1691,6 @@ void start_control(void) {
 		SPI5_ArmNextFrame();
 		// --- 2. HARDWARE INITIALIZATION LOOP ---
 		uint8_t sensorInit = 0;
-		uint8_t cal_samples = 0;
 		while (sensorInit == 0)
 		{
 			g_drone_status.flight_mode = 5;
@@ -1766,9 +2037,11 @@ void start_control(void) {
 
 	case STATE_MODE_SEL: {
 		static uint8_t entered = 0;
+		static uint32_t mode_sel_last_ms = 0;
 		if (!entered) {
 			g_drone_status.drone_mode = 0;
 			entered = 1;
+			mode_sel_last_ms = HAL_GetTick();
 			SPI5_ArmNextFrame();
 		}
 
@@ -1816,6 +2089,17 @@ void start_control(void) {
 			SPI5_ArmNextFrame();
 		}
 
+
+
+
+		telem_data.timestamp  = g_state.dt_sec;
+		telem_data.roll       = g_state.roll;
+		telem_data.pitch      = g_state.pitch;
+		telem_data.yaw        = g_state.yaw;
+		telem_data.altitude   = range_dist_cm;
+		telem_data.armed      = is_system_armed ? 0xFF : 0x00;
+		telem_data.drone_mode = g_drone_status.drone_mode;
+
 		// --- RESTORED STATE MACHINE CRITERIA ---
 
 		// Criterion A: Autotune Request
@@ -1830,6 +2114,7 @@ void start_control(void) {
 		// Fixed: Using your global instance g_drone_status
 		if (g_drone_status.drone_mode != 0) {
 			StartControlState = STATE_MODE_SEL_COMPLETE;
+			mode_sel_last_ms = 0;
 			entered = 0;
 		}
 		break;
@@ -1845,16 +2130,14 @@ static void SPI5_ArmNextFrame(void)
 
 	// --------------------------------
 	__HAL_SPI_CLEAR_OVRFLAG(&hspi5);
-	// 2. RE-INIT HEADERS (You MUST do this every frame)
-	telem_data.header = 0xDEADBEEF;
-	telem_data.magic_footer = 0xAB;
+	StageActiveTelemetryFrame();
 
 	// 3. Clear RX buffer
 	spi_rx_buffer[0] = 0;
 
 	// 5. Arm the DMA
 	HAL_StatusTypeDef status = HAL_SPI_TransmitReceive_DMA(&hspi5,
-			(uint8_t*)&telem_data,
+			spi_tx_buf,
 			spi_rx_buffer,
 			SPI_FRAME_LEN);
 
@@ -1924,9 +2207,7 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 	switch (cmd[0]) {
 
 	case 'x': case 'X': // --- EMERGENCY STOP ---
-		for(uint32_t ch = 1; ch <= 4; ch++) {
-			ESC_SetThrottle(get_timer_channel(ch), 0.0f);
-		}
+		ESC_Disarm();
 		is_estop_active = 1;
 		is_system_armed = 0;
 		g_mission.landing_start_t = (float)HAL_GetTick() / 1000.0f;
@@ -1939,27 +2220,39 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 		if (cmd[1] == 'r' && cmd[2] == 'm') { // "arm"
 			ESC_ArmAll();
 		}
-		else if (cmd[1] == 'l' && cmd[2] == 'l') { // "all t25.0"
+		else if (cmd[1] == 'l' && cmd[2] == 'l') { // "all p25.0"
 			char* t_ptr = strchr(cmd, 'p');
 			if (t_ptr != NULL) {
 				char* val_start = t_ptr + 1;
 				while (*val_start == ' ') val_start++;
 
 				float throttle = strtof(val_start, NULL);
-				ESC_SetThrottle(TIM_CHANNEL_1, throttle);
-				ESC_SetThrottle(TIM_CHANNEL_2, throttle);
-				ESC_SetThrottle(TIM_CHANNEL_3, throttle);
-				ESC_SetThrottle(TIM_CHANNEL_4, throttle);
+				float motor_scales[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+				Mixer_GetMotorScales(motor_scales);
+				ESC_SetThrottle(TIM_CHANNEL_1, throttle * motor_scales[0]);
+				ESC_SetThrottle(TIM_CHANNEL_2, throttle * motor_scales[1]);
+				ESC_SetThrottle(TIM_CHANNEL_3, throttle * motor_scales[2]);
+				ESC_SetThrottle(TIM_CHANNEL_4, throttle * motor_scales[3]);
 			}
 		}
 		break;
 
 	case 'm': // --- MOTOR or MODE ---
 		// Check if it's "mode"
-		if (cmd[1] == 'o' && cmd[2] == 'd') { // "mode 2"
+		if (cmd[1] == 'o' && cmd[2] == 'd') { // "mode 1|2|3"
 			char* val_ptr = strchr(cmd, ' ');
 			if (val_ptr != NULL) {
-				g_drone_status.drone_mode = (uint8_t)atoi(val_ptr + 1);
+				int requested_mode = atoi(val_ptr + 1);
+				if (requested_mode == MODE_MANUAL_LEVEL ||
+						requested_mode == MODE_MISSION ||
+						requested_mode == MODE_THRUST_STAND) {
+					g_drone_status.drone_mode = (uint8_t)requested_mode;
+				} else {
+					// Unsupported/reserved mode IDs (including obsolete mode 4) are ignored
+					unknownTelemCMD_counter += 1;
+				}
+			} else {
+				unknownTelemCMD_counter += 1;
 			}
 		}
 		// Check if it's "motor X tY" (e.g. "m1 p10" or "motor 1 p10")
@@ -2013,6 +2306,25 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 	case 't': // --- TUNE ---
 		if (cmd[1] == 'u') {
 			tune_request = 1;
+		} else if (cmd[1] == 'p') {
+			char* val_ptr = strchr(cmd, ' ');
+			if (val_ptr != NULL) {
+				int requested_loop = atoi(val_ptr + 1);
+				if (requested_loop == PID_TUNE_LOOP_ROLL_RATE ||
+						requested_loop == PID_TUNE_LOOP_PITCH_RATE ||
+						requested_loop == PID_TUNE_LOOP_YAW_RATE) {
+					g_pid_tune_loop = (pidTuneLoop_t)requested_loop;
+					g_telem_mode = TELEM_MODE_PID_TUNE;
+				} else {
+					unknownTelemCMD_counter += 1;
+				}
+			} else {
+				unknownTelemCMD_counter += 1;
+			}
+		} else if (cmd[1] == 'n') {
+			g_telem_mode = TELEM_MODE_NORMAL;
+		} else {
+			unknownTelemCMD_counter += 1;
 		}
 		break;
 	}
@@ -2152,12 +2464,8 @@ void ESC_ArmAll(void) {
 	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ESC_ARM_PULSE); // PB5
 	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, ESC_ARM_PULSE); // PC8
 	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, ESC_ARM_PULSE); // PC9
-	// Zero PIDS
-	PID_Reset(&pid_roll);
-	PID_Reset(&pid_pitch);
-	PID_Reset(&pid_yaw);
-	PID_Reset(&pid_pos_z);
-	PID_Reset(&pid_vel_z);
+	// Zero active flight-control PID memory before enabling outputs
+	ResetActiveFlightPIDsFromState(&g_state);
 	// Enable PWM Generation
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
@@ -2183,7 +2491,7 @@ void ESC_ArmAll(void) {
 void ESC_Disarm(void) {
 	// Turn off the ESC Beep
 	g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
-	g_state.offGround = false;
+	g_drone_status.armed = 0;
 	// Force immediate hardware override to 0%
 	for(int i = 1; i <= 4; i++) {
 		ESC_SetThrottle(get_timer_channel(i), 0.0f);
@@ -2224,33 +2532,33 @@ static void I2C1_Scan(void) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
-	/* USER CODE BEGIN Error_Handler_Debug */
+  /* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1)
 	{
 	}
-	/* USER CODE END Error_Handler_Debug */
+  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-	/* USER CODE BEGIN 6 */
+  /* USER CODE BEGIN 6 */
 	/* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-	/* USER CODE END 6 */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

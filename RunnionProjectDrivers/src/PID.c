@@ -94,4 +94,16 @@ void PID_Reset(PIDController* pid) {
     if (!pid) return;
     pid->previous_error = 0.0f;
     pid->previous_i = 0.0f;
+    pid->previous_d_filtered = 0.0f;
+    pid->previous_actual = 0.0f;
+    pid->p_out = 0.0f;
+    pid->i_out = 0.0f;
+    pid->d_out = 0.0f;
+    pid->output = 0.0f;
+}
+
+void PID_ResetWithMeasurement(PIDController* pid, float actual_now) {
+    if (!pid) return;
+    PID_Reset(pid);
+    pid->previous_actual = actual_now;
 }
