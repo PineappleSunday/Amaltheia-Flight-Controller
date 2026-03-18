@@ -6,7 +6,7 @@
 #define MOTOR_SCALE_MIN 0.1f
 #define MOTOR_SCALE_MAX 3.0f
 
-static float g_motor_scale[4] = {1.0f, 1.0f, 0.8f, 1.1f};
+static float g_motor_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 static float constrain(float value, float min, float max) {
 	if (value < min) return min;

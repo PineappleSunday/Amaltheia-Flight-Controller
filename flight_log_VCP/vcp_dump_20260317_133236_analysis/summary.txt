@@ -1,0 +1,21 @@
+=== Amaltheia VCP Analysis Summary ===
+Samples: 10061
+Duration: 106.544 s
+Estimated stream rate: 37878.79 Hz
+Sequence drops: 0
+Armed ratio: 55.88 %
+Dominant drone_mode: 1
+Dominant flight_mode: 8
+
+Rate Error Metrics (deg/s):
+  Roll  RMS=14.2249 MAE=6.9701 P95|e|=32.6162 Max|e|=84.3023
+  Pitch RMS=11.8663 MAE=5.8811 P95|e|=30.4342 Max|e|=61.9101
+  Yaw   RMS=18.3243 MAE=8.2144 P95|e|=29.5244 Max|e|=182.2048
+
+Motor Means (%): [28.144 27.879 22.492 30.894]
+Motor Std (%):   [25.362 25.122 20.251 27.865]
+Motor mean imbalance (max-min): 8.403 %
+
+Saturation counts (low-side bits M1..M4):  [0 0 0 0]
+Saturation counts (high-side bits M1..M4): [0 0 0 0]
+

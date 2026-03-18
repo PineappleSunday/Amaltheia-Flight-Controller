@@ -113,9 +113,9 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     float gy_dps =  raw->gx - g_offsets.pitch_bias; // body Y
     float gz_dps =  raw->gz - g_offsets.yaw_bias;   // body Z
     // Remap gyro to Accel/Mag Frame, also Body Frame
-    float ax = raw->ax;
-    float ay = raw->ay;
-    float az = raw->az;
+    float ax = raw->ax; // body X
+    float ay = raw->ay; // body Y
+    float az = raw->az; // body Z
 
     float mx = raw->mx;
     float my = raw->my;
@@ -284,12 +284,12 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     // convention as legacy accel equations:
     // accel_roll  = atan2(-ay, az)
     // accel_pitch = atan2(ax, sqrt(ay^2 + az^2))
-    float g_bx = 2.0f * (q[0] * q[1] + q[2] * q[3]);
-    float g_by = 2.0f * (q[1] * q[3] - q[0] * q[2]);
-    float g_bz = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
+    float ax_pred = 2.0f * (q[1] * q[3] - q[0] * q[2]);
+    float ay_pred = 2.0f * (q[0] * q[1] + q[2] * q[3]);
+    float az_pred = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
     const float r2d = 57.2957795f;
-    float roll_deg = atan2f(-g_by, g_bz) * r2d;
-    float pitch_deg = atan2f(g_bx, sqrtf(g_by * g_by + g_bz * g_bz)) * r2d;
+    float roll_deg  = atan2f( ay_pred, az_pred) * r2d;
+    float pitch_deg = atan2f(-ax_pred, sqrtf(ay_pred * ay_pred + az_pred * az_pred)) * r2d;
 
     state->roll  = roll_deg;
     state->pitch = pitch_deg;

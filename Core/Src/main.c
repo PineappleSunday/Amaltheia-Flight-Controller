@@ -2,12 +2,13 @@
 /**
  ******************************************************************************
  * @file           : main.c
- * @brief          : Main program body (USB REMOVED - UART DEBUG ONLY)
+ * @brief          : Main program body
  ******************************************************************************
  */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -26,6 +27,7 @@
 #include <float.h>
 #include "biquadButter.h"
 #include <ctype.h>
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -106,6 +108,40 @@ typedef struct __attribute__((packed)) {
 	uint8_t reserved1;
 } PIDTune_Packet_t;
 _Static_assert(sizeof(PIDTune_Packet_t) == 80, "PID Tune Struct size mismatch!");
+
+typedef struct __attribute__((packed)) {
+	uint32_t header;
+	uint32_t tick_ms;
+	uint16_t sequence;
+	uint8_t armed;
+	uint8_t drone_mode;
+	uint8_t flight_mode;
+	uint8_t sat_flags;
+	float dt_sec;
+
+	float x, y, z;
+	float vx, vy, vz;
+	float roll, pitch, yaw;
+	float roll_rate, pitch_rate, yaw_rate;
+
+	float accel_x, accel_y, accel_z;
+	float mag_x, mag_y, mag_z;
+	float gyro_x, gyro_y, gyro_z;
+
+	float target_x, target_y, target_z;
+	float target_roll, target_pitch, target_yaw;
+	float target_rate_roll, target_rate_pitch, target_rate_yaw;
+	float target_ff_vz;
+
+	float pid_roll_p, pid_roll_i, pid_roll_d, pid_roll_out;
+	float pid_pitch_p, pid_pitch_i, pid_pitch_d, pid_pitch_out;
+	float pid_yaw_p, pid_yaw_i, pid_yaw_d, pid_yaw_out;
+	float pid_velz_p, pid_velz_i, pid_velz_d, pid_velz_out;
+
+	float motor1_pct, motor2_pct, motor3_pct, motor4_pct;
+	uint8_t magic_footer;
+} VCPDumpPacket_t;
+_Static_assert(sizeof(VCPDumpPacket_t) == 223, "VCP dump packet size mismatch!");
 
 static bool normal_telem = true;
 static uint8_t dbg_axis = 1;   // 0=roll, 1=pitch, 2=yaw
@@ -215,6 +251,11 @@ BiquadFilter_t filter_gyro_yaw;
 #define ESC_ARM_PULSE 1000  // Arming signal
 
 #define LIDAR_BUF_SIZE 128
+
+#define VCP_DUMP_ENABLE      1U
+#define VCP_DUMP_PERIOD_MS   10U
+#define VCP_DUMP_HEADER      0x31504356UL  // "VCP1"
+#define VCP_DUMP_FOOTER      0xABU
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -274,6 +315,9 @@ volatile float target_throttle = 0.0f; // The throttle we want
 
 Telemetry_Packet_t telem_data;
 PIDTune_Packet_t pid_tune_data;
+static VCPDumpPacket_t vcp_dump_packet;
+static uint16_t vcp_dump_sequence = 0;
+static uint32_t vcp_last_tx_ms = 0;
 
 uint8_t spi_rx_buffer[SPI_FRAME_LEN];
 uint8_t spi_tx_buf[SPI_FRAME_LEN];
@@ -393,10 +437,11 @@ static void ResetActiveFlightPIDsFromState(const vehicleState_t* state);
 static void AcquireSensorsAndUpdateState(float dt_sec);
 static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags);
 static void StageActiveTelemetryFrame(void);
+static void VCP_Dump_TrySend(uint32_t now_ms);
 
 //SPI1 GYRO
 //I2C1 ACCEL/MAG
-//UART2 ST-LINK
+//USB CDC (Virtual COM)
 //SPI5 ESP8826
 
 /* Custom ESC Control Functions */
@@ -423,6 +468,84 @@ int _write(int file, char *ptr, int len) {
 		ITM_SendChar((*ptr++));
 	}
 	return len;
+}
+
+static void VCP_Dump_TrySend(uint32_t now_ms) {
+#if VCP_DUMP_ENABLE
+	if ((now_ms - vcp_last_tx_ms) < VCP_DUMP_PERIOD_MS) {
+		return;
+	}
+	vcp_last_tx_ms = now_ms;
+
+	vcp_dump_packet.header = VCP_DUMP_HEADER;
+	vcp_dump_packet.tick_ms = now_ms;
+	vcp_dump_packet.sequence = vcp_dump_sequence++;
+	vcp_dump_packet.armed = telem_data.armed;
+	vcp_dump_packet.drone_mode = g_drone_status.drone_mode;
+	vcp_dump_packet.flight_mode = g_drone_status.flight_mode;
+	vcp_dump_packet.sat_flags = telem_data.sat_flags;
+	vcp_dump_packet.dt_sec = g_state.dt_sec;
+
+	vcp_dump_packet.x = g_state.x;
+	vcp_dump_packet.y = g_state.y;
+	vcp_dump_packet.z = g_state.z;
+	vcp_dump_packet.vx = g_state.vx;
+	vcp_dump_packet.vy = g_state.vy;
+	vcp_dump_packet.vz = g_state.vz;
+	vcp_dump_packet.roll = g_state.roll;
+	vcp_dump_packet.pitch = g_state.pitch;
+	vcp_dump_packet.yaw = g_state.yaw;
+	vcp_dump_packet.roll_rate = g_state.roll_rate;
+	vcp_dump_packet.pitch_rate = g_state.pitch_rate;
+	vcp_dump_packet.yaw_rate = g_state.yaw_rate;
+
+	vcp_dump_packet.accel_x = raw_data.ax;
+	vcp_dump_packet.accel_y = raw_data.ay;
+	vcp_dump_packet.accel_z = raw_data.az;
+	vcp_dump_packet.mag_x = raw_data.mx;
+	vcp_dump_packet.mag_y = raw_data.my;
+	vcp_dump_packet.mag_z = raw_data.mz;
+	vcp_dump_packet.gyro_x = raw_data.gx;
+	vcp_dump_packet.gyro_y = raw_data.gy;
+	vcp_dump_packet.gyro_z = raw_data.gz;
+
+	vcp_dump_packet.target_x = g_target.x;
+	vcp_dump_packet.target_y = g_target.y;
+	vcp_dump_packet.target_z = g_target.z;
+	vcp_dump_packet.target_roll = g_target.roll;
+	vcp_dump_packet.target_pitch = g_target.pitch;
+	vcp_dump_packet.target_yaw = g_target.yaw;
+	vcp_dump_packet.target_rate_roll = g_target.rate_roll;
+	vcp_dump_packet.target_rate_pitch = g_target.rate_pitch;
+	vcp_dump_packet.target_rate_yaw = g_target.rate_yaw;
+	vcp_dump_packet.target_ff_vz = g_target.ff_vz;
+
+	vcp_dump_packet.pid_roll_p = pid_roll_rate.p_out;
+	vcp_dump_packet.pid_roll_i = pid_roll_rate.i_out;
+	vcp_dump_packet.pid_roll_d = pid_roll_rate.d_out;
+	vcp_dump_packet.pid_roll_out = pid_roll_rate.output;
+	vcp_dump_packet.pid_pitch_p = pid_pitch_rate.p_out;
+	vcp_dump_packet.pid_pitch_i = pid_pitch_rate.i_out;
+	vcp_dump_packet.pid_pitch_d = pid_pitch_rate.d_out;
+	vcp_dump_packet.pid_pitch_out = pid_pitch_rate.output;
+	vcp_dump_packet.pid_yaw_p = pid_yaw_rate.p_out;
+	vcp_dump_packet.pid_yaw_i = pid_yaw_rate.i_out;
+	vcp_dump_packet.pid_yaw_d = pid_yaw_rate.d_out;
+	vcp_dump_packet.pid_yaw_out = pid_yaw_rate.output;
+	vcp_dump_packet.pid_velz_p = pid_vel_z.p_out;
+	vcp_dump_packet.pid_velz_i = pid_vel_z.i_out;
+	vcp_dump_packet.pid_velz_d = pid_vel_z.d_out;
+	vcp_dump_packet.pid_velz_out = pid_vel_z.output;
+
+	vcp_dump_packet.motor1_pct = telem_data.motor1_T;
+	vcp_dump_packet.motor2_pct = telem_data.motor2_T;
+	vcp_dump_packet.motor3_pct = telem_data.motor3_T;
+	vcp_dump_packet.motor4_pct = telem_data.motor4_T;
+	vcp_dump_packet.magic_footer = VCP_DUMP_FOOTER;
+
+	/* Non-blocking USB CDC push: drop this frame if USB is busy/not configured. */
+	(void)CDC_Transmit_FS((uint8_t*)&vcp_dump_packet, (uint16_t)sizeof(vcp_dump_packet));
+#endif
 }
 
 static float median5f(const float v[5]) {
@@ -686,6 +809,7 @@ int main(void)
   MX_TIM3_Init();
   MX_I2C3_Init();
   MX_ADC1_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -1111,6 +1235,7 @@ int main(void)
 				telem_data.magic_footer        = 0xAB;
 			}
 
+			VCP_Dump_TrySend(now);
 		}
 	}
     /* USER CODE END WHILE */
@@ -1144,7 +1269,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 4;
   RCC_OscInitStruct.PLL.PLLN = 96;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 3;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -1621,12 +1746,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : VBUS_FS_Pin */
-  GPIO_InitStruct.Pin = VBUS_FS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(VBUS_FS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
   GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
