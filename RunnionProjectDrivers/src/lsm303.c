@@ -49,6 +49,8 @@
 #define AGR_CFG_C_M         0x62
 #define AGR_OUTX_L_M        0x68   // OUTX_L..OUTZ_H continuous
 #define AGR_STATUS_M        0x67
+#define AGR_CFG_A_M_REBOOT  0x40
+#define AGR_CFG_A_M_SOFT_RST 0x20
 
 
 // --- AGR Registers (Temp) ---
@@ -187,6 +189,42 @@ bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale) 
 		dev->mag_gauss_per_lsb = 0.0015f;
 	}
 	return true;
+}
+
+bool LSM303_SoftResetAGR(LSM303* dev) {
+	if (!dev || !dev->hi2c) return false;
+	if (dev->variant != LSM303_AGR) return false;
+
+	// Preserve current config bits, pulse SOFT_RST then REBOOT.
+	uint8_t cfg_a = rd8(dev->hi2c, dev->addr_mag, AGR_CFG_A_M);
+	if (i2c_write(dev->hi2c, dev->addr_mag, AGR_CFG_A_M, (uint8_t)(cfg_a | AGR_CFG_A_M_SOFT_RST)) != HAL_OK) {
+		return false;
+	}
+	HAL_Delay(5);
+
+	cfg_a = rd8(dev->hi2c, dev->addr_mag, AGR_CFG_A_M);
+	if (i2c_write(dev->hi2c, dev->addr_mag, AGR_CFG_A_M, (uint8_t)(cfg_a | AGR_CFG_A_M_REBOOT)) != HAL_OK) {
+		return false;
+	}
+	HAL_Delay(5);
+
+	return true;
+}
+
+bool LSM303_Recover(LSM303* dev, LSM303_AccelScale scale) {
+	if (!dev || !dev->hi2c) return false;
+
+	// AGR supports software reset/reboot; DLHC falls back to full re-init.
+	if (dev->variant == LSM303_AGR) {
+		(void)LSM303_SoftResetAGR(dev);
+	}
+
+	// Reset software state machine flags before re-initializing.
+	dev->state = LSM303_IDLE;
+	dev->accel_ready = false;
+	dev->mag_ready = false;
+
+	return LSM303_Init(dev, dev->hi2c, scale);
 }
 
 // Non-blocking Accelerometer Start

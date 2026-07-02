@@ -31,6 +31,7 @@
 #include "usbd_cdc.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include <stdbool.h>
 
 /* USER CODE END INCLUDE */
 
@@ -109,6 +110,8 @@ extern USBD_CDC_ItfTypeDef USBD_Interface_fops_FS;
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
 
 /* USER CODE BEGIN EXPORTED_FUNCTIONS */
+bool VCP_Command_ReadLine(uint8_t* out_buf, uint16_t out_buf_len);
+bool VCP_Command_HadOverflow(void);
 
 /* USER CODE END EXPORTED_FUNCTIONS */
 

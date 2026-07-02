@@ -87,9 +87,14 @@ bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale);
 void LSM303_Process_DMA(LSM303* dev);
 void LSM303_XferCpltCallback(LSM303* dev, bool is_rx);
 
-bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale);
 bool LSM303_StartAccelRead_DMA(LSM303* dev, uint8_t* dma_buffer);
 bool LSM303_StartMagRead_DMA(LSM303* dev, uint8_t* dma_buffer);
+// AGR path: issue software reset/reboot command sequence on magnetometer.
+bool LSM303_SoftResetAGR(LSM303* dev);
+// Recovery helper:
+// - AGR: performs software reset sequence then full re-init
+// - DLHC/unknown: full re-init only
+bool LSM303_Recover(LSM303* dev, LSM303_AccelScale scale);
 //bool LSM303_ReadAccel(LSM303* dev, LSM303_Raw* out);
 //bool LSM303_ReadMag(LSM303* dev, LSM303_Raw* out);
 bool LSM303_ReadTemp(LSM303* dev, int16_t* out);

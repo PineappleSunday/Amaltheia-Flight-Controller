@@ -72,15 +72,17 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneSt
 	float pitch_torque = PID_Calculate(&pid_pitch_rate, state->pitch_rate, target->rate_pitch);
 	float yaw_torque   = PID_Calculate(&pid_yaw_rate,   state->yaw_rate,   target->rate_yaw);
 
-	// 4. MOTOR MIXING (Plus Configuration)
+	// 4. MOTOR MIXING (frame selected inside mixer config)
 	float motor_pcts[4];
 	sat = Mixer_Apply(base_thrust, roll_torque, pitch_torque, yaw_torque, motor_pcts);
 
-	// 5. HARDWARE ACTUATION
-	ESC_SetThrottle(TIM_CHANNEL_1, motor_pcts[0]); // Front
-	ESC_SetThrottle(TIM_CHANNEL_2, motor_pcts[1]); // Right
-	ESC_SetThrottle(TIM_CHANNEL_3, motor_pcts[2]); // Rear
-	ESC_SetThrottle(TIM_CHANNEL_4, motor_pcts[3]); // Left
+	// 5. HARDWARE ACTUATION (channel order stays M1..M4)
+	// Plus: M1 Front, M2 Right, M3 Rear, M4 Left
+	// X:    M1 FrontRight, M2 RearRight, M3 RearLeft, M4 FrontLeft
+	ESC_SetThrottle(TIM_CHANNEL_1, motor_pcts[0]);
+	ESC_SetThrottle(TIM_CHANNEL_2, motor_pcts[1]);
+	ESC_SetThrottle(TIM_CHANNEL_3, motor_pcts[2]);
+	ESC_SetThrottle(TIM_CHANNEL_4, motor_pcts[3]);
 	return sat;
 }
 

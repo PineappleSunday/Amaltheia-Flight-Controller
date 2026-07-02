@@ -9,7 +9,7 @@
 #include <stdbool.h>
 
 #ifndef AHRS_MADGWICK_BETA
-#define AHRS_MADGWICK_BETA 0.06f
+#define AHRS_MADGWICK_BETA 0.04f
 #endif
 
 // Set to 1 if accel axes must be mapped with the same transform as gyro:

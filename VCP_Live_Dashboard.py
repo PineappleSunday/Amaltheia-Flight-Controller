@@ -12,15 +12,22 @@ import matplotlib.animation as animation
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, TextBox
+import numpy as np
 import serial
 import serial.tools.list_ports
 
 
 HEADER_VALUE = 0x31504356  # "VCP1"
 FOOTER_VALUE = 0xAB
-FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
+FRAME_FORMAT = "<IIHBBBB" + ("f" * 65) + "B"
+BME_FRAME_FORMAT = "<IIHBBBB" + ("f" * 57) + "B"
+LEGACY_FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
 FRAME_STRUCT = struct.Struct(FRAME_FORMAT)
+BME_FRAME_STRUCT = struct.Struct(BME_FRAME_FORMAT)
+LEGACY_FRAME_STRUCT = struct.Struct(LEGACY_FRAME_FORMAT)
 FRAME_SIZE = FRAME_STRUCT.size
+BME_FRAME_SIZE = BME_FRAME_STRUCT.size
+LEGACY_FRAME_SIZE = LEGACY_FRAME_STRUCT.size
 HEADER_BYTES = struct.pack("<I", HEADER_VALUE)
 
 FRAME_FIELDS = [
@@ -63,6 +70,19 @@ FRAME_FIELDS = [
     "target_rate_pitch",
     "target_rate_yaw",
     "target_ff_vz",
+    "bme280_valid",
+    "bme280_temp_c",
+    "bme280_pressure_pa",
+    "bme280_humidity_rh",
+    "bme280_altitude_m", # BME280 altitude in meters (relative, based on pressure)
+    "gps_valid",
+    "gps_sats",
+    "gps_lat_deg",
+    "gps_lon_deg",
+    "gps_alt_m", # GPS altitude in meters
+    "gps_speed_mps", # GPS speed over ground in m/s
+    "gps_course_deg", # GPS course over ground in degrees
+    "gps_hdop", # GPS horizontal dilution of precision
     "pid_roll_p",
     "pid_roll_i",
     "pid_roll_d",
@@ -86,7 +106,12 @@ FRAME_FIELDS = [
     "magic_footer",
 ]
 
-assert FRAME_SIZE == 223, f"Unexpected frame size: {FRAME_SIZE}"
+BME_FRAME_FIELDS = [field for field in FRAME_FIELDS if not field.startswith("gps_")]
+LEGACY_FRAME_FIELDS = [field for field in BME_FRAME_FIELDS if not field.startswith("bme280_")]
+
+assert FRAME_SIZE == 275, f"Unexpected frame size: {FRAME_SIZE}"
+assert BME_FRAME_SIZE == 243, f"Unexpected BME frame size: {BME_FRAME_SIZE}"
+assert LEGACY_FRAME_SIZE == 223, f"Unexpected legacy frame size: {LEGACY_FRAME_SIZE}"
 
 
 class FrameParser:
@@ -108,24 +133,55 @@ class FrameParser:
             if idx > 0:
                 del self.buffer[:idx]
 
-            if len(self.buffer) < FRAME_SIZE:
+            if len(self.buffer) < LEGACY_FRAME_SIZE:
                 break
 
-            candidate = bytes(self.buffer[:FRAME_SIZE])
-            if candidate[-1] != FOOTER_VALUE:
+            frame_size = 0
+            frame_struct = None
+            frame_fields = None
+            if len(self.buffer) >= FRAME_SIZE and self.buffer[FRAME_SIZE - 1] == FOOTER_VALUE:
+                frame_size = FRAME_SIZE
+                frame_struct = FRAME_STRUCT
+                frame_fields = FRAME_FIELDS
+            elif len(self.buffer) >= BME_FRAME_SIZE and self.buffer[BME_FRAME_SIZE - 1] == FOOTER_VALUE:
+                frame_size = BME_FRAME_SIZE
+                frame_struct = BME_FRAME_STRUCT
+                frame_fields = BME_FRAME_FIELDS
+            elif self.buffer[LEGACY_FRAME_SIZE - 1] == FOOTER_VALUE:
+                frame_size = LEGACY_FRAME_SIZE
+                frame_struct = LEGACY_FRAME_STRUCT
+                frame_fields = LEGACY_FRAME_FIELDS
+            else:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
-            values = FRAME_STRUCT.unpack(candidate)
-            frame = dict(zip(FRAME_FIELDS, values))
+            candidate = bytes(self.buffer[:frame_size])
+            values = frame_struct.unpack(candidate)
+            frame = dict(zip(frame_fields, values))
             if frame["header"] != HEADER_VALUE or frame["magic_footer"] != FOOTER_VALUE:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
+            if frame_size == LEGACY_FRAME_SIZE:
+                frame["bme280_valid"] = 0.0
+                frame["bme280_temp_c"] = 0.0
+                frame["bme280_pressure_pa"] = 0.0
+                frame["bme280_humidity_rh"] = 0.0
+                frame["bme280_altitude_m"] = 0.0
+            if frame_size != FRAME_SIZE:
+                frame["gps_valid"] = 0.0
+                frame["gps_sats"] = 0.0
+                frame["gps_lat_deg"] = 0.0
+                frame["gps_lon_deg"] = 0.0
+                frame["gps_alt_m"] = 0.0
+                frame["gps_speed_mps"] = 0.0
+                frame["gps_course_deg"] = 0.0
+                frame["gps_hdop"] = 0.0
+
             frames.append(frame)
-            del self.buffer[:FRAME_SIZE]
+            del self.buffer[:frame_size]
 
         return frames
 
@@ -176,6 +232,34 @@ def serial_reader(ser, out_q, stop_event, stats):
                 stats["queue_drops"] += 1
 
 
+def csv_logger(log_q, csv_file, csv_writer, stop_event):
+    flush_counter = 0
+    last_flush = time.perf_counter()
+
+    while not stop_event.is_set():
+        try:
+            row = log_q.get(timeout=0.1)
+        except queue.Empty:
+            row = None
+
+        if row is None:
+            now = time.perf_counter()
+            if flush_counter > 0 and (now - last_flush) >= 0.5:
+                csv_file.flush()
+                flush_counter = 0
+                last_flush = now
+            continue
+
+        csv_writer.writerow(row)
+        flush_counter += 1
+        if flush_counter >= 200:
+            csv_file.flush()
+            flush_counter = 0
+            last_flush = time.perf_counter()
+
+    csv_file.flush()
+
+
 def build_status_text(state):
     latest = state["latest"]
     port_line = state["port"] if state["port"] else "(not selected)"
@@ -193,6 +277,27 @@ def build_status_text(state):
             f"Frames parsed: {state['frames_seen']}\n"
             f"Queue drops: {state['queue_drops']}\n"
             f"Bad frames: {state['bad_frames']}\n"
+        )
+
+    bme_status = int(float(latest["bme280_valid"]))
+    if bme_status == 1:
+        bme_line = (
+            f"BME280: status=1 | temp={latest['bme280_temp_c']:+.2f}C |"
+            f"| alt={latest['bme280_altitude_m']:+.3f}m | "
+            f"pressure={latest['bme280_pressure_pa']:.1f}Pa | RH={latest['bme280_humidity_rh']:.2f}%\n"
+            
+        )
+    elif bme_status == -5:
+        bme_line = "BME280: status=-5 no I2C3 devices ACKed\n"
+    elif bme_status == -6:
+        bme_line = (
+            f"BME280: status=-6 I2C3 alive first=0x{int(float(latest['bme280_pressure_pa'])):02X} "
+            f"count={int(float(latest['bme280_temp_c']))}\n"
+        )
+    else:
+        bme_line = (
+            f"BME280: status={bme_status} addr=0x{int(float(latest['bme280_pressure_pa'])):02X} "
+            f"chip=0x{int(float(latest['bme280_temp_c'])):02X}\n"
         )
 
     return (
@@ -221,6 +326,10 @@ def build_status_text(state):
         f"Motors %: {latest['motor1_pct']:.1f}, {latest['motor2_pct']:.1f}, {latest['motor3_pct']:.1f}, {latest['motor4_pct']:.1f}\n"
         f"Z/VZ: {latest['z']:+.3f} m / {latest['vz']:+.3f} m/s\n"
         f"Target Z/FFvz: {latest['target_z']:+.3f} m / {latest['target_ff_vz']:+.3f}\n"
+        f"{bme_line}"
+        f"GPS: valid={latest['gps_valid']:.0f} sats={latest['gps_sats']:.0f} "
+        f"lat={latest['gps_lat_deg']:+.6f} lon={latest['gps_lon_deg']:+.6f} "
+        f"alt={latest['gps_alt_m']:+.1f}m spd={latest['gps_speed_mps']:.2f}m/s hdop={latest['gps_hdop']:.2f}\n"
     )
 
 
@@ -234,7 +343,9 @@ def main():
     parser.add_argument("port", nargs="?", help="Initial COM port (optional)")
     parser.add_argument("--baud", type=int, default=921600, help="Serial baud rate")
     parser.add_argument("--window-sec", type=float, default=15.0, help="Plot history window in seconds")
-    parser.add_argument("--update-ms", type=int, default=40, help="Plot refresh interval")
+    parser.add_argument("--update-ms", type=int, default=100, help="UI refresh interval")
+    parser.add_argument("--plot-sample-hz", type=float, default=50.0, help="Maximum rate stored in plot history")
+    parser.add_argument("--drain-budget-ms", type=float, default=12.0, help="Maximum queue-drain time per UI tick")
     parser.add_argument("--queue-size", type=int, default=4096, help="Frame queue size")
     parser.add_argument("--no-log", action="store_true", help="Disable CSV logging")
     parser.add_argument("--log-dir", default=f"flight_log_VCP", help="CSV output directory")
@@ -242,9 +353,9 @@ def main():
 
     initial_port = args.port or auto_pick_port() or ""
     print("Dashboard started in offline mode. Use the GUI controls to connect.")
-    print(f"Frame size: {FRAME_SIZE} bytes")
+    print(f"Frame size: {FRAME_SIZE} bytes ({LEGACY_FRAME_SIZE} byte legacy frames also accepted)")
 
-    max_points = max(200, int(args.window_sec * 200))
+    max_points = max(200, int(args.window_sec * max(1.0, args.plot_sample_hz)))
     t = deque(maxlen=max_points)
     roll = deque(maxlen=max_points)
     pitch = deque(maxlen=max_points)
@@ -269,7 +380,9 @@ def main():
 
     csv_file = None
     csv_writer = None
-    csv_flush_counter = 0
+    log_q = None
+    logger_thread = None
+    logger_stop_event = None
     if not args.no_log:
         os.makedirs(args.log_dir, exist_ok=True)
         log_name = datetime.now().strftime("vcp_dump_%Y%m%d_%H%M%S.csv")
@@ -277,6 +390,14 @@ def main():
         csv_file = open(log_path, "w", newline="", encoding="utf-8")
         csv_writer = csv.DictWriter(csv_file, fieldnames=["host_time_s"] + FRAME_FIELDS)
         csv_writer.writeheader()
+        log_q = queue.Queue(maxsize=8192)
+        logger_stop_event = threading.Event()
+        logger_thread = threading.Thread(
+            target=csv_logger,
+            args=(log_q, csv_file, csv_writer, logger_stop_event),
+            daemon=True,
+        )
+        logger_thread.start()
         print(f"Logging CSV: {log_path}")
 
     frame_q = queue.Queue(maxsize=args.queue_size)
@@ -289,6 +410,9 @@ def main():
     last_seq = None
     fps_last_t = start
     fps_last_n = 0
+    last_plot_sample_s = -1.0
+    last_axes_scale_s = -1.0
+    last_status_text_s = -1.0
 
     state = {
         "port": initial_port,
@@ -307,7 +431,7 @@ def main():
     fig = plt.figure(figsize=(16, 10))
     fig.suptitle("Amaltheia VCP Live Telemetry", fontsize=14)
     fig.subplots_adjust(bottom=0.14)
-    gs = gridspec.GridSpec(5, 2, width_ratios=[4.0, 1.8])
+    gs = gridspec.GridSpec(5, 2, width_ratios=[4.0, 2.5])
 
     ax_att = fig.add_subplot(gs[0, 0])
     l_roll, = ax_att.plot([], [], "r-", label="Roll")
@@ -374,13 +498,18 @@ def main():
         fontsize=9,
     )
 
-    # Bottom control strip: port selection and connection controls.
+    # Bottom control strip: command, port selection, and connection controls.
+    ax_cmd_box = fig.add_axes([0.08, 0.02, 0.33, 0.04])
+    cmd_box = TextBox(ax_cmd_box, "Command", initial="")
+    ax_btn_send = fig.add_axes([0.42, 0.02, 0.06, 0.04])
+    btn_send = Button(ax_btn_send, "Send")
     ax_port_box = fig.add_axes([0.72, 0.02, 0.14, 0.04])
     port_box = TextBox(ax_port_box, "Port", initial=initial_port)
     ax_btn_connect = fig.add_axes([0.87, 0.02, 0.06, 0.04])
     ax_btn_disconnect = fig.add_axes([0.94, 0.02, 0.05, 0.04])
     ax_btn_refresh = fig.add_axes([0.72, 0.07, 0.14, 0.04])
     btn_connect = Button(ax_btn_connect, "Connect")
+    ax_btn_3d = fig.add_axes([0.5, 0.07, 0.1, 0.04])
     btn_disconnect = Button(ax_btn_disconnect, "Disconnect")
     btn_refresh = Button(ax_btn_refresh, "Refresh Ports")
 
@@ -457,16 +586,41 @@ def main():
         fps_last_t = time.perf_counter()
         fps_last_n = state["frames_seen"]
 
+    def send_command(_event=None):
+        command = cmd_box.text.strip()
+        if not command:
+            state["conn_msg"] = "Enter a command first."
+            return
+        if ser is None or not ser.is_open:
+            state["conn_msg"] = "Connect before sending commands."
+            return
+
+        try:
+            ser.write((command + "\n").encode("ascii", errors="ignore"))
+            state["conn_msg"] = f"Sent command: {command}"
+            cmd_box.set_val("")
+        except serial.SerialException as exc:
+            state["conn_msg"] = f"Command send failed: {exc}"
+
     btn_connect.on_clicked(connect_serial)
     btn_disconnect.on_clicked(disconnect_serial)
     btn_refresh.on_clicked(refresh_ports)
+    btn_send.on_clicked(send_command)
+    cmd_box.on_submit(send_command)
+    btn_3d = Button(ax_btn_3d, "3D View")
     refresh_ports()
 
     def update(_):
-        nonlocal last_seq, csv_flush_counter, fps_last_t, fps_last_n
+        nonlocal last_seq, fps_last_t, fps_last_n
+        nonlocal last_plot_sample_s, last_axes_scale_s, last_status_text_s
 
         drained = 0
-        while drained < 1500:
+        tick_start = time.perf_counter()
+        drain_budget_s = max(0.001, args.drain_budget_ms * 0.001)
+        plot_sample_period_s = 1.0 / max(1.0, args.plot_sample_hz)
+        plot_dirty = False
+
+        while drained < 600 and (time.perf_counter() - tick_start) < drain_budget_s:
             try:
                 frame = frame_q.get_nowait()
             except queue.Empty:
@@ -483,36 +637,38 @@ def main():
             state["frames_seen"] += 1
             state["latest"] = frame
 
-            t.append(now_s)
-            roll.append(frame["roll"])
-            pitch.append(frame["pitch"])
-            yaw.append(frame["yaw"])
-            roll_rate.append(frame["roll_rate"])
-            pitch_rate.append(frame["pitch_rate"])
-            yaw_rate.append(frame["yaw_rate"])
-            target_roll_rate.append(frame["target_rate_roll"])
-            target_pitch_rate.append(frame["target_rate_pitch"])
-            target_yaw_rate.append(frame["target_rate_yaw"])
-            pid_roll_out.append(frame["pid_roll_out"])
-            pid_pitch_out.append(frame["pid_pitch_out"])
-            pid_yaw_out.append(frame["pid_yaw_out"])
-            motor1.append(frame["motor1_pct"])
-            motor2.append(frame["motor2_pct"])
-            motor3.append(frame["motor3_pct"])
-            motor4.append(frame["motor4_pct"])
-            z.append(frame["z"])
-            target_z.append(frame["target_z"])
-            vz.append(frame["vz"])
-            ff_vz.append(frame["target_ff_vz"])
+            if (now_s - last_plot_sample_s) >= plot_sample_period_s:
+                last_plot_sample_s = now_s
+                plot_dirty = True
+                t.append(now_s)
+                roll.append(frame["roll"])
+                pitch.append(frame["pitch"])
+                yaw.append(frame["yaw"])
+                roll_rate.append(frame["roll_rate"])
+                pitch_rate.append(frame["pitch_rate"])
+                yaw_rate.append(frame["yaw_rate"])
+                target_roll_rate.append(frame["target_rate_roll"])
+                target_pitch_rate.append(frame["target_rate_pitch"])
+                target_yaw_rate.append(frame["target_rate_yaw"])
+                pid_roll_out.append(frame["pid_roll_out"])
+                pid_pitch_out.append(frame["pid_pitch_out"])
+                pid_yaw_out.append(frame["pid_yaw_out"])
+                motor1.append(frame["motor1_pct"])
+                motor2.append(frame["motor2_pct"])
+                motor3.append(frame["motor3_pct"])
+                motor4.append(frame["motor4_pct"])
+                z.append(frame["z"])
+                target_z.append(frame["target_z"])
+                vz.append(frame["vz"])
+                ff_vz.append(frame["target_ff_vz"])
 
-            if csv_writer is not None:
+            if log_q is not None:
                 row = {"host_time_s": now_s}
                 row.update(frame)
-                csv_writer.writerow(row)
-                csv_flush_counter += 1
-                if csv_flush_counter >= 100:
-                    csv_file.flush()
-                    csv_flush_counter = 0
+                try:
+                    log_q.put_nowait(row)
+                except queue.Full:
+                    state["queue_drops"] += 1
 
             drained += 1
 
@@ -526,43 +682,49 @@ def main():
         state["queue_drops"] = reader_stats["queue_drops"]
         state["bad_frames"] = reader_stats["bad_frames"]
 
-        if len(t) > 0:
-            l_roll.set_data(t, roll)
-            l_pitch.set_data(t, pitch)
-            l_yaw.set_data(t, yaw)
+        
+        if plot_dirty and len(t) > 0:
+            t_list = list(t)
+            l_roll.set_data(t_list, list(roll))
+            l_pitch.set_data(t_list, list(pitch))
+            l_yaw.set_data(t_list, list(yaw))
 
-            l_rr.set_data(t, roll_rate)
-            l_pr.set_data(t, pitch_rate)
-            l_yr.set_data(t, yaw_rate)
-            l_rr_cmd.set_data(t, target_roll_rate)
-            l_pr_cmd.set_data(t, target_pitch_rate)
-            l_yr_cmd.set_data(t, target_yaw_rate)
+            l_rr.set_data(t_list, list(roll_rate))
+            l_pr.set_data(t_list, list(pitch_rate))
+            l_yr.set_data(t_list, list(yaw_rate))
+            l_rr_cmd.set_data(t_list, list(target_roll_rate))
+            l_pr_cmd.set_data(t_list, list(target_pitch_rate))
+            l_yr_cmd.set_data(t_list, list(target_yaw_rate))
 
-            l_pid_r.set_data(t, pid_roll_out)
-            l_pid_p.set_data(t, pid_pitch_out)
-            l_pid_y.set_data(t, pid_yaw_out)
+            l_pid_r.set_data(t_list, list(pid_roll_out))
+            l_pid_p.set_data(t_list, list(pid_pitch_out))
+            l_pid_y.set_data(t_list, list(pid_yaw_out))
 
-            l_m1.set_data(t, motor1)
-            l_m2.set_data(t, motor2)
-            l_m3.set_data(t, motor3)
-            l_m4.set_data(t, motor4)
+            l_m1.set_data(t_list, list(motor1))
+            l_m2.set_data(t_list, list(motor2))
+            l_m3.set_data(t_list, list(motor3))
+            l_m4.set_data(t_list, list(motor4))
 
-            l_z.set_data(t, z)
-            l_tz.set_data(t, target_z)
-            l_vz.set_data(t, vz)
-            l_ffvz.set_data(t, ff_vz)
+            l_z.set_data(t_list, list(z))
+            l_tz.set_data(t_list, list(target_z))
+            l_vz.set_data(t_list, list(vz))
+            l_ffvz.set_data(t_list, list(ff_vz))
 
             tmax = t[-1]
             tmin = max(0.0, tmax - args.window_sec)
             for ax in (ax_att, ax_rate, ax_pid, ax_mot, ax_alt):
                 ax.set_xlim(tmin, tmax + 0.05)
 
-            for ax in (ax_rate, ax_pid, ax_alt):
-                ax.relim()
-                ax.autoscale_view()
+            if (now_perf - last_axes_scale_s) >= 0.5:
+                last_axes_scale_s = now_perf
+                for ax in (ax_att, ax_rate, ax_pid, ax_mot, ax_alt):
+                    ax.relim()
+                    ax.autoscale_view()
 
         state["port"] = port_box.text.strip()
-        status_text.set_text(build_status_text(state))
+        if (now_perf - last_status_text_s) >= 0.2:
+            last_status_text_s = now_perf
+            status_text.set_text(build_status_text(state))
 
         return (
             l_roll,
@@ -587,12 +749,111 @@ def main():
             l_ffvz,
             status_text,
         )
+        
+    # --- 3D Visualization ---
+    state["3d_view_open"] = False
+    state["3d_fig"] = None
+    state["3d_ax"] = None
+    state["3d_ani"] = None
+
+    # --- 3D Model Constants ---
+    ARM_LEN = 0.15  # meters
+    MOTOR_POS = np.array([
+        [ ARM_LEN,  0, 0],  # Motor 1 (Front, +X)
+        [ 0, -ARM_LEN, 0],  # Motor 2 (Right, -Y)
+        [-ARM_LEN,  0, 0],  # Motor 3 (Back, -X)
+        [ 0,  ARM_LEN, 0]   # Motor 4 (Left, +Y)
+    ])
+
+    def _update_3d_view(_):
+        if not state["3d_view_open"] or state["latest"] is None:
+            return []
+
+        ax = state["3d_ax"]
+        ax.clear()
+
+        # --- Attitude Processing ---
+        # Get attitude in radians from the telemetry frame, same as the 2D plots.
+        roll_rad = np.deg2rad(state["latest"]["roll"])
+        pitch_rad = np.deg2rad(state["latest"]["pitch"])
+        yaw_rad = np.deg2rad(state["latest"]["yaw"])
+
+        # --- 3D Rotation Matrices (Standard Aerospace Convention) ---
+        Rx = np.array([[1, 0, 0], [0, np.cos(roll_rad), -np.sin(roll_rad)], [0, np.sin(roll_rad), np.cos(roll_rad)]])
+        # A positive pitch value should be a pitch-up rotation. We negate the angle
+        # to align with the standard rotation matrix definition.
+        Ry = np.array([[np.cos(-pitch_rad), 0, np.sin(-pitch_rad)], [0, 1, 0], [-np.sin(-pitch_rad), 0, np.cos(-pitch_rad)]])
+        Rz = np.array([[np.cos(yaw_rad), -np.sin(yaw_rad), 0], [np.sin(yaw_rad), np.cos(yaw_rad), 0], [0, 0, 1]])
+        R = Rz @ Ry @ Rx
+
+        # Rotate motor positions
+        rotated_pos = (R @ MOTOR_POS.T).T
+
+        # Draw arms
+        ax.plot([rotated_pos[0, 0], rotated_pos[2, 0]], [rotated_pos[0, 1], rotated_pos[2, 1]], [rotated_pos[0, 2], rotated_pos[2, 2]], 'k-')
+        ax.plot([rotated_pos[1, 0], rotated_pos[3, 0]], [rotated_pos[1, 1], rotated_pos[3, 1]], [rotated_pos[1, 2], rotated_pos[3, 2]], 'k-')
+
+        # Draw motors and thrust vectors
+        motor_thrusts = [
+            state["latest"]["motor1_pct"],
+            state["latest"]["motor2_pct"],
+            state["latest"]["motor3_pct"],
+            state["latest"]["motor4_pct"]
+        ]
+        
+        motor_colors = ['r', 'g', 'b', 'c']
+        motor_labels = ['M1 (Front)', 'M2 (Right)', 'M3 (Back)', 'M4 (Left)']
+
+        for i in range(4):
+            pos = rotated_pos[i]
+            ax.scatter(pos[0], pos[1], pos[2], c=motor_colors[i], s=100, label=motor_labels[i])
+
+            thrust_mag = motor_thrusts[i] / 100.0 * 0.35  # Increased scale for better visibility
+            thrust_vec_local = np.array([0, 0, thrust_mag]) # Thrust is along local Z
+            thrust_vec_world = R @ thrust_vec_local
+
+            ax.quiver(pos[0], pos[1], pos[2], thrust_vec_world[0], thrust_vec_world[1], thrust_vec_world[2], length=thrust_mag, normalize=False, color=motor_colors[i])
+
+        # Set plot limits and labels
+        lim = ARM_LEN * 1.5
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, lim)
+        ax.set_xlabel("X (North)")
+        ax.set_ylabel("Y (West)")
+        ax.set_zlabel("Z (Up)")
+        ax.set_title(f"3D Orientation | R:{state['latest']['roll']:.1f} P:{state['latest']['pitch']:.1f} Y:{state['latest']['yaw']:.1f}")
+        ax.legend()
+        
+        return ax.patches + ax.lines + ax.collections
+
+    def on_3d_close(event):
+        state["3d_view_open"] = False
+        if state["3d_ani"] is not None:
+            state["3d_ani"].event_source.stop()
+        state["3d_fig"] = None
+        state["3d_ax"] = None
+        state["3d_ani"] = None
+        print("3D view closed.")
+
+    def show_3d_view(_event=None):
+        if state["3d_view_open"]:
+            return
+        state["3d_view_open"] = True
+        state["3d_fig"] = plt.figure(figsize=(8, 8))
+        state["3d_fig"].canvas.mpl_connect('close_event', on_3d_close)
+        state["3d_ax"] = state["3d_fig"].add_subplot(111, projection='3d')
+        state["3d_ani"] = animation.FuncAnimation(state["3d_fig"], _update_3d_view, interval=50, blit=False)
+        plt.show(block=False)
+        print("3D view opened.")
+
+    btn_3d.on_clicked(show_3d_view)
 
     ani = animation.FuncAnimation(
         fig,
         update,
         interval=max(10, args.update_ms),
-        blit=False,
+        blit=True, # Changed on 6-3-2026
         cache_frame_data=False,
     )
 
@@ -602,6 +863,10 @@ def main():
         pass
     finally:
         disconnect_serial()
+        if logger_stop_event is not None:
+            logger_stop_event.set()
+        if logger_thread is not None:
+            logger_thread.join(timeout=2.0)
         if csv_file is not None:
             csv_file.flush()
             csv_file.close()

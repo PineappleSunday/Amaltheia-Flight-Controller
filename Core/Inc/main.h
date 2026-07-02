@@ -56,6 +56,7 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
 void ESC_SetThrottle(uint32_t channel, float percentage);
+void ESC_D300_SetThrottle(uint32_t channel, uint16_t dshot_raw);
 uint32_t get_timer_channel(int motor_num);
 /* USER CODE END EFP */
 

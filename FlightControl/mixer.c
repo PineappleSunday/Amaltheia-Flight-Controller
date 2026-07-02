@@ -7,6 +7,9 @@
 #define MOTOR_SCALE_MAX 3.0f
 
 static float g_motor_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+static MixerConfig g_mixer_config = {
+	.frame_type = MIXER_DEFAULT_FRAME_TYPE
+};
 
 static float constrain(float value, float min, float max) {
 	if (value < min) return min;
@@ -15,8 +18,29 @@ static float constrain(float value, float min, float max) {
 }
 
 // Constraints based on your PhysicalConstants (max_rpm/max_w_sq)
-#define PWM_MIN 1100 // 1.1ms
-#define PWM_MAX 1900 // 1.9ms (95% safety margin per your Python model)
+#define PWM_MIN 1100 // 1.1ms 
+#define PWM_MAX 1900 // 1.9ms (90% safety margin per your Python model)
+
+void Mixer_SetConfig(const MixerConfig* config) {
+	if (!config) return;
+	Mixer_SetFrameType(config->frame_type);
+}
+
+void Mixer_GetConfig(MixerConfig* config) {
+	if (!config) return;
+	config->frame_type = g_mixer_config.frame_type;
+}
+
+void Mixer_SetFrameType(MixerFrameType frame_type) {
+	if (frame_type != MIXER_FRAME_PLUS && frame_type != MIXER_FRAME_X) {
+		return;
+	}
+	g_mixer_config.frame_type = frame_type;
+}
+
+MixerFrameType Mixer_GetFrameType(void) {
+	return g_mixer_config.frame_type;
+}
 
 void Mixer_ResetMotorScales(void) {
 	g_motor_scale[0] = 1.0f;
@@ -56,18 +80,44 @@ static float apply_thrust_linearization(float input_percent) {
 	return y * 100.0f;
 }
 
-uint8_t Mixer_Apply(float thrust, float roll, float pitch, float yaw, float* motor_percentages) {
-	uint8_t sat = 0;
-	// Logic for Plus (+) Configuration
-	float m1_raw = thrust + pitch + yaw;
-	float m2_raw = thrust - roll - yaw;
-	float m3_raw = thrust - pitch + yaw;
-	float m4_raw = thrust + roll - yaw;
+static void Mixer_ComputeRaw(MixerFrameType frame_type, float thrust, float roll, float pitch, float yaw,
+		float* m1_raw, float* m2_raw, float* m3_raw, float* m4_raw) {
+	if (!m1_raw || !m2_raw || !m3_raw || !m4_raw) return;
 
-	float m1 = apply_thrust_linearization(m1_raw) * g_motor_scale[0]; // Front (CCW)
-	float m2 = apply_thrust_linearization(m2_raw) * g_motor_scale[1]; // Right (CW)
-	float m3 = apply_thrust_linearization(m3_raw) * g_motor_scale[2]; // Rear (CCW)
-	float m4 = apply_thrust_linearization(m4_raw) * g_motor_scale[3]; // Left (CW)
+	if (frame_type == MIXER_FRAME_X) {
+		// X configuration motor order:
+		// M1=FrontRight, M2=RearRight, M3=RearLeft, M4=FrontLeft
+		// Roll/pitch diagonal contribution uses 1/sqrt(2).
+		// Ideall to maintain same + config PID tuning
+		// Yaw follows existing spin convention by channel:
+		// M1/M3 CCW (+yaw), M2/M4 CW (-yaw).
+		const float k = 0.70710678f; // 1/sqrt(2)
+		*m1_raw = thrust + k * (pitch - roll) + yaw;
+		*m2_raw = thrust + k * (-pitch - roll) - yaw;
+		*m3_raw = thrust + k * (-pitch + roll) + yaw;
+		*m4_raw = thrust + k * (pitch + roll) - yaw;
+		return;
+	}
+
+	// Plus (+) configuration motor order:
+	// M1=Front, M2=Right, M3=Rear, M4=Left
+	*m1_raw = thrust + pitch + yaw;
+	*m2_raw = thrust - roll - yaw;
+	*m3_raw = thrust - pitch + yaw;
+	*m4_raw = thrust + roll - yaw;
+}
+
+uint8_t Mixer_Apply(float thrust, float roll, float pitch, float yaw, float* motor_percentages) {
+	if (!motor_percentages) return 0;
+
+	uint8_t sat = 0;
+	float m1_raw = 0.0f, m2_raw = 0.0f, m3_raw = 0.0f, m4_raw = 0.0f;
+	Mixer_ComputeRaw(g_mixer_config.frame_type, thrust, roll, pitch, yaw, &m1_raw, &m2_raw, &m3_raw, &m4_raw);
+
+	float m1 = apply_thrust_linearization(m1_raw) * g_motor_scale[0];
+	float m2 = apply_thrust_linearization(m2_raw) * g_motor_scale[1];
+	float m3 = apply_thrust_linearization(m3_raw) * g_motor_scale[2];
+	float m4 = apply_thrust_linearization(m4_raw) * g_motor_scale[3];
 
 	// Low-side saturation uses pre-linearization mixed command to preserve negative detection.
 	if (m1_raw <= 0.0f) sat |= (1 << 0);

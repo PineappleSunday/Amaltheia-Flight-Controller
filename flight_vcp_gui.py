@@ -24,7 +24,7 @@ import time
 import tkinter as tk
 from collections import deque
 from tkinter import filedialog, messagebox, ttk
-
+import matplotlib.pyplot as plt
 try:
     import serial
     from serial.tools import list_ports
@@ -44,9 +44,15 @@ from matplotlib.figure import Figure
 
 HEADER_VALUE = 0x31504356
 FOOTER_VALUE = 0xAB
-FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
+FRAME_FORMAT = "<IIHBBBB" + ("f" * 65) + "B"
+BME_FRAME_FORMAT = "<IIHBBBB" + ("f" * 57) + "B"
+LEGACY_FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
 FRAME_STRUCT = struct.Struct(FRAME_FORMAT)
+BME_FRAME_STRUCT = struct.Struct(BME_FRAME_FORMAT)
+LEGACY_FRAME_STRUCT = struct.Struct(LEGACY_FRAME_FORMAT)
 FRAME_SIZE = FRAME_STRUCT.size
+BME_FRAME_SIZE = BME_FRAME_STRUCT.size
+LEGACY_FRAME_SIZE = LEGACY_FRAME_STRUCT.size
 HEADER_BYTES = struct.pack("<I", HEADER_VALUE)
 
 FRAME_FIELDS = [
@@ -89,6 +95,19 @@ FRAME_FIELDS = [
     "target_rate_pitch",
     "target_rate_yaw",
     "target_ff_vz",
+    "bme280_valid",
+    "bme280_temp_c",
+    "bme280_pressure_pa",
+    "bme280_humidity_rh",
+    "bme280_altitude_m",
+    "gps_valid",
+    "gps_sats",
+    "gps_lat_deg",
+    "gps_lon_deg",
+    "gps_alt_m",
+    "gps_speed_mps",
+    "gps_course_deg",
+    "gps_hdop",
     "pid_roll_p",
     "pid_roll_i",
     "pid_roll_d",
@@ -112,7 +131,12 @@ FRAME_FIELDS = [
     "magic_footer",
 ]
 
-assert FRAME_SIZE == 223
+BME_FRAME_FIELDS = [field for field in FRAME_FIELDS if not field.startswith("gps_")]
+LEGACY_FRAME_FIELDS = [field for field in BME_FRAME_FIELDS if not field.startswith("bme280_")]
+
+assert FRAME_SIZE == 275
+assert BME_FRAME_SIZE == 243
+assert LEGACY_FRAME_SIZE == 223
 
 
 class FrameParser:
@@ -134,24 +158,55 @@ class FrameParser:
             if idx > 0:
                 del self.buffer[:idx]
 
-            if len(self.buffer) < FRAME_SIZE:
+            if len(self.buffer) < LEGACY_FRAME_SIZE:
                 break
 
-            frame_bytes = bytes(self.buffer[:FRAME_SIZE])
-            if frame_bytes[-1] != FOOTER_VALUE:
+            frame_size = 0
+            frame_struct = None
+            frame_fields = None
+            if len(self.buffer) >= FRAME_SIZE and self.buffer[FRAME_SIZE - 1] == FOOTER_VALUE:
+                frame_size = FRAME_SIZE
+                frame_struct = FRAME_STRUCT
+                frame_fields = FRAME_FIELDS
+            elif len(self.buffer) >= BME_FRAME_SIZE and self.buffer[BME_FRAME_SIZE - 1] == FOOTER_VALUE:
+                frame_size = BME_FRAME_SIZE
+                frame_struct = BME_FRAME_STRUCT
+                frame_fields = BME_FRAME_FIELDS
+            elif self.buffer[LEGACY_FRAME_SIZE - 1] == FOOTER_VALUE:
+                frame_size = LEGACY_FRAME_SIZE
+                frame_struct = LEGACY_FRAME_STRUCT
+                frame_fields = LEGACY_FRAME_FIELDS
+            else:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
-            values = FRAME_STRUCT.unpack(frame_bytes)
-            frame = dict(zip(FRAME_FIELDS, values))
+            frame_bytes = bytes(self.buffer[:frame_size])
+            values = frame_struct.unpack(frame_bytes)
+            frame = dict(zip(frame_fields, values))
             if frame["header"] != HEADER_VALUE or frame["magic_footer"] != FOOTER_VALUE:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
+            if frame_size == LEGACY_FRAME_SIZE:
+                frame["bme280_valid"] = 0.0
+                frame["bme280_temp_c"] = 0.0
+                frame["bme280_pressure_pa"] = 0.0
+                frame["bme280_humidity_rh"] = 0.0
+                frame["bme280_altitude_m"] = 0.0
+            if frame_size != FRAME_SIZE:
+                frame["gps_valid"] = 0.0
+                frame["gps_sats"] = 0.0
+                frame["gps_lat_deg"] = 0.0
+                frame["gps_lon_deg"] = 0.0
+                frame["gps_alt_m"] = 0.0
+                frame["gps_speed_mps"] = 0.0
+                frame["gps_course_deg"] = 0.0
+                frame["gps_hdop"] = 0.0
+
             out.append(frame)
-            del self.buffer[:FRAME_SIZE]
+            del self.buffer[:frame_size]
 
         return out
 
@@ -179,6 +234,7 @@ class FlightVcpGui:
         self.port_var = tk.StringVar(value="")
         self.baud_var = tk.StringVar(value="921600")
         self.window_sec_var = tk.StringVar(value="15")
+        self.command_var = tk.StringVar(value="")
         self.pause_plots_var = tk.BooleanVar(value=False)
         self.log_btn_text = tk.StringVar(value="Start Log")
 
@@ -204,6 +260,14 @@ class FlightVcpGui:
         self.vz_var = tk.StringVar(value="0")
         self.target_z_var = tk.StringVar(value="0")
         self.ff_vz_var = tk.StringVar(value="0")
+        self.bme280_valid_var = tk.StringVar(value="0")
+        self.bme280_temp_var = tk.StringVar(value="0")
+        self.bme280_pressure_var = tk.StringVar(value="0")
+        self.bme280_humidity_var = tk.StringVar(value="0")
+        self.bme280_altitude_var = tk.StringVar(value="0")
+        self.gps_status_var = tk.StringVar(value="0")
+        self.gps_position_var = tk.StringVar(value="0, 0")
+        self.gps_motion_var = tk.StringVar(value="0")
         self.accel_norm_var = tk.StringVar(value="0")
         self.gyro_norm_var = tk.StringVar(value="0")
 
@@ -258,6 +322,12 @@ class FlightVcpGui:
         ttk.Label(conn, text="State:").grid(row=0, column=10, sticky=tk.E, padx=(16, 4))
         ttk.Label(conn, textvariable=self.connection_var).grid(row=0, column=11, sticky=tk.W)
 
+        ttk.Label(conn, text="Command").grid(row=1, column=0, sticky=tk.W, padx=(0, 6), pady=(8, 0))
+        cmd_entry = ttk.Entry(conn, textvariable=self.command_var, width=48)
+        cmd_entry.grid(row=1, column=1, columnspan=4, sticky=tk.EW, pady=(8, 0))
+        cmd_entry.bind("<Return>", lambda _event: self._send_command())
+        ttk.Button(conn, text="Send", command=self._send_command).grid(row=1, column=5, padx=(10, 0), pady=(8, 0))
+
         telem = ttk.LabelFrame(container, text="Live Telemetry", padding=8)
         telem.pack(fill=tk.X, pady=(10, 0))
 
@@ -283,8 +353,16 @@ class FlightVcpGui:
         self._kv_label(telem, 19, "VZ", self.vz_var)
         self._kv_label(telem, 20, "Target Z", self.target_z_var)
         self._kv_label(telem, 21, "FF VZ", self.ff_vz_var)
-        self._kv_label(telem, 22, "|Accel|", self.accel_norm_var)
-        self._kv_label(telem, 23, "|Gyro|", self.gyro_norm_var)
+        self._kv_label(telem, 22, "BME Status", self.bme280_valid_var)
+        self._kv_label(telem, 23, "BME Temp C", self.bme280_temp_var)
+        self._kv_label(telem, 24, "BME Press Pa", self.bme280_pressure_var)
+        self._kv_label(telem, 25, "BME Hum %", self.bme280_humidity_var)
+        self._kv_label(telem, 26, "BME Alt m", self.bme280_altitude_var)
+        self._kv_label(telem, 27, "GPS Status", self.gps_status_var)
+        self._kv_label(telem, 28, "GPS Lat/Lon", self.gps_position_var)
+        self._kv_label(telem, 29, "GPS Alt/Spd", self.gps_motion_var)
+        self._kv_label(telem, 30, "|Accel|", self.accel_norm_var)
+        self._kv_label(telem, 31, "|Gyro|", self.gyro_norm_var)
 
         body = ttk.Frame(container)
         body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -423,6 +501,25 @@ class FlightVcpGui:
         self.status_var.set("Disconnected")
         self._append_log("# Disconnected")
 
+    def _send_command(self) -> None:
+        command = self.command_var.get().strip()
+        if not command:
+            self.status_var.set("Enter a command first")
+            return
+        if self.ser is None or not self.ser.is_open:
+            self.status_var.set("Connect before sending commands")
+            return
+        try:
+            self.ser.write((command + "\n").encode("ascii", errors="ignore"))
+        except Exception as exc:
+            self._append_log(f"! TX error: {exc}")
+            self._disconnect()
+            return
+
+        self._append_log(f"> {command}")
+        self.status_var.set("Command sent")
+        self.command_var.set("")
+
     def _clear_plots(self) -> None:
         for d in (
             self.plot_time,
@@ -538,6 +635,30 @@ class FlightVcpGui:
         self.vz_var.set(f"{float(frame['vz']):+.3f}")
         self.target_z_var.set(f"{float(frame['target_z']):+.3f}")
         self.ff_vz_var.set(f"{float(frame['target_ff_vz']):+.3f}")
+        bme_status = int(float(frame["bme280_valid"]))
+        if bme_status == 1:
+            self.bme280_valid_var.set("1")
+        elif bme_status == -5:
+            self.bme280_valid_var.set("-5 no I2C3 ACK")
+        elif bme_status == -6:
+            bme_addr = int(float(frame["bme280_pressure_pa"]))
+            bme_count = int(float(frame["bme280_temp_c"]))
+            self.bme280_valid_var.set(f"-6 first=0x{bme_addr:02X} count={bme_count}")
+        else:
+            bme_addr = int(float(frame["bme280_pressure_pa"]))
+            bme_chip = int(float(frame["bme280_temp_c"]))
+            self.bme280_valid_var.set(f"{bme_status} addr=0x{bme_addr:02X} chip=0x{bme_chip:02X}")
+        self.bme280_temp_var.set(f"{float(frame['bme280_temp_c']):+.2f}")
+        self.bme280_pressure_var.set(f"{float(frame['bme280_pressure_pa']):.1f}")
+        self.bme280_humidity_var.set(f"{float(frame['bme280_humidity_rh']):.2f}")
+        self.bme280_altitude_var.set(f"{float(frame['bme280_altitude_m']):+.3f}")
+        self.gps_status_var.set(
+            f"valid={int(float(frame['gps_valid']))} sats={int(float(frame['gps_sats']))} hdop={float(frame['gps_hdop']):.2f}"
+        )
+        self.gps_position_var.set(f"{float(frame['gps_lat_deg']):+.6f}, {float(frame['gps_lon_deg']):+.6f}")
+        self.gps_motion_var.set(
+            f"alt={float(frame['gps_alt_m']):+.1f}m spd={float(frame['gps_speed_mps']):.2f}m/s crs={float(frame['gps_course_deg']):.1f}"
+        )
         self.accel_norm_var.set(f"{accel_norm:.3f}")
         self.gyro_norm_var.set(f"{gyro_norm:.3f}")
 

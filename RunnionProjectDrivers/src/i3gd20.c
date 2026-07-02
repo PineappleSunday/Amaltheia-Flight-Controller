@@ -89,7 +89,7 @@ bool I3GD20_Init(I3GD20* dev, SPI_HandleTypeDef* hspi)
     if (dev == NULL || hspi == NULL) return false;
     dev->hspi = hspi;
     dev->initialized = false;
-    dev->dps_per_lsb = 0.00875f;
+    dev->dps_per_lsb = 0.07f;  // 70 mdps/LSB @ 2000 dps full-scale
 
     // 1. Ensure CS is High (Inactive)
     i3gd20_cs_deassert();
@@ -126,9 +126,9 @@ bool I3GD20_Init(I3GD20* dev, SPI_HandleTypeDef* hspi)
 
     // 4. Configure Control Registers
     // CTRL1: 0x0F (Normal Mode, XYZ enabled, 100Hz)
-    // CTRL4: 0x80 (Block Data Update ON, 250dps) -> Safer for reading
+    // CTRL4: 0xA0 (BDU=1, FS=10 -> 2000 dps full-scale)
     if (!i3gd20_write_reg(dev->hspi, I3GD20_CTRL_REG1, 0x0F)) return false;
-    if (!i3gd20_write_reg(dev->hspi, I3GD20_CTRL_REG4, 0x80)) return false; // Changed to 0x80 (BDU)
+    if (!i3gd20_write_reg(dev->hspi, I3GD20_CTRL_REG4, 0xA0)) return false;
 
     dev->initialized = true;
     return true;

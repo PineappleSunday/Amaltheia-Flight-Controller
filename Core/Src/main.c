@@ -28,6 +28,9 @@
 #include "biquadButter.h"
 #include <ctype.h>
 #include "usbd_cdc_if.h"
+#include "mixer.h"
+#include "bme280.h"
+#include "gt_u7.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -132,6 +135,8 @@ typedef struct __attribute__((packed)) {
 	float target_roll, target_pitch, target_yaw;
 	float target_rate_roll, target_rate_pitch, target_rate_yaw;
 	float target_ff_vz;
+	float bme280_valid, bme280_temp_c, bme280_pressure_pa, bme280_humidity_rh, bme280_altitude_m;
+	float gps_valid, gps_sats, gps_lat_deg, gps_lon_deg, gps_alt_m, gps_speed_mps, gps_course_deg, gps_hdop;
 
 	float pid_roll_p, pid_roll_i, pid_roll_d, pid_roll_out;
 	float pid_pitch_p, pid_pitch_i, pid_pitch_d, pid_pitch_out;
@@ -141,7 +146,7 @@ typedef struct __attribute__((packed)) {
 	float motor1_pct, motor2_pct, motor3_pct, motor4_pct;
 	uint8_t magic_footer;
 } VCPDumpPacket_t;
-_Static_assert(sizeof(VCPDumpPacket_t) == 223, "VCP dump packet size mismatch!");
+_Static_assert(sizeof(VCPDumpPacket_t) == 275, "VCP dump packet size mismatch!");
 
 static bool normal_telem = true;
 static uint8_t dbg_axis = 1;   // 0=roll, 1=pitch, 2=yaw
@@ -249,8 +254,14 @@ BiquadFilter_t filter_gyro_yaw;
 #define ESC_MIN_PULSE 1000  // 1000us (0%)
 #define ESC_MAX_PULSE 2000  // 2000us (100%)
 #define ESC_ARM_PULSE 1000  // Arming signal
-
+#define ESC_PWM_CHANNEL               TIM_CHANNEL_1 //PC6
+#define ESC_PWM_MIN_US                1000U
+#define ESC_PWM_MAX_US                2000U
+#define ESC_PWM_ARM_US                ESC_PWM_MIN_US
+#define ESC_PWM_TIMER_PSC             95U
+#define ESC_PWM_TIMER_ARR             1999U
 #define LIDAR_BUF_SIZE 128
+#define GPS_BUF_SIZE 512
 
 #define VCP_DUMP_ENABLE      1U
 #define VCP_DUMP_PERIOD_MS   10U
@@ -281,6 +292,7 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart1_rx;
 DMA_HandleTypeDef hdma_usart1_tx;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
 volatile uint8_t is_system_armed = 0; // 0: Locked, 1: Armed
@@ -301,7 +313,7 @@ Waypoint mission_waypoints[] = {
 		{{0.0f, 0.0f, 0.0f, 0.0f},  0.0f, 0.0f, 0.08f, WP_ACTION_LAND}   // Step 3: Land
 };
 uint16_t total_wp_count = 3;
-//TIM3 > APB2 > Motor PWM Control
+//TIM3 > APB1 > Motor PWM Control
 // Global instances for the Flight Stack
 vehicleState_t  g_state;      // The current estimated state (Kinematics)
 targetState_t g_target;	;     // The desired state (Setpoints)
@@ -337,6 +349,21 @@ LSM303 imu;
 LSM303_Raw raw;
 I3GD20 i3gd20;
 I3GD20_Raw gyro_raw;
+BME280 bme280;
+static BME280_Data bme280_data;
+static bool bme280_ready = false;
+static uint8_t bme280_addr = BME280_I2C_ADDR_PRIM;
+static uint32_t bme280_last_read_ms = 0;
+static uint32_t bme280_last_init_attempt_ms = 0;
+static uint8_t bme280_chip_id = 0;
+static uint8_t i2c3_first_ack_addr = 0;
+static uint8_t i2c3_ack_count = 0;
+static float bme280_status = 0.0f; // 1 ready, 0 not attempted, negative values diagnose init/read failure.
+
+GTU7 gps;
+static GTU7_Fix gps_fix;
+static uint8_t gps_dma_buffer[GPS_BUF_SIZE];
+static bool gps_ready = false;
 
 uint8_t tf_state = 0;
 uint8_t tf_buf[9];
@@ -438,6 +465,10 @@ static void AcquireSensorsAndUpdateState(float dt_sec);
 static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags);
 static void StageActiveTelemetryFrame(void);
 static void VCP_Dump_TrySend(uint32_t now_ms);
+static bool BME280_TryInit(void);
+static bool BME280_TryInitAtAddress(uint8_t addr7);
+static void Process_VCP_Command_Line(const uint8_t* line);
+static void Process_VCP_Command_Queue(void);
 
 //SPI1 GYRO
 //I2C1 ACCEL/MAG
@@ -456,6 +487,7 @@ uint32_t unknownTelemCMD_counter;
 uint32_t CMDpulseTime = 1000;
 
 static void I2C1_Scan(void);
+static void I2C3_Scan(void);
 void Process_Lidar_DMA(void);
 /* USER CODE END PFP */
 
@@ -469,6 +501,66 @@ int _write(int file, char *ptr, int len) {
 	}
 	return len;
 }
+
+static bool BME280_TryInitAtAddress(uint8_t addr7) {
+	HAL_StatusTypeDef probe_status;
+
+	bme280_addr = addr7;
+	probe_status = BME280_Probe(&hi2c3, addr7, &bme280_chip_id);
+	if (probe_status != HAL_OK) {
+		bme280_status = -1.0f; // No ACK or chip-id register read failed.
+		return false;
+	}
+
+	if (bme280_chip_id != BME280_CHIP_ID) {
+		bme280_status = -2.0f; // A device answered, but it is not a BME280.
+		return false;
+	}
+
+	if (!BME280_Init(&bme280, &hi2c3, addr7)) {
+		bme280_status = -3.0f; // Probe passed, but reset/calibration/config failed.
+		return false;
+	}
+
+	bme280_addr = addr7;
+	bme280_ready = true;
+	bme280_status = 1.0f;
+	bme280_last_read_ms = HAL_GetTick();
+	if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
+		bme280_ready = false;
+		bme280_status = -4.0f; // First data read failed after init.
+		return false;
+	}
+
+	return true;
+}
+
+static bool BME280_TryInit(void) {
+	bme280_last_init_attempt_ms = HAL_GetTick();
+	bme280_ready = false;
+
+	if (BME280_TryInitAtAddress(BME280_I2C_ADDR_PRIM)) {
+		return true;
+	}
+
+	if (BME280_TryInitAtAddress(BME280_I2C_ADDR_SEC)) {
+		return true;
+	}
+
+	I2C3_Scan();
+	if (i2c3_ack_count == 0u) {
+		bme280_status = -5.0f; // No devices responded anywhere on I2C3.
+		bme280_addr = 0u;
+		bme280_chip_id = 0u;
+	} else {
+		bme280_status = -6.0f; // I2C3 has devices, but no BME280 at 0x76/0x77.
+		bme280_addr = i2c3_first_ack_addr;
+		bme280_chip_id = i2c3_ack_count;
+	}
+
+	return false;
+}
+
 
 static void VCP_Dump_TrySend(uint32_t now_ms) {
 #if VCP_DUMP_ENABLE
@@ -519,6 +611,19 @@ static void VCP_Dump_TrySend(uint32_t now_ms) {
 	vcp_dump_packet.target_rate_pitch = g_target.rate_pitch;
 	vcp_dump_packet.target_rate_yaw = g_target.rate_yaw;
 	vcp_dump_packet.target_ff_vz = g_target.ff_vz;
+	vcp_dump_packet.bme280_valid = bme280_status;
+	vcp_dump_packet.bme280_temp_c = bme280_ready ? bme280_data.temperature_c : (float)bme280_chip_id;
+	vcp_dump_packet.bme280_pressure_pa = bme280_ready ? bme280_data.pressure_pa : (float)bme280_addr;
+	vcp_dump_packet.bme280_humidity_rh = bme280_data.humidity_rh;
+	vcp_dump_packet.bme280_altitude_m = bme280_data.altitude_m;
+	vcp_dump_packet.gps_valid = (gps_ready && gps_fix.valid) ? 1.0f : 0.0f;
+	vcp_dump_packet.gps_sats = (float)gps_fix.satellites;
+	vcp_dump_packet.gps_lat_deg = (float)gps_fix.latitude_deg;
+	vcp_dump_packet.gps_lon_deg = (float)gps_fix.longitude_deg;
+	vcp_dump_packet.gps_alt_m = gps_fix.altitude_m;
+	vcp_dump_packet.gps_speed_mps = gps_fix.speed_mps;
+	vcp_dump_packet.gps_course_deg = gps_fix.course_deg;
+	vcp_dump_packet.gps_hdop = gps_fix.hdop;
 
 	vcp_dump_packet.pid_roll_p = pid_roll_rate.p_out;
 	vcp_dump_packet.pid_roll_i = pid_roll_rate.i_out;
@@ -586,6 +691,13 @@ static void ResetActiveFlightPIDsFromState(const vehicleState_t* state) {
 
 static void AcquireSensorsAndUpdateState(float dt_sec) {
 	LSM303_Process_DMA(&imu);
+	if (gps_ready) {
+		GTU7_ProcessDMARing(&gps);
+		if (GTU7_HasFreshFix(&gps)) {
+			(void)GTU7_GetLatest(&gps, &gps_fix);
+			GTU7_ClearFreshFlag(&gps);
+		}
+	}
 
 	// ACCELEROMETER Parsing
 	if (imu.accel_ready) {
@@ -633,6 +745,16 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		raw_data.gx = Biquad_Process(&filter_gyro_roll,  gx_raw);
 		raw_data.gy = Biquad_Process(&filter_gyro_pitch, gy_raw);
 		raw_data.gz = Biquad_Process(&filter_gyro_yaw,   gz_raw);
+	}
+
+	if (bme280_ready && ((HAL_GetTick() - bme280_last_read_ms) >= 50u)) {
+		bme280_last_read_ms = HAL_GetTick();
+		if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
+			bme280_ready = false;
+			bme280_status = -4.0f;
+		}
+	} else if (!bme280_ready && ((HAL_GetTick() - bme280_last_init_attempt_ms) >= 1000u)) {
+		(void)BME280_TryInit();
 	}
 
 	// Lidar-based altitude/vertical-velocity estimator.
@@ -769,6 +891,39 @@ static void StageActiveTelemetryFrame(void) {
 	telem_data.magic_footer = 0xAB;
 	memcpy(spi_tx_buf, &telem_data, SPI_FRAME_LEN);
 }
+
+static void Process_VCP_Command_Line(const uint8_t* line) {
+	uint8_t cmd_buf[SPI_FRAME_LEN] = {0};
+	uint16_t src_i = 0u;
+	uint16_t dst_i = 0u;
+
+	if (line == NULL) return;
+
+	while (line[src_i] == ' ' || line[src_i] == '\t') {
+		src_i++;
+	}
+
+	cmd_buf[dst_i++] = '$';
+	if (line[src_i] == '$') {
+		src_i++;
+	}
+
+	while ((line[src_i] != '\0') && (dst_i < (SPI_FRAME_LEN - 1u))) {
+		cmd_buf[dst_i++] = line[src_i++];
+	}
+
+	Process_TELEM_Command(cmd_buf, SPI_FRAME_LEN);
+}
+
+static void Process_VCP_Command_Queue(void) {
+	uint8_t line[SPI_FRAME_LEN];
+
+	(void)VCP_Command_HadOverflow();
+
+	while (VCP_Command_ReadLine(line, sizeof(line))) {
+		Process_VCP_Command_Line(line);
+	}
+}
 /* USER CODE END 0 */
 
 /**
@@ -832,11 +987,19 @@ int main(void)
 
 	// --- 3. Start Lidar DMA ---
 	HAL_UART_Receive_DMA(&huart1, lidar_dma_buffer, LIDAR_BUF_SIZE);
+	gps_ready = GTU7_Init(&gps, &huart2);
+	if (gps_ready) {
+		gps_ready = GTU7_AttachDMARxBuffer(&gps, gps_dma_buffer, GPS_BUF_SIZE);
+	}
+	if (gps_ready) {
+		gps_ready = (GTU7_StartRxDMA(&gps) == HAL_OK);
+	}
 	HAL_Delay(100);
 
 
 
 	I2C1_Scan();
+	I2C3_Scan();
 	Vehicle_State_Init(&g_drone_status);
 	last = HAL_GetTick();
 	g_drone_status.flight_mode = 10; // 0 = START UP
@@ -910,6 +1073,7 @@ int main(void)
 		if (do_rearm) {
 			SPI5_ArmNextFrame();
 		}
+		Process_VCP_Command_Queue();
 		// 1. Process Lidar
 		Process_Lidar_DMA();
 
@@ -1108,7 +1272,16 @@ int main(void)
 				g_drone_status.flight_mode = 0x08; //Stabilize
 				Navigation_GetTarget(&g_mission, (float)now / 1000.0f, &g_state, &g_target);
 				g_target.yaw_hold_enabled = true;
-
+							// Check for mission completion (e.g., after landing)
+				if (g_mission.is_complete) {
+					ESC_Disarm(); // This function already sets motors to 0 and is_system_armed to 0
+					g_state.offGround = false;
+					takeoff_state = INIT; // Reset takeoff state machine
+					g_drone_status.drone_mode = 0; // Go back to idle/mode-select
+					g_mission.is_complete = 0; // Reset mission flag
+					StartControlState = STATE_MODE_SEL; // Re-enter mode selection loop
+					continue; // Skip the rest of this control loop iteration
+				}				
 			} else if (g_drone_status.drone_mode == MODE_THRUST_STAND) {
 				g_drone_status.drone_mode = 3;
 				continue;
@@ -1595,7 +1768,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = GT_U7_DEFAULT_BAUD;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -1629,6 +1802,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
   /* DMA2_Stream2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
@@ -1763,9 +1939,12 @@ void start_control(void) {
 
 	switch (StartControlState) {
 	case STATE_INIT:
+		// INIT ESC
+
 		g_drone_status.flight_mode = 5;
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---\
 
+		// PID Tuning 
 		PID_Init(&pid_pos_z, 0.3f, 0.0f, 0.0f, 0.002f, 5.0f);   // Position P gain
 
 		PID_Init(&pid_vel_z, 0.2f, 0.01f, 0.0f, 0.002f, 10.0f); // Velocity PID with I-limit
@@ -1778,7 +1957,8 @@ void start_control(void) {
 		PID_Init(&pid_pitch_rate, 0.1f, 0.0f, 0.000f, 0.002f, 0.35f);
 		PID_Init(&pid_yaw_rate, 0.12f, 0.0f, 0.000f, 0.002f, 0.12f);
 
-		
+		// -- Frame Configuration -- 
+		Mixer_SetFrameType(MIXER_FRAME_PLUS);
 		
 
 		float d_alpha = PID_Calculate_Alpha(20.0f, 0.002f);
@@ -1795,31 +1975,48 @@ void start_control(void) {
 		// Turn off the ESC Beep...un-safe, but oh well
 		ESC_ArmAll();
 		ESC_Disarm();
-
+		HAL_Delay(1000); // Attempting to give time to let frame settle before starting the init loop
 
 		// Accel/Mag (I2C1) - Configure Registers
 		if (LSM303_Init(&imu, &hi2c1, LSM303_ACCEL_SCALE_2G)) {
 			telem_data.sensor_status |= 0x02; // Bit 1: LSM Hardware Found
 		}
-		if (I3GD20_Init(&i3gd20, &hspi1)) {
-			I3GD20_CalibrateZeroRate(&i3gd20, 500); // 1000 samples
-			telem_data.sensor_status |= 0x01; // Bit 0: Gyro Ready
-		}
+
+		(void)BME280_TryInit();
 		// SPI Begin
 		HAL_Delay(200);          // optional “let ESP settle” gate (helps your battery case)
 		SPI5_ArmNextFrame();
 		// --- 2. HARDWARE INITIALIZATION LOOP ---
 		uint8_t sensorInit = 0;
+		uint8_t init_good_streak = 0;
+		uint8_t lsm_recover_attempts = 0;
+		uint32_t init_loop_start_ms = HAL_GetTick();
+		uint32_t last_lsm_recover_ms = init_loop_start_ms;
+		const uint8_t required_status_mask = 0x13; // Mag + Accel + Gyro; LiDAR is optional/absent
 		while (sensorInit == 0)
 		{
+			uint32_t now_ms = HAL_GetTick();
 			g_drone_status.flight_mode = 5;
 			// Clear status bits that require "Fresh" verification this frame
 			// We keep Bit 0 (Gyro Init) and Bit 1 (LSM Init) if they passed once,
 			// but we MUST verify the DATA is fresh.
-
+			if (I3GD20_Init(&i3gd20, &hspi1)) {
+				I3GD20_CalibrateZeroRate(&i3gd20, 1000); // 1000 samples
+				telem_data.sensor_status |= 0x01; // Bit 0: Gyro Ready
+			}
 			// 1. Trigger fresh DMA samples
 			LSM303_Process_DMA(&imu);
+			if (gps_ready) {
+				GTU7_ProcessDMARing(&gps);
+				if (GTU7_HasFreshFix(&gps)) {
+					(void)GTU7_GetLatest(&gps, &gps_fix);
+					GTU7_ClearFreshFlag(&gps);
+				}
+			}
 			Process_Lidar_DMA();
+			if (!bme280_ready && ((now_ms - bme280_last_init_attempt_ms) >= 1000u)) {
+				(void)BME280_TryInit();
+			}
 
 			// 2. Small delay to allow DMA to complete
 			HAL_Delay(50);
@@ -1851,6 +2048,7 @@ void start_control(void) {
 				spi5_need_rearm = 0;
 				SPI5_ArmNextFrame();
 			}
+			Process_VCP_Command_Queue();
 
 			// 3. Update data only if the hardware has provided a fresh packet
 			if (imu.accel_ready) {
@@ -1889,7 +2087,7 @@ void start_control(void) {
 				telem_data.sensor_status |= 0x10; // Let's use Bit 4 (0x10) for Mag Health
 			}
 			// 4. Verification Gate
-			if (telem_data.sensor_status == 0x1B) { // 0x1B = Mag + Lidar + Accel + Gyro
+			if ((telem_data.sensor_status & required_status_mask) == required_status_mask) {
 
 				// Gravity Vector Check
 				float accel_mag = sqrtf(raw_data.ax*raw_data.ax + raw_data.ay*raw_data.ay + raw_data.az*raw_data.az);
@@ -1904,7 +2102,7 @@ void start_control(void) {
 					sensorInit = 1; // Success! Exit loop
 					//printf("ALL SYSTEMS GO: G=%.2fg, Mag=%.2f Gauss\r\n", accel_mag, mag_field_strength);
 				} else {
-					if (!gravity_ok)
+					if (!gravity_ok) 
 						if (!mag_ok)
 							HAL_Delay(200);
 				}
@@ -1920,6 +2118,7 @@ void start_control(void) {
 
 			telem_data.magic_footer = 0xAB;       // UINT8
 			telem_data.header = 0xDEADBEEF;       // Redundant header as per your code
+			VCP_Dump_TrySend(HAL_GetTick());
 		}
 
 		StartControlState = STATE_MODE_SEL;
@@ -2207,6 +2406,14 @@ void start_control(void) {
 		if (do_rearm) {
 			SPI5_ArmNextFrame();
 		}
+		Process_VCP_Command_Queue();
+		if (gps_ready) {
+			GTU7_ProcessDMARing(&gps);
+			if (GTU7_HasFreshFix(&gps)) {
+				(void)GTU7_GetLatest(&gps, &gps_fix);
+				GTU7_ClearFreshFlag(&gps);
+			}
+		}
 
 
 
@@ -2218,6 +2425,7 @@ void start_control(void) {
 		telem_data.altitude   = range_dist_cm;
 		telem_data.armed      = is_system_armed ? 0xFF : 0x00;
 		telem_data.drone_mode = g_drone_status.drone_mode;
+		VCP_Dump_TrySend(now);
 
 		// --- RESTORED STATE MACHINE CRITERIA ---
 
@@ -2645,6 +2853,22 @@ void Process_Lidar_DMA(void) {
 static void I2C1_Scan(void) {
 	for (uint8_t addr = 1; addr < 0x7F; addr++) {
 		if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 1, 5) == HAL_OK) {
+		}
+	}
+}
+
+static void I2C3_Scan(void) {
+	i2c3_first_ack_addr = 0u;
+	i2c3_ack_count = 0u;
+
+	for (uint8_t addr = 1; addr < 0x7F; addr++) {
+		if (HAL_I2C_IsDeviceReady(&hi2c3, addr << 1, 1, 5) == HAL_OK) {
+			if (i2c3_first_ack_addr == 0u) {
+				i2c3_first_ack_addr = addr;
+			}
+			if (i2c3_ack_count < 255u) {
+				i2c3_ack_count++;
+			}
 		}
 	}
 }

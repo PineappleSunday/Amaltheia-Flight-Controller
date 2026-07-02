@@ -194,6 +194,34 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     float qDot2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
     float qDot3 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
 
+    // Added weight to the accelerometer correction based on how close the accel magnitude is to 1g.
+    // Date and rationale: During aggressive maneuvers, the accelerometer can deviate significantly from 1g, leading to incorrect attitude corrections. By reducing the influence of the accelerometer when its magnitude is far from 1g, we can improve the stability and accuracy of the AHRS in dynamic conditions.
+    // Date: 2024-06-15
+    float weight = 1.0f - clampf((amag_err - 0.1f) / 0.15f, 0.0f, 1.0f); 
+    if (weight > 0.001f) {
+        float f1 = 2.0f * (q1 * q3 - q0 * q2) - ax;
+        float f2 = 2.0f * (q0 * q1 + q2 * q3) - ay;
+        float f3 = 2.0f * (0.5f - q1 * q1 - q2 * q2) - az;
+
+        // Gradient s = J^T * f
+        float s0 = (-2.0f * q2) * f1 + ( 2.0f * q1) * f2;
+        float s1 = ( 2.0f * q3) * f1 + ( 2.0f * q0) * f2 + (-4.0f * q1) * f3;
+        float s2 = (-2.0f * q0) * f1 + ( 2.0f * q3) * f2 + (-4.0f * q2) * f3;
+        float s3 = ( 2.0f * q1) * f1 + ( 2.0f * q2) * f2;
+
+        float s_norm = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        if (s_norm > 1e-9f) {
+            // Apply weight to beta to scale the correction strength
+            float beta_eff = beta * weight;
+            
+            float inv_s = 1.0f / s_norm;
+            qDot0 -= beta_eff * (s0 * inv_s);
+            qDot1 -= beta_eff * (s1 * inv_s);
+            qDot2 -= beta_eff * (s2 * inv_s);
+            qDot3 -= beta_eff * (s3 * inv_s);
+        }
+    }
+    /*
     if (accel_trust) {
         float f1 = 2.0f * (q1 * q3 - q0 * q2) - ax;
         float f2 = 2.0f * (q0 * q1 + q2 * q3) - ay;
@@ -217,6 +245,7 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
             qDot3 -= beta * s3;
         }
     }
+    */
 
     q[0] += qDot0 * dt;
     q[1] += qDot1 * dt;
@@ -259,7 +288,11 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
         if (fabsf(yaw_err) > 1.0f) {
             mag_trust = false;
         } else {
-            const float K0 = 2.5f;
+            // Changing this from 2.5 to 0.1-0.5 to reduce YAW elasticity
+            /* Date: 2024-06-15
+             * Rationale: The original gain of 2.5 was found to cause excessive yaw corrections, leading to a "rubber band" effect where the drone would overcompensate for heading errors. By reducing the gain to a range of 0.1-0.5, we can achieve a more stable and responsive yaw control, improving overall flight performance and user experience.
+             */
+            const float K0 = 0.5f;
             float yaw_rate = fabsf(gz);                // rad/s
             float K = K0 / (1.0f + 2.0f*yaw_rate);
 
@@ -288,8 +321,8 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     float ay_pred = 2.0f * (q[0] * q[1] + q[2] * q[3]);
     float az_pred = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
     const float r2d = 57.2957795f;
-    float roll_deg  = atan2f( ay_pred, az_pred) * r2d;
-    float pitch_deg = atan2f(-ax_pred, sqrtf(ay_pred * ay_pred + az_pred * az_pred)) * r2d;
+    float roll_deg  = atan2f(-ax_pred, sqrtf(ay_pred * ay_pred + az_pred * az_pred)) * r2d;
+    float pitch_deg = atan2f( ay_pred, az_pred) * r2d;
 
     state->roll  = roll_deg;
     state->pitch = pitch_deg;
@@ -304,8 +337,8 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     state->gyro_y = gy;
     state->gyro_z = gz;
 
-    state->roll_rate  = gx_dps;
-    state->pitch_rate = gy_dps;
+    state->roll_rate  = gy_dps;
+    state->pitch_rate = gx_dps;
     state->yaw_rate   = gz_dps;
 }
 

@@ -22,6 +22,8 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include <stdbool.h>
+#include <string.h>
 
 /* USER CODE END INCLUDE */
 
@@ -94,6 +96,13 @@ uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
 uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
+#define VCP_CMD_LINE_MAX 80u
+
+static volatile uint8_t vcp_cmd_line_ready = 0u;
+static volatile uint8_t vcp_cmd_overflow = 0u;
+static uint8_t vcp_cmd_write_len = 0u;
+static uint8_t vcp_cmd_write_buf[VCP_CMD_LINE_MAX];
+static uint8_t vcp_cmd_ready_buf[VCP_CMD_LINE_MAX];
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -261,6 +270,33 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  uint32_t i;
+  uint32_t rx_len = (Len != NULL) ? *Len : 0u;
+
+  for (i = 0u; i < rx_len; i++) {
+    uint8_t ch = Buf[i];
+
+    if ((ch == '\r') || (ch == '\n')) {
+      if ((vcp_cmd_write_len > 0u) && (vcp_cmd_line_ready == 0u)) {
+        memcpy(vcp_cmd_ready_buf, vcp_cmd_write_buf, vcp_cmd_write_len);
+        vcp_cmd_ready_buf[vcp_cmd_write_len] = '\0';
+        vcp_cmd_line_ready = vcp_cmd_write_len;
+      }
+      vcp_cmd_write_len = 0u;
+    } else if ((ch == 0x08u) || (ch == 0x7Fu)) {
+      if (vcp_cmd_write_len > 0u) {
+        vcp_cmd_write_len--;
+      }
+    } else if (ch >= 0x20u) {
+      if (vcp_cmd_write_len < (VCP_CMD_LINE_MAX - 1u)) {
+        vcp_cmd_write_buf[vcp_cmd_write_len++] = ch;
+      } else {
+        vcp_cmd_overflow = 1u;
+        vcp_cmd_write_len = 0u;
+      }
+    }
+  }
+
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
@@ -319,7 +355,37 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
 }
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_IMPLEMENTATION */
+bool VCP_Command_ReadLine(uint8_t* out_buf, uint16_t out_buf_len)
+{
+  uint8_t len;
 
+  if ((out_buf == NULL) || (out_buf_len == 0u)) return false;
+  if (vcp_cmd_line_ready == 0u) return false;
+
+  __disable_irq();
+  len = vcp_cmd_line_ready;
+  if (len >= out_buf_len) {
+    len = (uint8_t)(out_buf_len - 1u);
+  }
+  memcpy(out_buf, vcp_cmd_ready_buf, len);
+  out_buf[len] = '\0';
+  vcp_cmd_line_ready = 0u;
+  __enable_irq();
+
+  return true;
+}
+
+bool VCP_Command_HadOverflow(void)
+{
+  bool overflow;
+
+  __disable_irq();
+  overflow = (vcp_cmd_overflow != 0u);
+  vcp_cmd_overflow = 0u;
+  __enable_irq();
+
+  return overflow;
+}
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
 
 /**
