@@ -49,8 +49,6 @@ float PID_Calculate(PIDController* pid, float actual, float goal) {
     //Derivative on measurement
     float dt = pid->cycle_time_seconds;
     if (dt <= 0.0f) dt = 0.002f;
-    pid->cycle_time_seconds = dt;
-    if (dt <= 0.0f) dt = 0.002f;
     float D_raw = -pid->kd * (actual - pid->previous_actual) / dt;
 
     // Apply Low Pass Filter if alpha is set (0.0 to 1.0)

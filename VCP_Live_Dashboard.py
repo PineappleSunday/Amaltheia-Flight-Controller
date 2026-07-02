@@ -113,6 +113,25 @@ assert FRAME_SIZE == 275, f"Unexpected frame size: {FRAME_SIZE}"
 assert BME_FRAME_SIZE == 243, f"Unexpected BME frame size: {BME_FRAME_SIZE}"
 assert LEGACY_FRAME_SIZE == 223, f"Unexpected legacy frame size: {LEGACY_FRAME_SIZE}"
 
+FLIGHT_MODE_MAP = {
+    0: "Disarmed/Idle",
+    4: "Emergency Land",
+    5: "Startup",
+    51: "Init",
+    52: "Sensor Init",
+    53: "Gyro Zero-Rate Cal",
+    54: "GPS Init",
+    6: "Mode Select",
+    7: "Tuning",
+    8: "Stabilize",
+    81: "Takeoff: Init",
+    82: "Takeoff: Spoolup",
+    83: "Takeoff: Liftoff",
+    84: "Takeoff: Transition",
+    91: "Telem CMD Pulse",
+    254: "Data Dump",
+}
+
 
 class FrameParser:
     def __init__(self):
@@ -136,26 +155,16 @@ class FrameParser:
             if len(self.buffer) < LEGACY_FRAME_SIZE:
                 break
 
-            frame_size = 0
-            frame_struct = None
-            frame_fields = None
-            if len(self.buffer) >= FRAME_SIZE and self.buffer[FRAME_SIZE - 1] == FOOTER_VALUE:
-                frame_size = FRAME_SIZE
-                frame_struct = FRAME_STRUCT
-                frame_fields = FRAME_FIELDS
-            elif len(self.buffer) >= BME_FRAME_SIZE and self.buffer[BME_FRAME_SIZE - 1] == FOOTER_VALUE:
-                frame_size = BME_FRAME_SIZE
-                frame_struct = BME_FRAME_STRUCT
-                frame_fields = BME_FRAME_FIELDS
-            elif self.buffer[LEGACY_FRAME_SIZE - 1] == FOOTER_VALUE:
-                frame_size = LEGACY_FRAME_SIZE
-                frame_struct = LEGACY_FRAME_STRUCT
-                frame_fields = LEGACY_FRAME_FIELDS
-            else:
+            # The firmware now consistently sends the full 275-byte frame.
+            # Simplify the parser to only look for this frame.
+            if len(self.buffer) < FRAME_SIZE or self.buffer[FRAME_SIZE - 1] != FOOTER_VALUE:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
+            frame_size = FRAME_SIZE
+            frame_struct = FRAME_STRUCT
+            frame_fields = FRAME_FIELDS
             candidate = bytes(self.buffer[:frame_size])
             values = frame_struct.unpack(candidate)
             frame = dict(zip(frame_fields, values))
@@ -163,22 +172,6 @@ class FrameParser:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
-
-            if frame_size == LEGACY_FRAME_SIZE:
-                frame["bme280_valid"] = 0.0
-                frame["bme280_temp_c"] = 0.0
-                frame["bme280_pressure_pa"] = 0.0
-                frame["bme280_humidity_rh"] = 0.0
-                frame["bme280_altitude_m"] = 0.0
-            if frame_size != FRAME_SIZE:
-                frame["gps_valid"] = 0.0
-                frame["gps_sats"] = 0.0
-                frame["gps_lat_deg"] = 0.0
-                frame["gps_lon_deg"] = 0.0
-                frame["gps_alt_m"] = 0.0
-                frame["gps_speed_mps"] = 0.0
-                frame["gps_course_deg"] = 0.0
-                frame["gps_hdop"] = 0.0
 
             frames.append(frame)
             del self.buffer[:frame_size]
@@ -300,6 +293,8 @@ def build_status_text(state):
             f"chip=0x{int(float(latest['bme280_temp_c'])):02X}\n"
         )
 
+    fm_val = latest['flight_mode']
+    fm_str = FLIGHT_MODE_MAP.get(fm_val, f"Unknown ({fm_val})")
     return (
         f"Connection: {conn_state}\n"
         f"Port: {port_line} @ {state['baud']}\n"
@@ -311,7 +306,7 @@ def build_status_text(state):
         f"Queue drops: {state['queue_drops']}\n"
         f"Bad frames: {state['bad_frames']}\n"
         "\n"
-        f"Armed: {latest['armed']}  Mode: {latest['drone_mode']}  FM: {latest['flight_mode']}\n"
+        f"Armed: {latest['armed']}  Mode: {latest['drone_mode']}  FM: {fm_str}\n"
         f"Sat: 0b{latest['sat_flags']:08b}\n"
         f"dt: {latest['dt_sec']:.4f}s\n"
         "\n"

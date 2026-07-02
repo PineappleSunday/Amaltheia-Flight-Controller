@@ -20,6 +20,8 @@ build/
 # ========================
 .settings/
 *.launch
+*.xml
+*.fig
 
 # ========================
 # VSCode / IDE noise
@@ -40,3 +42,7 @@ Thumbs.db
 *.log
 __pycache__/
 *.pyc
+*.png
+*.jpg
+flight_log_VCP/**/*.mat
+flight_log_VCP/**/*.txt

@@ -54,16 +54,8 @@ extern DMA_HandleTypeDef hdma_usart2_rx;
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-// Telemetry
-extern DMA_HandleTypeDef hdma_spi2_rx;
-extern DMA_HandleTypeDef hdma_spi2_tx;
-extern DMA_HandleTypeDef hdma_spi5_tx; // Already there
-extern DMA_HandleTypeDef hdma_spi5_rx; // <--- ADD THIS LINE
-
-// LIDAR
-extern DMA_HandleTypeDef hdma_usart1_rx;
-extern DMA_HandleTypeDef hdma_usart2_rx;
-
+// Redundant externs removed. The necessary ones are already declared
+// globally before this section.
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/

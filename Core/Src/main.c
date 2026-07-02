@@ -320,10 +320,7 @@ targetState_t g_target;	;     // The desired state (Setpoints)
 MissionManager g_mission;    // The mission and waypoint sequencer
 droneState_t g_drone_status; // Global metadata for modes, battery, and status
 
-
-
 volatile float target_throttle = 0.0f; // The throttle we want
-
 
 Telemetry_Packet_t telem_data;
 PIDTune_Packet_t pid_tune_data;
@@ -334,7 +331,15 @@ static uint32_t vcp_last_tx_ms = 0;
 uint8_t spi_rx_buffer[SPI_FRAME_LEN];
 uint8_t spi_tx_buf[SPI_FRAME_LEN];
 
-static volatile uint8_t spi5_frame_done = 0;
+// Double-buffering for SPI5 RX to avoid disabling interrupts
+static uint8_t spi_rx_buffer_a[SPI_FRAME_LEN];
+static uint8_t spi_rx_buffer_b[SPI_FRAME_LEN];
+// The buffer DMA is currently writing to. Toggled in the ISR.
+static uint8_t* volatile spi_dma_current_rx_buf = spi_rx_buffer_a;
+// The buffer that is filled and ready for the main loop to process.
+static uint8_t* volatile spi_main_process_buf = NULL;
+// Flag to signal to the main loop that a buffer is ready.
+static volatile bool spi_main_buf_ready = false;
 static volatile uint32_t spi5_frame_counter = 0;
 static uint32_t spi5_last_arm_tick = 0;
 static telemetryMode_t g_telem_mode = TELEM_MODE_NORMAL;
@@ -343,7 +348,6 @@ static uint16_t g_pid_tune_sequence = 0;
 
 uint8_t command_ready = 0;
 float commandZ = 0;
-//volatile uint8_t spi5_busy = 0;
 
 LSM303 imu;
 LSM303_Raw raw;
@@ -469,6 +473,7 @@ static bool BME280_TryInit(void);
 static bool BME280_TryInitAtAddress(uint8_t addr7);
 static void Process_VCP_Command_Line(const uint8_t* line);
 static void Process_VCP_Command_Queue(void);
+static void Process_SPI5_Frame(void);
 
 //SPI1 GYRO
 //I2C1 ACCEL/MAG
@@ -580,7 +585,7 @@ static void VCP_Dump_TrySend(uint32_t now_ms) {
 
 	vcp_dump_packet.x = g_state.x;
 	vcp_dump_packet.y = g_state.y;
-	vcp_dump_packet.z = g_state.z;
+	vcp_dump_packet.z = range_dist_cm * 0.01f;
 	vcp_dump_packet.vx = g_state.vx;
 	vcp_dump_packet.vy = g_state.vy;
 	vcp_dump_packet.vz = g_state.vz;
@@ -690,7 +695,7 @@ static void ResetActiveFlightPIDsFromState(const vehicleState_t* state) {
 }
 
 static void AcquireSensorsAndUpdateState(float dt_sec) {
-	LSM303_Process_DMA(&imu);
+	LSM303_Process_DMA(&imu); // Process any new accel/mag data from DMA
 	if (gps_ready) {
 		GTU7_ProcessDMARing(&gps);
 		if (GTU7_HasFreshFix(&gps)) {
@@ -757,46 +762,47 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		(void)BME280_TryInit();
 	}
 
-	// Lidar-based altitude/vertical-velocity estimator.
-	// - Innovation gate rejects one-sample spikes unless accel indicates real motion.
-	// - Median-of-5 removes impulse outliers.
-	// - LPF + derivative provides a stable vz estimate for the vertical controller.
-	float z_raw = range_dist_cm * 0.01f; // meters
-	float z_candidate = z_raw;
-	if (lidar_est_initialized) {
-		float dz = z_candidate - lidar_z_prev;
-		float max_step = 0.40f * dt_sec + 0.02f; // m/sample gate
-		float a_norm = sqrtf(raw_data.ax * raw_data.ax + raw_data.ay * raw_data.ay + raw_data.az * raw_data.az);
-		bool accel_event = fabsf(a_norm - 1.0f) > 0.25f;
-		if (fabsf(dz) > max_step && !accel_event) {
-			z_candidate = lidar_z_prev;
-		}
-	}
-
-	lidar_z_hist[lidar_hist_idx] = z_candidate;
-	lidar_hist_idx = (lidar_hist_idx + 1) % 5;
-	if (lidar_hist_count < 5) lidar_hist_count++;
-
-	float z_med = (lidar_hist_count < 5) ? z_candidate : median5f(lidar_z_hist);
-
-	if (!lidar_est_initialized) {
-		lidar_z_filt = z_med;
-		lidar_z_prev = z_med;
-		lidar_vz_filt = 0.0f;
-		lidar_est_initialized = 1;
-	} else {
-		float alpha_z = dt_sec / (0.08f + dt_sec);
-		lidar_z_filt += alpha_z * (z_med - lidar_z_filt);
-
-		float vz_raw = (lidar_z_filt - lidar_z_prev) / dt_sec;
-		lidar_z_prev = lidar_z_filt;
-
-		float alpha_v = dt_sec / (0.12f + dt_sec);
-		lidar_vz_filt += alpha_v * (vz_raw - lidar_vz_filt);
-	}
-
-	g_state.z = range_dist_cm / 100;
-	g_state.vz = lidar_vz_filt;
+	// Lidar-based altitude System
+    // - Pure 5-sample block average (0.01s at 500Hz) with simple velocity low-pass.
+    
+    static uint8_t sample_count = 0;
+    static float z_accumulator = 0.0f;
+    static float block_avg_z = 0.0f;
+    static float last_block_avg_z = 0.0f;
+    
+    float z_candidate = range_dist_cm * 0.01f; // meters
+    
+    if (!lidar_est_initialized) {
+        // Prime the initial value on the very first pass
+        block_avg_z = z_candidate;
+        // Assuming lidar_est_initialized is set to 1 elsewhere after this init phase
+    }
+    
+    // Accumulate the raw samples
+    z_accumulator += z_candidate;
+    sample_count++;
+    
+    // Process block average every 5 samples (10ms)
+    if (sample_count >= 5) {
+        last_block_avg_z = block_avg_z;
+        
+        // Calculate the new filtered Z altitude
+        block_avg_z = z_accumulator / 5.0f; 
+        
+        // Simple derivative for Z-velocity (dv / dt). dt is exactly 5 loops.
+        float raw_vz = (block_avg_z - last_block_avg_z) / (5.0f * dt_sec);
+        
+        // Basic low-pass filter for the velocity to prevent PID D-term harshness
+        lidar_vz_filt = (lidar_vz_filt * 0.8f) + (raw_vz * 0.2f);
+        
+        // Reset block accumulators for the next 10ms window
+        z_accumulator = 0.0f;
+        sample_count = 0;
+    }
+    
+    // Output the current estimates to the flight controller state
+    g_state.z = block_avg_z;    
+    g_state.vz = lidar_vz_filt;
 
 	// STATE ESTIMATION (AHRS & Kalman)
 	AHRS_Update(&raw_data, &g_state, dt_sec);
@@ -924,6 +930,23 @@ static void Process_VCP_Command_Queue(void) {
 		Process_VCP_Command_Line(line);
 	}
 }
+
+static void Process_SPI5_Frame(void) {
+	uint8_t cmd_buf[SPI_FRAME_LEN];
+	uint8_t* ready_buf;
+
+	if (!spi_main_buf_ready || spi_main_process_buf == NULL) {
+		return;
+	}
+
+	ready_buf = spi_main_process_buf;
+	memcpy(cmd_buf, (const void*)ready_buf, SPI_FRAME_LEN);
+	spi_main_buf_ready = false;
+
+	if (cmd_buf[0] == '$') {
+		Process_TELEM_Command(cmd_buf, SPI_FRAME_LEN);
+	}
+}
 /* USER CODE END 0 */
 
 /**
@@ -956,14 +979,14 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_I2C1_Init();
-  MX_USART2_UART_Init();
-  MX_SPI1_Init();
-  MX_USART1_UART_Init();
-  MX_SPI5_Init();
-  MX_TIM3_Init();
-  MX_I2C3_Init();
-  MX_ADC1_Init();
+  MX_I2C1_Init(); // Initialize I2C1 for LSM303 (Accelerometer/Magnetometer)
+  MX_USART2_UART_Init(); // Initialize USART2 for GPS (GTU7)
+  MX_SPI1_Init(); // Initialize SPI1 for Gyroscope (I3GD20)
+  MX_USART1_UART_Init(); // Initialize USART1 for Lidar (PWM/Serial)
+  MX_SPI5_Init(); // Initialize SPI5 for ESP8266 (WiFi/Telemetry)
+  MX_TIM3_Init(); // Initialize TIM3 for ESC PWM Control
+  MX_I2C3_Init(); // Initialize I2C3 for BME280 (Barometer/Temperature/Humidity)
+  MX_ADC1_Init(); // Initialize ADC1 for Battery Voltage Sensing
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
 
@@ -1002,13 +1025,11 @@ int main(void)
 	I2C3_Scan();
 	Vehicle_State_Init(&g_drone_status);
 	last = HAL_GetTick();
-	g_drone_status.flight_mode = 10; // 0 = START UP
+	g_drone_status.flight_mode = 5; // Use a proper enum for FLIGHT_MODE_STARTUP
 	HAL_Delay(10);
-	while(StartControlState != STATE_MODE_SEL_COMPLETE) { start_control(); }
+	// Run the pre-flight sequence until a flight mode is selected.
+	start_control();
 
-	// NOTE TO COLIN
-	// MODE SELECT
-	// ONCE MODE SELECT
 	// HAND OFF TO NAVIGATION STATE MACHINE
 	// Get Circular logic back to START CONTROL once Mode is finished or after emergency
 	// Will eventually want to setup a continue waypoint
@@ -1018,7 +1039,7 @@ int main(void)
 	float main_last = 0.00f;
 
 
-
+	g_drone_status.flight_mode = 0; // Set to a known state like FLIGHT_MODE_IDLE
 	// Loading Mission
 	// Link the waypoints to the manager and provide the current state for the start position
 	if (g_drone_status.drone_mode == MODE_MISSION){
@@ -1028,9 +1049,6 @@ int main(void)
 		g_mission.wp_start_time = (float)HAL_GetTick() / 1000.0f;
 	}
 
-
-
-
 	ResetActiveFlightPIDsFromState(&g_state);
 	g_target.yaw = g_state.yaw;
 	g_target.yaw_hold_enabled = true;
@@ -1039,7 +1057,7 @@ int main(void)
 	SPI5_ArmNextFrame();
 
 	g_state.offGround = false;
-	float flight_leg_height = 0.2f;
+	float flight_takeoff_height_threshold = 0.3f; // Units meters. 
 
   /* USER CODE END 2 */
 
@@ -1047,33 +1065,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
 	while (1)
 	{
+		// Process any completed SPI frames from the telemetry radio.
+		// This is now non-blocking and does not disable interrupts.
+		Process_SPI5_Frame();
 
-		uint8_t do_rearm = 0;
-
-		if (spi5_need_rearm) {
-			spi5_need_rearm = 0;
-			do_rearm = 1;
-		}
-
-		if (spi5_frame_done) {
-			spi5_frame_done = 0;
-
-			uint8_t cmd_work_buf[SPI_FRAME_LEN];
-			__disable_irq();
-			memcpy(cmd_work_buf, spi_rx_buffer, SPI_FRAME_LEN);
-			memset(spi_rx_buffer, 0, SPI_FRAME_LEN);
-			__enable_irq();
-
-			if (cmd_work_buf[0] == '$') {
-				Process_TELEM_Command(cmd_work_buf, SPI_FRAME_LEN);
-			}
-			do_rearm = 1;
-		}
-
-		if (do_rearm) {
-			SPI5_ArmNextFrame();
-		}
+		// Process any commands from the USB Virtual COM Port.
 		Process_VCP_Command_Queue();
+
 		// 1. Process Lidar
 		Process_Lidar_DMA();
 
@@ -1106,6 +1104,10 @@ int main(void)
 				switch(takeoff_state) {
 				case INIT:
 					g_drone_status.flight_mode = 81;
+					// Reset altitude state to ensure we start from a known ground-level.
+					// This prevents stale/noisy sensor data from causing a premature transition.
+					lidar_est_initialized = 0;
+					g_state.z = 0.0f;
 					PID_Reset(&pid_pos_z); // Clear old errors
 					PID_Reset(&pid_vel_z);
 					g_target.yaw = g_state.yaw;
@@ -1122,7 +1124,7 @@ int main(void)
 					break;
 
 				case SPOOLUP:
-					// Give motors 500ms to reach idle speed
+					// Give motors 2000ms to reach idle speed
 					g_drone_status.flight_mode = 82;
 					g_target.yaw = g_state.yaw;
 					g_target.yaw_hold_enabled = false;
@@ -1132,7 +1134,7 @@ int main(void)
 					ESC_SetThrottle(TIM_CHANNEL_3, 15.0f);
 					ESC_SetThrottle(TIM_CHANNEL_4, 15.0f);
 					takeoff_override_this_tick = 1;
-					if (now - state_timer > 500) {
+					if (now - state_timer > 2000) {
 						state_timer = now;
 						takeoff_state = TAKEOFF;
 					}
@@ -1145,12 +1147,13 @@ int main(void)
 					g_target.yaw = g_state.yaw;
 					g_target.yaw_hold_enabled = false;
 					g_target.rate_yaw = 0.0f;
-					g_target.z     = flight_leg_height + 0.2f;
-					g_target.ff_vz = 0.5f;
+					g_target.z     = flight_takeoff_height_threshold + 0.2f;
+					g_target.ff_vz = 0.5f; 
 
 					// Allow control update in TAKEOFF to climb toward z target
+					takeoff_override_this_tick = 1;
 
-					if (g_state.z > flight_leg_height) {
+					if (g_state.z > flight_takeoff_height_threshold) {
 						takeoff_state = TRANSISTION;
 						takeoff_count = 0;
 					} else {
@@ -1164,18 +1167,12 @@ int main(void)
 					g_target.yaw_hold_enabled = true;
 					g_target.rate_yaw = 0.0f;
 					ResetActiveFlightPIDsFromState(&g_state);
+					takeoff_override_this_tick = 1;
 					g_state.offGround = true; // Hand over to main flight controller
 					g_drone_status.flight_mode = 0x08; //Stabilize
 					break;
 				}
 			}
-			/*printf("IMU,%ld,AX=%f,AY=%f,AZ=%f,MX=%f,MY=%f,MZ=%f,GX=%f,GY=%f,GZ=%f\r\n",
-			       HAL_GetTick(),
-			       raw_data.ax, raw_data.ay, raw_data.az,
-			       raw_data.mx, raw_data.my, raw_data.mz,
-			       raw_data.gx, raw_data.gy, raw_data.gz);
-			 */
-			// 3. NAVIGATION (Mission Manager)
 			// 2. MISSION LOGIC
 			uint8_t invalid_mode_requested = 0;
 			if (!takeoff_override_this_tick &&
@@ -1222,7 +1219,7 @@ int main(void)
 				g_target.ff_vz = -descent_rate;
 
 				// Auto-disarm once on the ground
-				if (g_state.z <= flight_leg_height){//flight_leg_height) {
+				if (g_state.z <= flight_takeoff_height_threshold){//flight_takeoff_height_threshold) {
 					ResetActiveFlightPIDsFromState(&g_state);
 					g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
 					g_state.offGround = false;
@@ -1263,7 +1260,7 @@ int main(void)
 					g_target.rate_pitch = 0.0f;
 					g_target.rate_yaw = 0.0f;
 				}
-				g_target.z = commandZ + flight_leg_height;
+				g_target.z = commandZ + flight_takeoff_height_threshold;
 
 			} else if (!takeoff_override_this_tick &&
 					(g_drone_status.drone_mode == MODE_MISSION)) {
@@ -1937,11 +1934,14 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void start_control(void) {
 
-	switch (StartControlState) {
+	// This function now runs its own loop until a flight mode is selected.
+	while (StartControlState != STATE_MODE_SEL_COMPLETE)
+	{
+		switch (StartControlState) {
 	case STATE_INIT:
 		// INIT ESC
 
-		g_drone_status.flight_mode = 5;
+		g_drone_status.drone_mode = 51; // Init Mode
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---\
 
 		// PID Tuning 
@@ -1991,15 +1991,26 @@ void start_control(void) {
 		uint8_t init_good_streak = 0;
 		uint8_t lsm_recover_attempts = 0;
 		uint32_t init_loop_start_ms = HAL_GetTick();
+		uint32_t last_sensor_check_ms = 0;
 		uint32_t last_lsm_recover_ms = init_loop_start_ms;
 		const uint8_t required_status_mask = 0x13; // Mag + Accel + Gyro; LiDAR is optional/absent
 		while (sensorInit == 0)
 		{
 			uint32_t now_ms = HAL_GetTick();
-			g_drone_status.flight_mode = 5;
+			g_drone_status.flight_mode = 52; // Sensor Init Mode
 			// Clear status bits that require "Fresh" verification this frame
+
+			// SAFETY: Add a timeout to the sensor init loop.
+			// If sensors are not ready after 10 seconds, enter a permanent fault state.
+			if ((now_ms - init_loop_start_ms) > 10000) {
+				g_drone_status.flight_mode = 255; // FAULT_STATE
+				// Infinite loop to halt progression. A real implementation might blink an LED.
+				while(1) { HAL_Delay(100); }
+			}
+
 			// We keep Bit 0 (Gyro Init) and Bit 1 (LSM Init) if they passed once,
 			// but we MUST verify the DATA is fresh.
+			g_drone_status.flight_mode = 53; // Gyro Zero-rate calibration
 			if (I3GD20_Init(&i3gd20, &hspi1)) {
 				I3GD20_CalibrateZeroRate(&i3gd20, 1000); // 1000 samples
 				telem_data.sensor_status |= 0x01; // Bit 0: Gyro Ready
@@ -2007,6 +2018,7 @@ void start_control(void) {
 			// 1. Trigger fresh DMA samples
 			LSM303_Process_DMA(&imu);
 			if (gps_ready) {
+				g_drone_status.flight_mode = 54; // GPS Init Mode
 				GTU7_ProcessDMARing(&gps);
 				if (GTU7_HasFreshFix(&gps)) {
 					(void)GTU7_GetLatest(&gps, &gps_fix);
@@ -2018,38 +2030,18 @@ void start_control(void) {
 				(void)BME280_TryInit();
 			}
 
-			// 2. Small delay to allow DMA to complete
-			HAL_Delay(50);
-
-			if (spi5_frame_done)
-			{
-				spi5_frame_done = 0;
-
-				uint8_t cmd_work_buf[SPI_FRAME_LEN];
-				__disable_irq();
-				memcpy(cmd_work_buf, spi_rx_buffer, SPI_FRAME_LEN);
-				memset(spi_rx_buffer, 0, SPI_FRAME_LEN);
-				__enable_irq();
-				/*
-				// --- DEBUG PRINT START ---
-				// Print to Stimulus Port 0
-				printf("CMD: %02X %02X\r\n", spi_rx_buffer[0], spi_rx_buffer[1]);
-				// --- DEBUG PRINT END ---
-				 */
-				// Now it’s safe to re-arm (DMA can reuse spi_rx_buffer)
-				SPI5_ArmNextFrame();
-
-				// Only treat as command if it starts with '$'
-				if (cmd_work_buf[0] == '$') {
-					Process_TELEM_Command(cmd_work_buf, SPI_FRAME_LEN);
-				}
+			// 2. Non-blocking check at ~20Hz to allow Lidar processing to run frequently
+			if ((now_ms - last_sensor_check_ms) < 50) {
+				// Continue spinning the loop to process Lidar/VCP commands
+				continue;
 			}
-			if (spi5_need_rearm) {
-				spi5_need_rearm = 0;
-				SPI5_ArmNextFrame();
-			}
+			last_sensor_check_ms = now_ms;
+
+			// Process SPI and VCP commands during the sensor init loop
+			Process_SPI5_Frame();
 			Process_VCP_Command_Queue();
 
+			g_drone_status.flight_mode = 5;
 			// 3. Update data only if the hardware has provided a fresh packet
 			if (imu.accel_ready) {
 				uint8_t accel_snap[6];
@@ -2107,7 +2099,6 @@ void start_control(void) {
 							HAL_Delay(200);
 				}
 			}
-			HAL_Delay(50);
 			telem_data.header = 0xDEADBEEF;       // UINT32        // float 1
 			telem_data.altitude = range_dist_cm;  // float 5 (Raw Lidar in cm)
 			telem_data.voltage = 15.0f;           // float 6
@@ -2354,6 +2345,7 @@ void start_control(void) {
 	}
 
 	case STATE_MODE_SEL: {
+		g_drone_status.flight_mode = 6; // Mode Select
 		static uint8_t entered = 0;
 		static uint32_t mode_sel_last_ms = 0;
 		if (!entered) {
@@ -2364,14 +2356,17 @@ void start_control(void) {
 		}
 
 		telem_data.flight_mode = 0x06; // Signal HUD we are in Mode Select
-		uint8_t do_rearm = 0;
-
-		// 1. Check for hardware errors
-		if (spi5_need_rearm) {
-			spi5_need_rearm = 0;
-			do_rearm = 1;
-		}
 		uint32_t now = HAL_GetTick();
+		Process_SPI5_Frame();
+		Process_VCP_Command_Queue();
+
+		if (gps_ready) {
+			GTU7_ProcessDMARing(&gps);
+			if (GTU7_HasFreshFix(&gps)) {
+				(void)GTU7_GetLatest(&gps, &gps_fix);
+				GTU7_ClearFreshFlag(&gps);
+			}
+		}
 
 		if (telemCMDPulse){
 			// Has 1000ms passed?
@@ -2384,40 +2379,7 @@ void start_control(void) {
 				ESC_SetThrottle(TIM_CHANNEL_4, 0.0f);
 			}
 		}
-
-		// 2. Process incoming SPI frames
-		if (spi5_frame_done) {
-			spi5_frame_done = 0;
-
-			uint8_t cmd_work_buf[SPI_FRAME_LEN];
-			__disable_irq();
-			memcpy(cmd_work_buf, spi_rx_buffer, SPI_FRAME_LEN);
-			memset(spi_rx_buffer, 0, SPI_FRAME_LEN);
-			__enable_irq();
-
-			// Check for commands EVERY frame to ensure responsiveness
-			if (cmd_work_buf[0] == '$') {
-				Process_TELEM_Command(cmd_work_buf, SPI_FRAME_LEN);
-			}
-
-			do_rearm = 1;
-		}
-
-		if (do_rearm) {
-			SPI5_ArmNextFrame();
-		}
-		Process_VCP_Command_Queue();
-		if (gps_ready) {
-			GTU7_ProcessDMARing(&gps);
-			if (GTU7_HasFreshFix(&gps)) {
-				(void)GTU7_GetLatest(&gps, &gps_fix);
-				GTU7_ClearFreshFlag(&gps);
-			}
-		}
-
-
-
-
+		
 		telem_data.timestamp  = g_state.dt_sec;
 		telem_data.roll       = g_state.roll;
 		telem_data.pitch      = g_state.pitch;
@@ -2450,32 +2412,28 @@ void start_control(void) {
 		// do nothing
 		break;
 	}
+	}
 
 }
 static void SPI5_ArmNextFrame(void)
 {
-
-	// --------------------------------
 	__HAL_SPI_CLEAR_OVRFLAG(&hspi5);
-	StageActiveTelemetryFrame();
+	StageActiveTelemetryFrame(); // Prepares spi_tx_buf
 
-	// 3. Clear RX buffer
-	spi_rx_buffer[0] = 0;
-
-	// 5. Arm the DMA
+	// Arm the DMA with the buffer the ISR has designated for the next transfer.
+	// Note: We cast away volatile, which is safe here as we are just passing the address to the HAL function.
 	HAL_StatusTypeDef status = HAL_SPI_TransmitReceive_DMA(&hspi5,
 			spi_tx_buf,
-			spi_rx_buffer,
+			(uint8_t*)spi_dma_current_rx_buf,
 			SPI_FRAME_LEN);
 
-	// 6. VISUAL DEBUG
 	if (status != HAL_OK) {
-		// If this lights up, the OVR clear didn't work or DMA is broken
+		// DMA arming failed. This is a critical error.
+		// A more robust system might try to re-init the SPI peripheral.
 		HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_SET);
 	} else {
 		HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_RESET);
 	}
-
 	spi5_last_arm_tick = HAL_GetTick();
 }
 
@@ -2496,20 +2454,37 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
 	if (hspi->Instance == SPI5)
 	{
-		spi5_frame_done = 1;
 		spi5_frame_counter++;
 
+		// Hand the completed DMA buffer to the main loop. If the main loop is
+		// still processing the previous frame, keep reusing this DMA buffer and
+		// drop/overwrite the new frame instead of touching the held buffer.
+		if (spi_main_buf_ready) {
+			// Main loop hasn't processed the last frame.
+		} else {
+			spi_main_process_buf = spi_dma_current_rx_buf;
+			spi_main_buf_ready = true;
 
+			if (spi_dma_current_rx_buf == spi_rx_buffer_a) {
+				spi_dma_current_rx_buf = spi_rx_buffer_b;
+			} else {
+				spi_dma_current_rx_buf = spi_rx_buffer_a;
+			}
+		}
+
+		// Immediately arm the next DMA transfer into the new buffer.
+		SPI5_ArmNextFrame();
 	}
 }
 
 void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
 	if (hspi->Instance == SPI5) {
-		// Abort the current failed transfer to clear hardware busy flags
+		// An SPI error occurred (e.g., Overrun). Abort to reset HAL state.
 		HAL_SPI_Abort(hspi);
 		hspi->State = HAL_SPI_STATE_READY;
-		spi5_need_rearm = 1;
+		// Immediately try to re-arm the next DMA transfer to recover.
+		SPI5_ArmNextFrame();
 	}
 }
 
@@ -2827,7 +2802,7 @@ void ESC_Disarm(void) {
 	HAL_Delay(100);
 }
 void Process_Lidar_DMA(void) {
-	uint8_t write_idx = (LIDAR_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx)) % LIDAR_BUF_SIZE;	telem_data.sensor_status |= 0x08;
+	uint8_t write_idx = (LIDAR_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx)) % LIDAR_BUF_SIZE;
 	while (lidar_read_idx != write_idx) {
 		uint8_t b = lidar_dma_buffer[lidar_read_idx];
 		switch(tf_state) {
@@ -2840,6 +2815,7 @@ void Process_Lidar_DMA(void) {
 				if ((uint8_t)(tf_checksum & 0xFF) == tf_buf[6]) {
 					uint16_t dist_raw = tf_buf[0] + (tf_buf[1] << 8);
 					range_dist_cm = (float)dist_raw;
+					telem_data.sensor_status |= 0x08; // Lidar is healthy
 				}
 				tf_state = 0;
 			}
