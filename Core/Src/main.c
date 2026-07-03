@@ -36,9 +36,27 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-#define SPI_FRAME_LEN 80
-#define TELEMETRY_HEADER_NORMAL 0xDEADBEEFUL
-#define TELEMETRY_HEADER_PID_TUNE 0x54554E45UL
+#define SPI_FRAME_LEN 				80
+#define TELEMETRY_HEADER_NORMAL 	0xDEADBEEFUL
+#define TELEMETRY_HEADER_PID_TUNE 	0x54554E45UL
+#define TELEMETRY_HANDSHAKE_FC		"Arbiter"
+#define TELEMETRY_HANDSHAKE_ESP		"peace"
+#define SENSOR_STATUS_GYRO_READY 	0x01u
+#define SENSOR_STATUS_LSM_READY  	0x02u
+#define SENSOR_STATUS_LIDAR_OK   	0x08u
+#define SENSOR_STATUS_MAG_OK     	0x10u
+#define SENSOR_STATUS_BME280_READY 	0x40u
+#define SENSOR_STATUS_GPS_FIX    	0x20u
+
+/* Two-stage sensor BIT: comms/alive first, then data-validity second. */
+#define SENSOR_BIT_GPS        0x01u
+#define SENSOR_BIT_ACCEL_MAG  0x02u
+#define SENSOR_BIT_BME280     0x04u
+#define SENSOR_BIT_GYRO       0x08u
+#define SENSOR_BIT_LIDAR      0x10u
+#define SENSOR_BIT_TELEMETRY  0x20u
+#define SENSOR_BIT_SPARE_1    0x40u
+#define SENSOR_BIT_SPARE_2    0x80u
 typedef struct __attribute__((packed)) {
 	uint32_t header; // 0xDEADBEEF
 	float timestamp;
@@ -308,8 +326,8 @@ typedef enum { READ_ACCEL, READ_MAG } sensor_state_t;
 
 Waypoint mission_waypoints[] = {
 		// { {x, y, z, yaw}, toa, hover_duration, tolerance, action }
-		{{0.0f, 0.0f, 0.8f, 0.0f},  0.0f, 0.0f, 0.10f, WP_ACTION_MOVE},  // Step 1: Takeoff to 0.8m
-		{{0.0f, 0.0f, 0.8f, 0.0f},  0.0f, 8.0f, 0.15f, WP_ACTION_HOVER}, // Step 2: Hover in place
+		{{0.0f, 0.0f, 0.6f, 0.0f},  0.0f, 0.0f, 0.10f, WP_ACTION_MOVE},  // Step 1: Takeoff to 0.6m
+		{{0.0f, 0.0f, 0.6f, 0.0f},  0.0f, 8.0f, 0.15f, WP_ACTION_HOVER}, // Step 2: Hover in place
 		{{0.0f, 0.0f, 0.0f, 0.0f},  0.0f, 0.0f, 0.08f, WP_ACTION_LAND}   // Step 3: Land
 };
 uint16_t total_wp_count = 3;
@@ -340,8 +358,24 @@ static uint8_t* volatile spi_dma_current_rx_buf = spi_rx_buffer_a;
 static uint8_t* volatile spi_main_process_buf = NULL;
 // Flag to signal to the main loop that a buffer is ready.
 static volatile bool spi_main_buf_ready = false;
+static uint8_t spi_cmd_irq_buf[SPI_FRAME_LEN];
+static volatile bool spi_cmd_irq_pending = false;
 static volatile uint32_t spi5_frame_counter = 0;
+static volatile uint32_t spi5_dropped_frame_counter = 0;
+static volatile uint32_t spi5_cmd_rx_counter = 0;
+static volatile uint32_t spi5_noncmd_rx_counter = 0;
+static volatile uint8_t spi5_last_rx0 = 0;
+static volatile uint8_t spi5_last_rx1 = 0;
+static volatile uint32_t spi5_last_cmd_tick = 0;
 static uint32_t spi5_last_arm_tick = 0;
+static volatile uint16_t telem_cmd_ack_counter = 0;
+static volatile uint8_t telem_cmd_ack_status = 0; // 0 none, 1 accepted, 2 rejected
+static volatile uint8_t telem_cmd_ack_code = 0;
+static volatile bool huzzah_handshake_ok = false;
+static volatile uint32_t huzzah_handshake_tick = 0;
+static float soft_land_x = 0.0f;
+static float soft_land_y = 0.0f;
+static float soft_land_yaw = 0.0f;
 static telemetryMode_t g_telem_mode = TELEM_MODE_NORMAL;
 static pidTuneLoop_t g_pid_tune_loop = PID_TUNE_LOOP_PITCH_RATE;
 static uint16_t g_pid_tune_sequence = 0;
@@ -471,9 +505,22 @@ static void StageActiveTelemetryFrame(void);
 static void VCP_Dump_TrySend(uint32_t now_ms);
 static bool BME280_TryInit(void);
 static bool BME280_TryInitAtAddress(uint8_t addr7);
+static void UpdateTelemetryGPSStatus(void);
+static void UpdateCompactTelemetryDiagnostics(void);
 static void Process_VCP_Command_Line(const uint8_t* line);
 static void Process_VCP_Command_Queue(void);
 static void Process_SPI5_Frame(void);
+static void EnterMode(uint8_t mode);
+static void BeginSoftLanding(void);
+static void CompleteSoftLanding(void);
+static void EnterPermanentFaultBlink(void);
+static void SetPBITOkLed(bool on);
+static void SetModeSelectLed(bool on);
+static void UpdateGPSLockLed(bool gps_locked);
+static void LSM303_DisableSharedIRQs(void);
+static void LSM303_EnableSharedIRQs(void);
+static void SPI5_DisableSharedIRQs(void);
+static void SPI5_EnableSharedIRQs(void);
 
 //SPI1 GYRO
 //I2C1 ACCEL/MAG
@@ -530,9 +577,11 @@ static bool BME280_TryInitAtAddress(uint8_t addr7) {
 	bme280_addr = addr7;
 	bme280_ready = true;
 	bme280_status = 1.0f;
+	telem_data.sensor_status |= SENSOR_STATUS_BME280_READY;
 	bme280_last_read_ms = HAL_GetTick();
 	if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
 		bme280_ready = false;
+		telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_BME280_READY;
 		bme280_status = -4.0f; // First data read failed after init.
 		return false;
 	}
@@ -543,6 +592,7 @@ static bool BME280_TryInitAtAddress(uint8_t addr7) {
 static bool BME280_TryInit(void) {
 	bme280_last_init_attempt_ms = HAL_GetTick();
 	bme280_ready = false;
+	telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_BME280_READY;
 
 	if (BME280_TryInitAtAddress(BME280_I2C_ADDR_PRIM)) {
 		return true;
@@ -566,6 +616,93 @@ static bool BME280_TryInit(void) {
 	return false;
 }
 
+static void UpdateTelemetryGPSStatus(void) {
+	const bool gps_locked = (gps_ready && gps_fix.valid);
+
+	if (gps_locked) {
+		telem_data.sensor_status |= SENSOR_STATUS_GPS_FIX;
+	} else {
+		telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_GPS_FIX;
+	}
+	UpdateGPSLockLed(gps_locked);
+}
+
+static void UpdateCompactTelemetryGPSFields(void) {
+	telem_data.setpoint = (gps_ready && gps_fix.valid) ? 1.0f : 0.0f;
+	telem_data.measurement = (float)gps_fix.satellites;
+	telem_data.error = (float)gps_fix.latitude_deg;
+	telem_data.p_term = (float)gps_fix.longitude_deg;
+	telem_data.i_term = gps_fix.altitude_m;
+	telem_data.d_term = gps_fix.speed_mps;
+	telem_data.output_sum = gps_fix.hdop;
+}
+
+static void UpdateCompactTelemetryDiagnostics(void) {
+	telem_data.timestamp = (float)HAL_GetTick() * 0.001f;
+	telem_data.cmd_roll_deg_x100 = (int16_t)(spi5_frame_counter & 0x7FFFu);
+	telem_data.cmd_pitch_deg_x100 = (int16_t)(spi5_cmd_rx_counter & 0x7FFFu);
+	telem_data.cmd_yaw_deg_x100 = (int16_t)(spi5_dropped_frame_counter & 0x7FFFu);
+	telem_data.i_state = (int16_t)(spi5_noncmd_rx_counter & 0x7FFFu);
+	telem_data.gyro_p = (int16_t)(((uint16_t)spi5_last_rx0 << 8) | spi5_last_rx1);
+	telem_data.gyro_q = (int16_t)(((uint16_t)telem_cmd_ack_status << 8) | telem_cmd_ack_code);
+	telem_data.gyro_r = (int16_t)(telem_cmd_ack_counter & 0x7FFFu);
+}
+
+static bool SPIBufferContains(const uint8_t* buf, const char* pattern) {
+	size_t pattern_len = strlen(pattern);
+	if (pattern_len == 0u || pattern_len > SPI_FRAME_LEN) {
+		return false;
+	}
+	for (size_t i = 0; i <= (SPI_FRAME_LEN - pattern_len); i++) {
+		if (memcmp(&buf[i], pattern, pattern_len) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void LSM303_DisableSharedIRQs(void) {
+	HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+	HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
+	HAL_NVIC_DisableIRQ(DMA1_Stream0_IRQn);
+	HAL_NVIC_DisableIRQ(DMA1_Stream1_IRQn);
+}
+
+static void LSM303_EnableSharedIRQs(void) {
+	HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
+	HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+	HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
+	HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+}
+
+static void SPI5_DisableSharedIRQs(void) {
+	HAL_NVIC_DisableIRQ(SPI5_IRQn);
+	HAL_NVIC_DisableIRQ(DMA2_Stream3_IRQn);
+	HAL_NVIC_DisableIRQ(DMA2_Stream4_IRQn);
+}
+
+static void SPI5_EnableSharedIRQs(void) {
+	HAL_NVIC_EnableIRQ(DMA2_Stream4_IRQn);
+	HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+	HAL_NVIC_EnableIRQ(SPI5_IRQn);
+}
+
+static int FindSPICommandOffset(const uint8_t* buf) {
+	for (int i = 0; i < SPI_FRAME_LEN - 1; i++) {
+		if (buf[i] == '$' && buf[i + 1] >= 0x20u && buf[i + 1] <= 0x7Eu) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static void CopySPICommandFrame(uint8_t* dst, const uint8_t* src, int offset) {
+	memset(dst, 0, SPI_FRAME_LEN);
+	if (offset < 0 || offset >= SPI_FRAME_LEN) {
+		return;
+	}
+	memcpy(dst, &src[offset], SPI_FRAME_LEN - (uint32_t)offset);
+}
 
 static void VCP_Dump_TrySend(uint32_t now_ms) {
 #if VCP_DUMP_ENABLE
@@ -694,6 +831,30 @@ static void ResetActiveFlightPIDsFromState(const vehicleState_t* state) {
 	PID_ResetWithMeasurement(&pid_yaw_rate, yaw_rate);
 }
 
+static void EnterMode(uint8_t mode) {
+	switch (mode) {
+	case MODE_MISSION:
+		Navigation_Init(&g_mission, mission_waypoints, total_wp_count, &g_state);
+		takeoff_state = INIT;
+		g_state.offGround = false;
+		ResetActiveFlightPIDsFromState(&g_state);
+		g_drone_status.drone_mode = MODE_MISSION;
+		break;
+
+	case MODE_MANUAL_LEVEL:
+	case MODE_THRUST_STAND:
+		takeoff_state = INIT;
+		g_state.offGround = false;
+		ResetActiveFlightPIDsFromState(&g_state);
+		g_drone_status.drone_mode = mode;
+		break;
+
+	default:
+		unknownTelemCMD_counter += 1;
+		break;
+	}
+}
+
 static void AcquireSensorsAndUpdateState(float dt_sec) {
 	LSM303_Process_DMA(&imu); // Process any new accel/mag data from DMA
 	if (gps_ready) {
@@ -703,15 +864,16 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 			GTU7_ClearFreshFlag(&gps);
 		}
 	}
+	UpdateTelemetryGPSStatus();
 
 	// ACCELEROMETER Parsing
 	if (imu.accel_ready) {
 		// Atomic snapshot of the 6-byte buffer
 		uint8_t accel_snap[6];
-		__disable_irq();
+		LSM303_DisableSharedIRQs();
 		memcpy(accel_snap, imu.accel_raw, 6);
 		imu.accel_ready = false; // Clear flag in struct
-		__enable_irq();
+		LSM303_EnableSharedIRQs();
 
 		// Parse from snapshot (Little Endian: L, H)
 		raw_data.ax = (int16_t)((accel_snap[1] << 8) | accel_snap[0]) * imu.accel_g_per_lsb;
@@ -722,10 +884,10 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 	// MAGNETOMETER Parsing
 	if (imu.mag_ready) {
 		uint8_t mag_snap[6];
-		__disable_irq();
+		LSM303_DisableSharedIRQs();
 		memcpy(mag_snap, imu.mag_raw, 6);
 		imu.mag_ready = false; // Clear flag in struct
-		__enable_irq();
+		LSM303_EnableSharedIRQs();
 
 		if (imu.variant == LSM303_DLHC) {
 			// DLHC: Big Endian and X-Z-Y order
@@ -756,7 +918,10 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		bme280_last_read_ms = HAL_GetTick();
 		if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
 			bme280_ready = false;
+			telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_BME280_READY;
 			bme280_status = -4.0f;
+		} else {
+			telem_data.sensor_status |= SENSOR_STATUS_BME280_READY;
 		}
 	} else if (!bme280_ready && ((HAL_GetTick() - bme280_last_init_attempt_ms) >= 1000u)) {
 		(void)BME280_TryInit();
@@ -886,6 +1051,12 @@ static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags) {
 }
 
 static void StageActiveTelemetryFrame(void) {
+	if (!huzzah_handshake_ok && StartControlState != STATE_MODE_SEL_COMPLETE) {
+		memset(spi_tx_buf, 0, SPI_FRAME_LEN);
+		memcpy(spi_tx_buf, TELEMETRY_HANDSHAKE_FC, strlen(TELEMETRY_HANDSHAKE_FC));
+		return;
+	}
+
 	if (g_telem_mode == TELEM_MODE_PID_TUNE &&
 			StartControlState == STATE_MODE_SEL_COMPLETE) {
 		BuildPIDTunePacket(g_state.dt_sec, telem_data.sat_flags);
@@ -895,6 +1066,8 @@ static void StageActiveTelemetryFrame(void) {
 
 	telem_data.header = TELEMETRY_HEADER_NORMAL;
 	telem_data.magic_footer = 0xAB;
+	UpdateCompactTelemetryGPSFields();
+	UpdateCompactTelemetryDiagnostics();
 	memcpy(spi_tx_buf, &telem_data, SPI_FRAME_LEN);
 }
 
@@ -935,16 +1108,131 @@ static void Process_SPI5_Frame(void) {
 	uint8_t cmd_buf[SPI_FRAME_LEN];
 	uint8_t* ready_buf;
 
+	SPI5_DisableSharedIRQs();
+	if (spi_cmd_irq_pending) {
+		memcpy(cmd_buf, spi_cmd_irq_buf, SPI_FRAME_LEN);
+		spi_cmd_irq_pending = false;
+		SPI5_EnableSharedIRQs();
+
+		spi5_last_rx0 = cmd_buf[0];
+		spi5_last_rx1 = cmd_buf[1];
+		spi5_cmd_rx_counter++;
+		spi5_last_cmd_tick = HAL_GetTick();
+		Process_TELEM_Command(cmd_buf, SPI_FRAME_LEN);
+		return;
+	}
+
 	if (!spi_main_buf_ready || spi_main_process_buf == NULL) {
+		SPI5_EnableSharedIRQs();
 		return;
 	}
 
 	ready_buf = spi_main_process_buf;
-	memcpy(cmd_buf, (const void*)ready_buf, SPI_FRAME_LEN);
+	spi_main_process_buf = NULL;
 	spi_main_buf_ready = false;
+	SPI5_EnableSharedIRQs();
 
-	if (cmd_buf[0] == '$') {
+	memcpy(cmd_buf, (const void*)ready_buf, SPI_FRAME_LEN);
+	spi5_last_rx0 = cmd_buf[0];
+	spi5_last_rx1 = cmd_buf[1];
+	if (SPIBufferContains(cmd_buf, TELEMETRY_HANDSHAKE_ESP)) {
+		huzzah_handshake_ok = true;
+		huzzah_handshake_tick = HAL_GetTick();
+	}
+	int cmd_offset = FindSPICommandOffset(cmd_buf);
+	if (cmd_offset >= 0) {
+		if (cmd_offset > 0) {
+			uint8_t normalized_cmd[SPI_FRAME_LEN];
+			CopySPICommandFrame(normalized_cmd, cmd_buf, cmd_offset);
+			memcpy(cmd_buf, normalized_cmd, SPI_FRAME_LEN);
+		}
+		spi5_cmd_rx_counter++;
+		spi5_last_cmd_tick = HAL_GetTick();
 		Process_TELEM_Command(cmd_buf, SPI_FRAME_LEN);
+	} else {
+		spi5_noncmd_rx_counter++;
+	}
+}
+
+static void BeginSoftLanding(void) {
+	is_land_cmd_active = 1;
+	is_estop_active = 0;
+	takeoff_state = INIT;
+	g_drone_status.drone_mode = MODE_MISSION;
+	if (is_system_armed) {
+		g_state.offGround = true;
+	}
+	g_mission.landing_start_t = (float)HAL_GetTick() / 1000.0f;
+	soft_land_x = g_state.x;
+	soft_land_y = g_state.y;
+	soft_land_yaw = g_state.yaw;
+	g_target.x = soft_land_x;
+	g_target.y = soft_land_y;
+	g_target.yaw = soft_land_yaw;
+	g_target.yaw_hold_enabled = true;
+	g_target.rate_yaw = 0.0f;
+	ResetActiveFlightPIDsFromState(&g_state);
+}
+
+static void CompleteSoftLanding(void) {
+	ESC_Disarm();
+	is_land_cmd_active = 0;
+	is_estop_active = 0;
+	g_state.offGround = false;
+	takeoff_state = INIT;
+	g_mission.is_complete = 0;
+	g_mission.landing_start_t = 0.0f;
+	g_drone_status.drone_mode = 0;
+	g_drone_status.flight_mode = 0;
+	StartControlState = STATE_MODE_SEL;
+}
+
+static void SetPBITOkLed(bool on) {
+	HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void SetModeSelectLed(bool on) {
+	HAL_GPIO_WritePin(LD6_GPIO_Port, LD6_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void UpdateGPSLockLed(bool gps_locked) {
+	static bool was_locked = false;
+	static bool led_on = false;
+	static uint32_t last_toggle_ms = 0u;
+	const uint32_t now_ms = HAL_GetTick();
+
+	if (!gps_locked) {
+		was_locked = false;
+		led_on = false;
+		last_toggle_ms = now_ms;
+		HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+		return;
+	}
+
+	if (!was_locked) {
+		was_locked = true;
+		led_on = true;
+		last_toggle_ms = now_ms;
+		HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+		return;
+	}
+
+	if ((now_ms - last_toggle_ms) >= 500u) {
+		led_on = !led_on;
+		last_toggle_ms = now_ms;
+		HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, led_on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	}
+}
+
+static void EnterPermanentFaultBlink(void) {
+	const uint16_t all_led_pins = LD4_Pin | LD3_Pin | LD5_Pin | LD6_Pin;
+
+	HAL_GPIO_WritePin(GPIOD, all_led_pins, GPIO_PIN_RESET);
+	while (1) {
+		HAL_GPIO_TogglePin(GPIOD, all_led_pins);
+		for (volatile uint32_t i = 0; i < 800000u; i++) {
+			__NOP();
+		}
 	}
 }
 /* USER CODE END 0 */
@@ -1010,7 +1298,9 @@ int main(void)
 
 	// --- 3. Start Lidar DMA ---
 	HAL_UART_Receive_DMA(&huart1, lidar_dma_buffer, LIDAR_BUF_SIZE);
+	// --- 4. Start GPS DMA ---
 	gps_ready = GTU7_Init(&gps, &huart2);
+	// - GPS 
 	if (gps_ready) {
 		gps_ready = GTU7_AttachDMARxBuffer(&gps, gps_dma_buffer, GPS_BUF_SIZE);
 	}
@@ -1043,10 +1333,7 @@ int main(void)
 	// Loading Mission
 	// Link the waypoints to the manager and provide the current state for the start position
 	if (g_drone_status.drone_mode == MODE_MISSION){
-		Navigation_Init(&g_mission, mission_waypoints, total_wp_count, &g_state);
-		g_drone_status.drone_mode = 2;
-		// Safety: Set the mission start time to the current clock
-		g_mission.wp_start_time = (float)HAL_GetTick() / 1000.0f;
+		EnterMode(MODE_MISSION);
 	}
 
 	ResetActiveFlightPIDsFromState(&g_state);
@@ -1057,8 +1344,8 @@ int main(void)
 	SPI5_ArmNextFrame();
 
 	g_state.offGround = false;
-	float flight_takeoff_height_threshold = 0.3f; // Units meters. 
-
+	float flight_takeoff_height_threshold = 0.5f; // Units meters. 
+	float flight_landing_height_threshold = 0.2f; // Units meters.
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1091,15 +1378,18 @@ int main(void)
 		// 2. Run Control Loop at 500Hz
 		if (now - main_last >= 2) {
 
-				float dt_sec = (now - main_last) / 1000.0f;
-				if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.002f;
-				main_last = now;
-				g_state.dt_sec = dt_sec;
+			float dt_sec = (now - main_last) / 1000.0f;
+			if (dt_sec <= 0.0f || dt_sec > 0.5f) dt_sec = 0.002f;
+			main_last = now;
+			g_state.dt_sec = dt_sec;
 
-				uint8_t takeoff_override_this_tick = 0;
-				AcquireSensorsAndUpdateState(dt_sec);
-				static uint32_t state_timer = 0;
+			uint8_t takeoff_override_this_tick = 0;
+			AcquireSensorsAndUpdateState(dt_sec);
+			static uint32_t state_timer = 0;
 
+			// --- TAKEOFF STATE MACHINE ---
+			// Only valid when the system is armed and drone is on ground
+			// On-Ground is procedural, not a sensor state.
 			if ((!g_state.offGround) && (is_system_armed)){
 				switch(takeoff_state) {
 				case INIT:
@@ -1151,7 +1441,7 @@ int main(void)
 					g_target.ff_vz = 0.5f; 
 
 					// Allow control update in TAKEOFF to climb toward z target
-					takeoff_override_this_tick = 1;
+					takeoff_override_this_tick = 0; // Allow normal control to run
 
 					if (g_state.z > flight_takeoff_height_threshold) {
 						takeoff_state = TRANSISTION;
@@ -1167,7 +1457,7 @@ int main(void)
 					g_target.yaw_hold_enabled = true;
 					g_target.rate_yaw = 0.0f;
 					ResetActiveFlightPIDsFromState(&g_state);
-					takeoff_override_this_tick = 1;
+					takeoff_override_this_tick = 0; // Allow normal control to run
 					g_state.offGround = true; // Hand over to main flight controller
 					g_drone_status.flight_mode = 0x08; //Stabilize
 					break;
@@ -1206,29 +1496,24 @@ int main(void)
 				is_estop_active = 0; // Reset for next boot
 
 			} else if (is_land_cmd_active) {
-				// FUTURE USE NOT IN CURRENT IMPLEMENTATION
-				// Force a landing setpoint: Stay at current X/Y, but descend Z
-				g_target.x = g_state.x;
-				g_target.y = g_state.y;
-				g_drone_status.flight_mode = 4; // 4 = EMERGENCY LANDING
-				// Use your tiered descent rates from navigation.c
+				// Soft landing: hold current X/Y and descend under normal control.
+				g_target.x = soft_land_x;
+				g_target.y = soft_land_y;
+				g_target.yaw = soft_land_yaw;
+				g_target.yaw_hold_enabled = true;
+				g_target.rate_yaw = 0.0f;
+				g_drone_status.flight_mode = 3; // LANDING
 				float descent_rate = (g_state.z > 5.0f) ? 0.4f : 0.15f;
 				g_target.z = g_state.z - (descent_rate * dt_sec);
 				if (g_target.z < 0.4f) g_target.z = 0.0f;
 
 				g_target.ff_vz = -descent_rate;
 
-				// Auto-disarm once on the ground
-				if (g_state.z <= flight_takeoff_height_threshold){//flight_takeoff_height_threshold) {
-					ResetActiveFlightPIDsFromState(&g_state);
-					g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
-					g_state.offGround = false;
-					// Force immediate hardware override to 0%
-					for(int i = 1; i <= 4; i++) {
-						ESC_SetThrottle(get_timer_channel(i), 0.0f);
-					}
-					is_system_armed = 0;
-					is_estop_active = 0; // Reset for next boot
+				// Auto-disarm once on the ground, then return to Mode Select.
+				if (!is_system_armed || g_state.z <= flight_landing_height_threshold) {
+					CompleteSoftLanding();
+					start_control();
+					continue;
 				}
 
 			} else if (!takeoff_override_this_tick && invalid_mode_requested) {
@@ -1264,21 +1549,24 @@ int main(void)
 
 			} else if (!takeoff_override_this_tick &&
 					(g_drone_status.drone_mode == MODE_MISSION)) {
-				// Normal Navigation logic
 				g_drone_status.drone_mode = 2;
-				g_drone_status.flight_mode = 0x08; //Stabilize
-				Navigation_GetTarget(&g_mission, (float)now / 1000.0f, &g_state, &g_target);
-				g_target.yaw_hold_enabled = true;
-							// Check for mission completion (e.g., after landing)
-				if (g_mission.is_complete) {
-					ESC_Disarm(); // This function already sets motors to 0 and is_system_armed to 0
-					g_state.offGround = false;
-					takeoff_state = INIT; // Reset takeoff state machine
-					g_drone_status.drone_mode = 0; // Go back to idle/mode-select
-					g_mission.is_complete = 0; // Reset mission flag
-					StartControlState = STATE_MODE_SEL; // Re-enter mode selection loop
-					continue; // Skip the rest of this control loop iteration
-				}				
+				if (g_state.offGround) {
+					// Mission navigation owns targets only after executive takeoff hands off.
+					g_drone_status.flight_mode = 0x08; //Stabilize
+					Navigation_GetTarget(&g_mission, (float)now / 1000.0f, &g_state, &g_target);
+					g_target.yaw_hold_enabled = true;
+					// Check for mission completion (e.g., after landing)
+					if (g_mission.is_complete) {
+						ESC_Disarm(); // This function already sets motors to 0 and is_system_armed to 0
+						g_state.offGround = false;
+						takeoff_state = INIT; // Reset takeoff state machine
+						g_drone_status.drone_mode = 0; // Go back to idle/mode-select
+						g_mission.is_complete = 0; // Reset mission flag
+						StartControlState = STATE_MODE_SEL; // Re-enter mode selection loop
+						start_control(); // Restart the mode selection process	
+						continue; // Skip the rest of this control loop iteration
+					}
+				}
 			} else if (g_drone_status.drone_mode == MODE_THRUST_STAND) {
 				g_drone_status.drone_mode = 3;
 				continue;
@@ -1297,8 +1585,13 @@ int main(void)
 				telem_data.sat_flags = 0;
 			}
 			else if (is_system_armed && !takeoff_override_this_tick) {
-				g_drone_status.flight_mode = 8;
+				if (!is_land_cmd_active) {
+					g_drone_status.flight_mode = 8;
+				}
 				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target, &g_drone_status);
+				if (is_land_cmd_active) {
+					g_drone_status.flight_mode = 3;
+				}
 			}
 			// Check if the system is disarmed AND if any motor has a non-zero throttle
 			else if (telem_data.motor1_T > 0 || telem_data.motor2_T > 0 ||
@@ -1315,7 +1608,7 @@ int main(void)
 
 			if (normal_telem){
 				telem_data.header 				= 0xDEADBEEF;       // UINT32
-				telem_data.timestamp 			= dt_sec;        // float 1
+				telem_data.timestamp 			= (float)HAL_GetTick() * 0.001f;        // float 1
 				telem_data.roll 				= g_state.roll;       // float 2 (Estimated Roll)
 				telem_data.pitch 				= g_state.pitch;     // float 3 (Estimated Pitch)
 				telem_data.yaw 					= g_state.yaw;         // float 4 (Estimated Yaw)
@@ -1325,22 +1618,15 @@ int main(void)
 				// Map the modes to the telemetry packet
 				telem_data.drone_mode  			= g_drone_status.drone_mode;
 				telem_data.flight_mode 			= g_drone_status.flight_mode;
-				telem_data.setpoint    			= g_target.rate_pitch;
-				telem_data.measurement 			= g_state.pitch_rate;
-				telem_data.error       			= pid_pitch_rate.previous_error;
-				telem_data.p_term      			= pid_pitch_rate.p_out;
-				telem_data.i_term      			= pid_pitch_rate.i_out;
-				telem_data.d_term      			= pid_pitch_rate.d_out;
-				telem_data.output_sum  			= pid_pitch_rate.output;
-				telem_data.cmd_roll_deg_x100 	= (int16_t)(g_target.roll  * 100.0f);
-				telem_data.cmd_pitch_deg_x100 	= (int16_t)(g_target.pitch * 100.0f);
-				telem_data.cmd_yaw_deg_x100   	= (int16_t)(g_target.yaw   * 100.0f);
-
-				telem_data.i_state 				= (int16_t)(pid_pitch_rate.i_out * 100.0f);
-
-				telem_data.gyro_p 				= (int16_t)(g_state.roll_rate  * 100.0f);
-				telem_data.gyro_q 				= (int16_t)(g_state.pitch_rate * 100.0f);
-				telem_data.gyro_r 				= (int16_t)(g_state.yaw_rate   * 100.0f);
+				UpdateTelemetryGPSStatus();
+				telem_data.setpoint    			= (gps_ready && gps_fix.valid) ? 1.0f : 0.0f;
+				telem_data.measurement 			= (float)gps_fix.satellites;
+				telem_data.error       			= (float)gps_fix.latitude_deg;
+				telem_data.p_term      			= (float)gps_fix.longitude_deg;
+				telem_data.i_term      			= gps_fix.altitude_m;
+				telem_data.d_term      			= gps_fix.speed_mps;
+				telem_data.output_sum  			= gps_fix.hdop;
+				UpdateCompactTelemetryDiagnostics();
 				telem_data.magic_footer 		= 0xAB;       // UINT8
 			} else {
 				// DEBUG TELEMETRY (multiplex roll/pitch/yaw rate loops)
@@ -1932,6 +2218,37 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static uint8_t Sensor_PBIT(void)
+{
+	uint8_t bits = 0u;
+
+	if (gps_ready) {
+		bits |= SENSOR_BIT_GPS;
+	}
+
+	if ((imu.variant != LSM303_UNKNOWN) && (imu.hi2c != NULL)) {
+		bits |= SENSOR_BIT_ACCEL_MAG;
+	}
+
+	if (bme280_ready) {
+		bits |= SENSOR_BIT_BME280;
+	}
+
+	if (i3gd20.initialized) {
+		bits |= SENSOR_BIT_GYRO;
+	}
+
+	if ((telem_data.sensor_status & SENSOR_STATUS_LIDAR_OK) != 0u) {
+		bits |= SENSOR_BIT_LIDAR;
+	}
+
+	if (huzzah_handshake_ok) {
+		bits |= SENSOR_BIT_TELEMETRY;
+	}
+
+	return bits;
+}
+
 void start_control(void) {
 
 	// This function now runs its own loop until a flight mode is selected.
@@ -1942,6 +2259,9 @@ void start_control(void) {
 		// INIT ESC
 
 		g_drone_status.drone_mode = 51; // Init Mode
+		SetPBITOkLed(false);
+		SetModeSelectLed(false);
+		UpdateGPSLockLed(false);
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---\
 
 		// PID Tuning 
@@ -1979,7 +2299,7 @@ void start_control(void) {
 
 		// Accel/Mag (I2C1) - Configure Registers
 		if (LSM303_Init(&imu, &hi2c1, LSM303_ACCEL_SCALE_2G)) {
-			telem_data.sensor_status |= 0x02; // Bit 1: LSM Hardware Found
+			telem_data.sensor_status |= SENSOR_STATUS_LSM_READY; // LSM hardware found
 		}
 
 		(void)BME280_TryInit();
@@ -1993,7 +2313,8 @@ void start_control(void) {
 		uint32_t init_loop_start_ms = HAL_GetTick();
 		uint32_t last_sensor_check_ms = 0;
 		uint32_t last_lsm_recover_ms = init_loop_start_ms;
-		const uint8_t required_status_mask = 0x13; // Mag + Accel + Gyro; LiDAR is optional/absent
+		const uint8_t required_status_mask =
+				SENSOR_STATUS_GYRO_READY | SENSOR_STATUS_LSM_READY | SENSOR_STATUS_MAG_OK | SENSOR_STATUS_BME280_READY;
 		while (sensorInit == 0)
 		{
 			uint32_t now_ms = HAL_GetTick();
@@ -2004,8 +2325,7 @@ void start_control(void) {
 			// If sensors are not ready after 10 seconds, enter a permanent fault state.
 			if ((now_ms - init_loop_start_ms) > 10000) {
 				g_drone_status.flight_mode = 255; // FAULT_STATE
-				// Infinite loop to halt progression. A real implementation might blink an LED.
-				while(1) { HAL_Delay(100); }
+				EnterPermanentFaultBlink();
 			}
 
 			// We keep Bit 0 (Gyro Init) and Bit 1 (LSM Init) if they passed once,
@@ -2013,7 +2333,7 @@ void start_control(void) {
 			g_drone_status.flight_mode = 53; // Gyro Zero-rate calibration
 			if (I3GD20_Init(&i3gd20, &hspi1)) {
 				I3GD20_CalibrateZeroRate(&i3gd20, 1000); // 1000 samples
-				telem_data.sensor_status |= 0x01; // Bit 0: Gyro Ready
+				telem_data.sensor_status |= SENSOR_STATUS_GYRO_READY;
 			}
 			// 1. Trigger fresh DMA samples
 			LSM303_Process_DMA(&imu);
@@ -2024,6 +2344,7 @@ void start_control(void) {
 					(void)GTU7_GetLatest(&gps, &gps_fix);
 					GTU7_ClearFreshFlag(&gps);
 				}
+				UpdateTelemetryGPSStatus();
 			}
 			Process_Lidar_DMA();
 			if (!bme280_ready && ((now_ms - bme280_last_init_attempt_ms) >= 1000u)) {
@@ -2045,24 +2366,24 @@ void start_control(void) {
 			// 3. Update data only if the hardware has provided a fresh packet
 			if (imu.accel_ready) {
 				uint8_t accel_snap[6];
-				__disable_irq();
+				LSM303_DisableSharedIRQs();
 				memcpy(accel_snap, imu.accel_raw, 6);
 				imu.accel_ready = false;
-				__enable_irq();
+				LSM303_EnableSharedIRQs();
 
 				raw_data.ax = (int16_t)((accel_snap[1] << 8) | accel_snap[0]) * imu.accel_g_per_lsb;
 				raw_data.ay = (int16_t)((accel_snap[3] << 8) | accel_snap[2]) * imu.accel_g_per_lsb;
 				raw_data.az = (int16_t)((accel_snap[5] << 8) | accel_snap[4]) * imu.accel_g_per_lsb;
 
 				// This bit now means: "I have a fresh, valid gravity sample"
-				telem_data.sensor_status |= 0x02;
+				telem_data.sensor_status |= SENSOR_STATUS_LSM_READY;
 			}
 			if (imu.mag_ready) {
 				uint8_t mag_snap[6];
-				__disable_irq();
+				LSM303_DisableSharedIRQs();
 				memcpy(mag_snap, imu.mag_raw, 6);
 				imu.mag_ready = false;
-				__enable_irq();
+				LSM303_EnableSharedIRQs();
 
 				// 1. Parse based on variant (DLHC vs AGR)
 				if (imu.variant == LSM303_DLHC) {
@@ -2076,10 +2397,16 @@ void start_control(void) {
 				}
 
 				// This bit confirms we are receiving data packets
-				telem_data.sensor_status |= 0x10; // Let's use Bit 4 (0x10) for Mag Health
+				telem_data.sensor_status |= SENSOR_STATUS_MAG_OK;
 			}
 			// 4. Verification Gate
-			if ((telem_data.sensor_status & required_status_mask) == required_status_mask) {
+			// First stage: comms/alive PBIT. Second stage: fresh data validity checks.
+			uint8_t comms_alive_mask = Sensor_PBIT();
+			if ((comms_alive_mask & (SENSOR_BIT_GPS | SENSOR_BIT_ACCEL_MAG | SENSOR_BIT_BME280 |
+					SENSOR_BIT_GYRO | SENSOR_BIT_LIDAR | SENSOR_BIT_TELEMETRY)) ==
+					(SENSOR_BIT_GPS | SENSOR_BIT_ACCEL_MAG | SENSOR_BIT_BME280 |
+						SENSOR_BIT_GYRO | SENSOR_BIT_LIDAR | SENSOR_BIT_TELEMETRY) &&
+				(telem_data.sensor_status & required_status_mask) == required_status_mask) {
 
 				// Gravity Vector Check
 				float accel_mag = sqrtf(raw_data.ax*raw_data.ax + raw_data.ay*raw_data.ay + raw_data.az*raw_data.az);
@@ -2091,6 +2418,7 @@ void start_control(void) {
 				bool mag_ok = (mag_field_strength > 0.2f && mag_field_strength < 0.9f);
 
 				if (gravity_ok && mag_ok) {
+					SetPBITOkLed(true);
 					sensorInit = 1; // Success! Exit loop
 					//printf("ALL SYSTEMS GO: G=%.2fg, Mag=%.2f Gauss\r\n", accel_mag, mag_field_strength);
 				} else {
@@ -2196,10 +2524,10 @@ void start_control(void) {
 			LSM303_Process_DMA(&imu);
 			if (imu.accel_ready) {
 				uint8_t snap[6];
-				__disable_irq();
+				LSM303_DisableSharedIRQs();
 				memcpy(snap, imu.accel_raw, 6);
 				imu.accel_ready = false;
-				__enable_irq();
+				LSM303_EnableSharedIRQs();
 
 				raw_data.ax = (int16_t)((snap[1] << 8) | snap[0]) * imu.accel_g_per_lsb;
 				raw_data.ay = (int16_t)((snap[3] << 8) | snap[2]) * imu.accel_g_per_lsb;
@@ -2350,6 +2678,7 @@ void start_control(void) {
 		static uint32_t mode_sel_last_ms = 0;
 		if (!entered) {
 			g_drone_status.drone_mode = 0;
+			SetModeSelectLed(true);
 			entered = 1;
 			mode_sel_last_ms = HAL_GetTick();
 			SPI5_ArmNextFrame();
@@ -2366,6 +2695,7 @@ void start_control(void) {
 				(void)GTU7_GetLatest(&gps, &gps_fix);
 				GTU7_ClearFreshFlag(&gps);
 			}
+			UpdateTelemetryGPSStatus();
 		}
 
 		if (telemCMDPulse){
@@ -2394,6 +2724,7 @@ void start_control(void) {
 		// Criterion A: Autotune Request
 		if (tune_request) {
 			tune_request = 0;
+			SetModeSelectLed(false);
 			entered = 0;
 			StartControlState = STATE_TUNE;
 			break;
@@ -2402,6 +2733,7 @@ void start_control(void) {
 		// Criterion B: Primary Mode Selection
 		// Fixed: Using your global instance g_drone_status
 		if (g_drone_status.drone_mode != 0) {
+			SetModeSelectLed(false);
 			StartControlState = STATE_MODE_SEL_COMPLETE;
 			mode_sel_last_ms = 0;
 			entered = 0;
@@ -2409,6 +2741,7 @@ void start_control(void) {
 		break;
 	}
 	case STATE_MODE_SEL_COMPLETE:
+		SetModeSelectLed(false);
 		// do nothing
 		break;
 	}
@@ -2455,17 +2788,35 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 	if (hspi->Instance == SPI5)
 	{
 		spi5_frame_counter++;
+		uint8_t* completed_rx_buf = spi_dma_current_rx_buf;
+		if (SPIBufferContains(completed_rx_buf, TELEMETRY_HANDSHAKE_ESP)) {
+			huzzah_handshake_ok = true;
+			huzzah_handshake_tick = HAL_GetTick();
+		}
+		int cmd_offset = FindSPICommandOffset(completed_rx_buf);
+		bool completed_is_cmd = (cmd_offset >= 0);
+
+		if (completed_is_cmd) {
+			if (spi_cmd_irq_pending) {
+				spi5_dropped_frame_counter++;
+			}
+			CopySPICommandFrame(spi_cmd_irq_buf, completed_rx_buf, cmd_offset);
+			spi_cmd_irq_pending = true;
+		}
 
 		// Hand the completed DMA buffer to the main loop. If the main loop is
 		// still processing the previous frame, keep reusing this DMA buffer and
 		// drop/overwrite the new frame instead of touching the held buffer.
-		if (spi_main_buf_ready) {
+		if (spi_main_buf_ready || completed_is_cmd) {
 			// Main loop hasn't processed the last frame.
+			if (spi_main_buf_ready && !completed_is_cmd) {
+				spi5_dropped_frame_counter++;
+			}
 		} else {
-			spi_main_process_buf = spi_dma_current_rx_buf;
+			spi_main_process_buf = completed_rx_buf;
 			spi_main_buf_ready = true;
 
-			if (spi_dma_current_rx_buf == spi_rx_buffer_a) {
+			if (completed_rx_buf == spi_rx_buffer_a) {
 				spi_dma_current_rx_buf = spi_rx_buffer_b;
 			} else {
 				spi_dma_current_rx_buf = spi_rx_buffer_a;
@@ -2504,11 +2855,18 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 
 	// The actual command string starts at index 1 (after the '$')
 	char* cmd = &local_buf[1];
+	while (*cmd == ' ' || *cmd == '\t' || *cmd == '\r' || *cmd == '\n') {
+		cmd++;
+	}
+	for (char* p = cmd; *p != '\0'; p++) {
+		*p = (char)tolower((unsigned char)*p);
+	}
+	bool command_accepted = false;
 
 	// 3. Token-Based Switch Switchboard
 	switch (cmd[0]) {
 
-	case 'x': case 'X': // --- EMERGENCY STOP ---
+	case 'x': // --- EMERGENCY STOP ---
 		ESC_Disarm();
 		is_estop_active = 1;
 		is_system_armed = 0;
@@ -2516,11 +2874,13 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 		if (g_mission.current_index < g_mission.total_waypoints) {
 			g_mission.waypoints[g_mission.current_index].action = WP_ACTION_LAND;
 		}
+		command_accepted = true;
 		break;
 
 	case 'a': // --- ARM or ALL ---
 		if (cmd[1] == 'r' && cmd[2] == 'm') { // "arm"
 			ESC_ArmAll();
+			command_accepted = true;
 		}
 		else if (cmd[1] == 'l' && cmd[2] == 'l') { // "all p25.0"
 			char* t_ptr = strchr(cmd, 'p');
@@ -2535,20 +2895,34 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 				ESC_SetThrottle(TIM_CHANNEL_2, throttle * motor_scales[1]);
 				ESC_SetThrottle(TIM_CHANNEL_3, throttle * motor_scales[2]);
 				ESC_SetThrottle(TIM_CHANNEL_4, throttle * motor_scales[3]);
+				command_accepted = true;
 			}
 		}
 		break;
 
+	case 'l': // --- SOFT LAND ---
+		if (strncmp(cmd, "land", 4) == 0) {
+			BeginSoftLanding();
+			command_accepted = true;
+		} else {
+			unknownTelemCMD_counter += 1;
+		}
+		break;
+
 	case 'm': // --- MOTOR or MODE ---
-		// Check if it's "mode"
-		if (cmd[1] == 'o' && cmd[2] == 'd') { // "mode 1|2|3"
-			char* val_ptr = strchr(cmd, ' ');
-			if (val_ptr != NULL) {
-				int requested_mode = atoi(val_ptr + 1);
+		// Check if it's "mode". Accept "mode 1", "mode1", "mode=1", etc.
+		if (strncmp(cmd, "mode", 4) == 0) { // "mode 1|2|3"
+			char* val_ptr = cmd + 4;
+			while (*val_ptr == ' ' || *val_ptr == '\t' || *val_ptr == '=' || *val_ptr == ':') {
+				val_ptr++;
+			}
+			if (isdigit((unsigned char)*val_ptr)) {
+				int requested_mode = atoi(val_ptr);
 				if (requested_mode == MODE_MANUAL_LEVEL ||
 						requested_mode == MODE_MISSION ||
 						requested_mode == MODE_THRUST_STAND) {
-					g_drone_status.drone_mode = (uint8_t)requested_mode;
+					EnterMode((uint8_t)requested_mode);
+					command_accepted = true;
 				} else {
 					// Unsupported/reserved mode IDs (including obsolete mode 4) are ignored
 					unknownTelemCMD_counter += 1;
@@ -2576,6 +2950,7 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 
 					float throttle = strtof(val_start, NULL);
 					ESC_SetThrottle(get_timer_channel(motor_num), throttle);
+					command_accepted = true;
 				}
 			}
 			// Pulse motor for 100ms
@@ -2591,6 +2966,7 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 					telemCMDPulse = true;
 					telemCMDTimeStart = HAL_GetTick();
 					g_drone_status.flight_mode = 91;
+					command_accepted = true;
 				}
 			}
 			else {
@@ -2599,15 +2975,26 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 		}
 		break;
 
+	case 'r': // --- RETURN TO HOME / SOFT LAND ALIAS ---
+		if (strncmp(cmd, "rth", 3) == 0) {
+			BeginSoftLanding();
+			command_accepted = true;
+		} else {
+			unknownTelemCMD_counter += 1;
+		}
+		break;
+
 	case 'z': case 'Z':
 		g_drone_status.drone_mode = 1;
 		commandZ = strtof(cmd + 1, NULL);
 		g_target.z = commandZ;
+		command_accepted = true;
 		break;
 
 	case 't': // --- TUNE ---
 		if (cmd[1] == 'u') {
 			tune_request = 1;
+			command_accepted = true;
 		} else if (cmd[1] == 'p') {
 			char* val_ptr = strchr(cmd, ' ');
 			if (val_ptr != NULL) {
@@ -2617,6 +3004,7 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 						requested_loop == PID_TUNE_LOOP_YAW_RATE) {
 					g_pid_tune_loop = (pidTuneLoop_t)requested_loop;
 					g_telem_mode = TELEM_MODE_PID_TUNE;
+					command_accepted = true;
 				} else {
 					unknownTelemCMD_counter += 1;
 				}
@@ -2625,11 +3013,16 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 			}
 		} else if (cmd[1] == 'n') {
 			g_telem_mode = TELEM_MODE_NORMAL;
+			command_accepted = true;
 		} else {
 			unknownTelemCMD_counter += 1;
 		}
 		break;
 	}
+
+	telem_cmd_ack_counter++;
+	telem_cmd_ack_status = command_accepted ? 1u : 2u;
+	telem_cmd_ack_code = (uint8_t)(cmd[0] ? cmd[0] : '?');
 }
 /**
  * @brief Helper to map Motor ID 1-4 to TIM_CHANNEL_x
@@ -2815,7 +3208,7 @@ void Process_Lidar_DMA(void) {
 				if ((uint8_t)(tf_checksum & 0xFF) == tf_buf[6]) {
 					uint16_t dist_raw = tf_buf[0] + (tf_buf[1] << 8);
 					range_dist_cm = (float)dist_raw;
-					telem_data.sensor_status |= 0x08; // Lidar is healthy
+					telem_data.sensor_status |= SENSOR_STATUS_LIDAR_OK;
 				}
 				tf_state = 0;
 			}
@@ -2859,9 +3252,7 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
 	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
-	while (1)
-	{
-	}
+	EnterPermanentFaultBlink();
   /* USER CODE END Error_Handler_Debug */
 }
 
