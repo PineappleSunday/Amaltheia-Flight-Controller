@@ -9,6 +9,7 @@
 extern PIDController pid_pos_z, pid_vel_z;
 extern PIDController pid_roll_angle, pid_pitch_angle, pid_yaw_angle;
 extern PIDController pid_roll_rate, pid_pitch_rate, pid_yaw_rate;
+extern float altitude_base_thrust_raw;
 
 float wrap_deg(float a);
 
@@ -42,7 +43,7 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneSt
 	float target_vz  = corr_vel_z + target->ff_vz;
 	float thrust_adj = PID_Calculate(&pid_vel_z, state->vz, target_vz);
 	// 2. BASE THRUST SELECTION
-	float base_thrust = 63.0f + thrust_adj;
+	float base_thrust = altitude_base_thrust_raw + thrust_adj;
 	base_thrust = clampf(base_thrust, 15.0f, 85.0f);
 
 	// 2. ATTITUDE OUTER LOOP (Angle -> Rate)

@@ -14,6 +14,15 @@ void Navigation_GetTarget(MissionManager* mgr, float t, const vehicleState_t* st
 void Navigation_GetTarget(MissionManager* mgr, float t, const vehicleState_t* state, targetState_t* target) {
     // 1. Check if mission is complete
     if (mgr->current_index >= mgr->total_waypoints) {
+        mgr->is_complete = 1;
+        if (mgr->total_waypoints == 0u) {
+            target->x = state->x;
+            target->y = state->y;
+            target->z = state->z;
+            target->yaw = state->yaw;
+            target->ff_vx = target->ff_vy = target->ff_vz = 0.0f;
+            return;
+        }
         Waypoint* last_wp = &mgr->waypoints[mgr->total_waypoints - 1];
         target->x = last_wp->position[0];
         target->y = last_wp->position[1];
@@ -26,6 +35,34 @@ void Navigation_GetTarget(MissionManager* mgr, float t, const vehicleState_t* st
     Waypoint* wp = &mgr->waypoints[mgr->current_index];
     float leg_duration = wp->toa - mgr->wp_start_time;
 
+    if (wp->action == WP_ACTION_LAND && mgr->landing_start_t > 0.0f) {
+        float elapsed = t - mgr->landing_start_t;
+        float descent_rate;
+        g_drone_status.flight_mode = 3;
+
+        if (state->z <= 0.05f) {
+            mgr->is_complete = 1;
+            descent_rate = 0.0f;
+        } else if (state->z > 20.0f) {
+            descent_rate = 0.6f;
+        } else if (state->z > 5.0f) {
+            descent_rate = 0.4f;
+        } else {
+            descent_rate = 0.15f;
+        }
+
+        target->z = wp->position[2] - (descent_rate * elapsed);
+        if (target->z < 0.0f) target->z = 0.0f;
+
+        target->x = wp->position[0];
+        target->y = wp->position[1];
+        target->yaw = wp->position[3];
+        target->ff_vz = -descent_rate;
+        target->ff_vx = 0.0f;
+        target->ff_vy = 0.0f;
+        return;
+    }
+
     // --- 2. BRANCH: INSTANT JUMP (Zero TOA) vs INTERPOLATION ---
     if (leg_duration <= 0.0f) {
         // Snap directly to target
@@ -36,52 +73,21 @@ void Navigation_GetTarget(MissionManager* mgr, float t, const vehicleState_t* st
         target->ff_vx = target->ff_vy = target->ff_vz = 0.0f;
     }
     else {
-        // --- 3. BRANCH: SPECIAL LANDING vs PATH INTERPOLATION ---
-        if (wp->action == WP_ACTION_LAND && mgr->landing_start_t > 0.0f) {
-            float elapsed = t - mgr->landing_start_t;
-            float descent_rate;
-            g_drone_status.flight_mode = 3;
-            // Tiered Descent Rates
-            if (state->z <= 0.05f) {
-                mgr->is_complete = 1;
-                descent_rate = 0.0f;
-            } else if (state->z > 20.0f) {
-                descent_rate = 0.6f;
-            } else if (state->z > 5.0f) {
-                descent_rate = 0.4f;
-            } else {
-                descent_rate = 0.15f;
-            }
+        // --- 3. BRANCH: PATH INTERPOLATION ---
+        float pct = (t - mgr->wp_start_time) / leg_duration;
+        pct = (pct < 0.0f) ? 0.0f : (pct > 1.0f) ? 1.0f : pct;
 
-            target->z = wp->position[2] - (descent_rate * elapsed);
-            if (target->z < 0.0f) target->z = 0.0f;
+        target->x = mgr->prev_wp_pos[0] + (wp->position[0] - mgr->prev_wp_pos[0]) * pct;
+        target->y = mgr->prev_wp_pos[1] + (wp->position[1] - mgr->prev_wp_pos[1]) * pct;
+        target->z = mgr->prev_wp_pos[2] + (wp->position[2] - mgr->prev_wp_pos[2]) * pct;
+        target->yaw = mgr->prev_wp_pos[3] + (wp->position[3] - mgr->prev_wp_pos[3]) * pct;
 
-            target->x = wp->position[0];
-            target->y = wp->position[1];
-            target->yaw = wp->position[3];
-            target->ff_vz = -descent_rate;
-            target->ff_vx = 0.0f;
-            target->ff_vy = 0.0f;
-
-            // Note: Prevent early exit here so distance checks still run
-        }
-        else {
-            // Standard Interpolation
-            float pct = (t - mgr->wp_start_time) / leg_duration;
-            pct = (pct < 0.0f) ? 0.0f : (pct > 1.0f) ? 1.0f : pct;
-
-            target->x = mgr->prev_wp_pos[0] + (wp->position[0] - mgr->prev_wp_pos[0]) * pct;
-            target->y = mgr->prev_wp_pos[1] + (wp->position[1] - mgr->prev_wp_pos[1]) * pct;
-            target->z = mgr->prev_wp_pos[2] + (wp->position[2] - mgr->prev_wp_pos[2]) * pct;
-            target->yaw = mgr->prev_wp_pos[3] + (wp->position[3] - mgr->prev_wp_pos[3]) * pct;
-
-            if (pct >= 1.0f) {
-                target->ff_vx = target->ff_vy = target->ff_vz = 0.0f;
-            } else {
-                target->ff_vx = (wp->position[0] - mgr->prev_wp_pos[0]) / leg_duration;
-                target->ff_vy = (wp->position[1] - mgr->prev_wp_pos[1]) / leg_duration;
-                target->ff_vz = (wp->position[2] - mgr->prev_wp_pos[2]) / leg_duration;
-            }
+        if (pct >= 1.0f) {
+            target->ff_vx = target->ff_vy = target->ff_vz = 0.0f;
+        } else {
+            target->ff_vx = (wp->position[0] - mgr->prev_wp_pos[0]) / leg_duration;
+            target->ff_vy = (wp->position[1] - mgr->prev_wp_pos[1]) / leg_duration;
+            target->ff_vz = (wp->position[2] - mgr->prev_wp_pos[2]) / leg_duration;
         }
     }
 

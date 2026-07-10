@@ -153,6 +153,7 @@ typedef struct __attribute__((packed)) {
 	float target_roll, target_pitch, target_yaw;
 	float target_rate_roll, target_rate_pitch, target_rate_yaw;
 	float target_ff_vz;
+	float mission_wp_index, mission_wp_total, mission_wp_action, mission_wp_remaining_dist;
 	float bme280_valid, bme280_temp_c, bme280_pressure_pa, bme280_humidity_rh, bme280_altitude_m;
 	float gps_valid, gps_sats, gps_lat_deg, gps_lon_deg, gps_alt_m, gps_speed_mps, gps_course_deg, gps_hdop;
 
@@ -164,7 +165,7 @@ typedef struct __attribute__((packed)) {
 	float motor1_pct, motor2_pct, motor3_pct, motor4_pct;
 	uint8_t magic_footer;
 } VCPDumpPacket_t;
-_Static_assert(sizeof(VCPDumpPacket_t) == 275, "VCP dump packet size mismatch!");
+_Static_assert(sizeof(VCPDumpPacket_t) == 291, "VCP dump packet size mismatch!");
 
 static bool normal_telem = true;
 static uint8_t dbg_axis = 1;   // 0=roll, 1=pitch, 2=yaw
@@ -210,7 +211,13 @@ typedef enum {
 	TAKEOFF,
 	TRANSISTION
 } takeoff_t;
-float take_off_thrust = 50.0f;
+
+#define ALTITUDE_HOVER_THRUST_RAW          63.0f
+#define TAKEOFF_BASE_THRUST_START_RAW      70.0f
+#define TAKEOFF_BASE_THRUST_END_RAW        85.0f
+#define TAKEOFF_BASE_THRUST_RAMP_MS        2000u
+
+float altitude_base_thrust_raw = ALTITUDE_HOVER_THRUST_RAW;
 
 uint32_t takeoff_count = 1;
 
@@ -510,7 +517,8 @@ static void UpdateCompactTelemetryDiagnostics(void);
 static void Process_VCP_Command_Line(const uint8_t* line);
 static void Process_VCP_Command_Queue(void);
 static void Process_SPI5_Frame(void);
-static void EnterMode(uint8_t mode);
+static bool EnterMode(uint8_t mode);
+static bool IsGPSLockReady(void);
 static void BeginSoftLanding(void);
 static void CompleteSoftLanding(void);
 static void EnterPermanentFaultBlink(void);
@@ -627,6 +635,10 @@ static void UpdateTelemetryGPSStatus(void) {
 	UpdateGPSLockLed(gps_locked);
 }
 
+static bool IsGPSLockReady(void) {
+	return gps_ready && gps_fix.valid;
+}
+
 static void UpdateCompactTelemetryGPSFields(void) {
 	telem_data.setpoint = (gps_ready && gps_fix.valid) ? 1.0f : 0.0f;
 	telem_data.measurement = (float)gps_fix.satellites;
@@ -722,7 +734,7 @@ static void VCP_Dump_TrySend(uint32_t now_ms) {
 
 	vcp_dump_packet.x = g_state.x;
 	vcp_dump_packet.y = g_state.y;
-	vcp_dump_packet.z = range_dist_cm * 0.01f;
+	vcp_dump_packet.z = g_state.z;
 	vcp_dump_packet.vx = g_state.vx;
 	vcp_dump_packet.vy = g_state.vy;
 	vcp_dump_packet.vz = g_state.vz;
@@ -753,6 +765,22 @@ static void VCP_Dump_TrySend(uint32_t now_ms) {
 	vcp_dump_packet.target_rate_pitch = g_target.rate_pitch;
 	vcp_dump_packet.target_rate_yaw = g_target.rate_yaw;
 	vcp_dump_packet.target_ff_vz = g_target.ff_vz;
+	if (g_mission.waypoints != NULL && g_mission.current_index < g_mission.total_waypoints) {
+		Waypoint* wp = &g_mission.waypoints[g_mission.current_index];
+		float dx = wp->position[0] - g_state.x;
+		float dy = wp->position[1] - g_state.y;
+		float dz = wp->position[2] - g_state.z;
+
+		vcp_dump_packet.mission_wp_index = (float)g_mission.current_index;
+		vcp_dump_packet.mission_wp_total = (float)g_mission.total_waypoints;
+		vcp_dump_packet.mission_wp_action = (float)wp->action;
+		vcp_dump_packet.mission_wp_remaining_dist = sqrtf(dx*dx + dy*dy + dz*dz);
+	} else {
+		vcp_dump_packet.mission_wp_index = (float)g_mission.current_index;
+		vcp_dump_packet.mission_wp_total = (float)g_mission.total_waypoints;
+		vcp_dump_packet.mission_wp_action = -1.0f;
+		vcp_dump_packet.mission_wp_remaining_dist = 0.0f;
+	}
 	vcp_dump_packet.bme280_valid = bme280_status;
 	vcp_dump_packet.bme280_temp_c = bme280_ready ? bme280_data.temperature_c : (float)bme280_chip_id;
 	vcp_dump_packet.bme280_pressure_pa = bme280_ready ? bme280_data.pressure_pa : (float)bme280_addr;
@@ -831,15 +859,19 @@ static void ResetActiveFlightPIDsFromState(const vehicleState_t* state) {
 	PID_ResetWithMeasurement(&pid_yaw_rate, yaw_rate);
 }
 
-static void EnterMode(uint8_t mode) {
+static bool EnterMode(uint8_t mode) {
 	switch (mode) {
 	case MODE_MISSION:
+		if (!IsGPSLockReady()) {
+			unknownTelemCMD_counter += 1;
+			return false;
+		}
 		Navigation_Init(&g_mission, mission_waypoints, total_wp_count, &g_state);
 		takeoff_state = INIT;
 		g_state.offGround = false;
 		ResetActiveFlightPIDsFromState(&g_state);
 		g_drone_status.drone_mode = MODE_MISSION;
-		break;
+		return true;
 
 	case MODE_MANUAL_LEVEL:
 	case MODE_THRUST_STAND:
@@ -847,11 +879,11 @@ static void EnterMode(uint8_t mode) {
 		g_state.offGround = false;
 		ResetActiveFlightPIDsFromState(&g_state);
 		g_drone_status.drone_mode = mode;
-		break;
+		return true;
 
 	default:
 		unknownTelemCMD_counter += 1;
-		break;
+		return false;
 	}
 }
 
@@ -1386,6 +1418,19 @@ int main(void)
 			uint8_t takeoff_override_this_tick = 0;
 			AcquireSensorsAndUpdateState(dt_sec);
 			static uint32_t state_timer = 0;
+			altitude_base_thrust_raw = ALTITUDE_HOVER_THRUST_RAW;
+
+			if (is_system_armed &&
+					!g_state.offGround &&
+					g_drone_status.drone_mode == MODE_MISSION &&
+					!IsGPSLockReady()) {
+				ESC_Disarm();
+				takeoff_state = INIT;
+				g_drone_status.drone_mode = 0;
+				StartControlState = STATE_MODE_SEL;
+				start_control();
+				continue;
+			}
 
 			// --- TAKEOFF STATE MACHINE ---
 			// Only valid when the system is armed and drone is on ground
@@ -1439,6 +1484,13 @@ int main(void)
 					g_target.rate_yaw = 0.0f;
 					g_target.z     = flight_takeoff_height_threshold + 0.2f;
 					g_target.ff_vz = 0.5f; 
+					uint32_t ramp_ms = now - state_timer;
+					if (ramp_ms > TAKEOFF_BASE_THRUST_RAMP_MS) {
+						ramp_ms = TAKEOFF_BASE_THRUST_RAMP_MS;
+					}
+					float ramp_fraction = (float)ramp_ms / (float)TAKEOFF_BASE_THRUST_RAMP_MS;
+					altitude_base_thrust_raw = TAKEOFF_BASE_THRUST_START_RAW +
+							((TAKEOFF_BASE_THRUST_END_RAW - TAKEOFF_BASE_THRUST_START_RAW) * ramp_fraction);
 
 					// Allow control update in TAKEOFF to climb toward z target
 					takeoff_override_this_tick = 0; // Allow normal control to run
@@ -1585,7 +1637,7 @@ int main(void)
 				telem_data.sat_flags = 0;
 			}
 			else if (is_system_armed && !takeoff_override_this_tick) {
-				if (!is_land_cmd_active) {
+				if (!is_land_cmd_active && !(!g_state.offGround && takeoff_state == TAKEOFF)) {
 					g_drone_status.flight_mode = 8;
 				}
 				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target, &g_drone_status);
@@ -2879,8 +2931,12 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 
 	case 'a': // --- ARM or ALL ---
 		if (cmd[1] == 'r' && cmd[2] == 'm') { // "arm"
-			ESC_ArmAll();
-			command_accepted = true;
+			if (g_drone_status.drone_mode == MODE_MISSION && !IsGPSLockReady()) {
+				unknownTelemCMD_counter += 1;
+			} else {
+				ESC_ArmAll();
+				command_accepted = true;
+			}
 		}
 		else if (cmd[1] == 'l' && cmd[2] == 'l') { // "all p25.0"
 			char* t_ptr = strchr(cmd, 'p');
@@ -2921,8 +2977,7 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 				if (requested_mode == MODE_MANUAL_LEVEL ||
 						requested_mode == MODE_MISSION ||
 						requested_mode == MODE_THRUST_STAND) {
-					EnterMode((uint8_t)requested_mode);
-					command_accepted = true;
+					command_accepted = EnterMode((uint8_t)requested_mode);
 				} else {
 					// Unsupported/reserved mode IDs (including obsolete mode 4) are ignored
 					unknownTelemCMD_counter += 1;

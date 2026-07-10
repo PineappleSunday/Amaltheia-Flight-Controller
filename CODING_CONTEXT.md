@@ -45,11 +45,19 @@ Mode IDs are defined in `FlightControl/state.h`:
 
 `EnterMode(MODE_MISSION)` in `Core/Src/main.c` currently:
 
+- requires GPS lock before accepting mission mode
 - calls `Navigation_Init(&g_mission, mission_waypoints, total_wp_count, &g_state)`
 - resets `takeoff_state = INIT`
 - sets `g_state.offGround = false`
 - resets active flight PIDs from current state
 - sets `g_drone_status.drone_mode = MODE_MISSION`
+
+Mission arming/takeoff GPS gate:
+
+- `mode 2` is rejected unless `gps_ready && gps_fix.valid`.
+- `arm` is rejected while in mission mode if GPS lock has been lost.
+- If mission mode is somehow armed on-ground and GPS lock is lost before takeoff,
+  the FC disarms and returns to Mode Select instead of spooling/launching.
 
 Current decision: takeoff is owned by the procedural executive state machine in
 the main control loop. Mission navigation must not write `g_target` until
@@ -65,10 +73,20 @@ Takeoff sequence:
 
 Takeoff threshold is currently:
 
-- `flight_takeoff_height_threshold = 0.3f` meters
-- TAKEOFF target is threshold plus `0.2f`, so about `0.5 m`
-- transition occurs when `g_state.z > 0.3f`
+- `flight_takeoff_height_threshold = 0.5f` meters
+- TAKEOFF target is threshold plus `0.2f`, so about `0.7 m`
+- transition occurs when `g_state.z > 0.5f`
 - transition sets `g_state.offGround = true`
+
+Takeoff thrust control:
+
+- Normal altitude control uses `altitude_base_thrust_raw = 63.0f` plus the
+  cascaded Z PI correction.
+- During `TAKEOFF`, the executive ramps `altitude_base_thrust_raw` from `70.0f`
+  to `85.0f` raw mixer percent over 2 seconds, while the Z controller still
+  trims thrust and attitude control remains active.
+- Mixer thrust linearization means raw mixer percent is not the same as final
+  motor output percent.
 
 Grounded mission test expectation:
 
@@ -76,7 +94,7 @@ Grounded mission test expectation:
 2. Send `arm`.
 3. Observe `flight_mode` walk through `81 -> 82 -> 83`.
 4. With motor battery disconnected, physically lift the frame in Z or spoof
-   LiDAR altitude above `0.3 m`.
+   LiDAR altitude above `0.5 m`.
 5. Observe `84`, then `8`, with mission navigation driving `g_target`.
 
 Because motor battery is disconnected, the drone cannot actually climb, so it

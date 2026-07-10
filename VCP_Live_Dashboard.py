@@ -19,7 +19,7 @@ import serial.tools.list_ports
 
 HEADER_VALUE = 0x31504356  # "VCP1"
 FOOTER_VALUE = 0xAB
-FRAME_FORMAT = "<IIHBBBB" + ("f" * 65) + "B"
+FRAME_FORMAT = "<IIHBBBB" + ("f" * 69) + "B"
 BME_FRAME_FORMAT = "<IIHBBBB" + ("f" * 57) + "B"
 LEGACY_FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
 FRAME_STRUCT = struct.Struct(FRAME_FORMAT)
@@ -29,6 +29,14 @@ FRAME_SIZE = FRAME_STRUCT.size
 BME_FRAME_SIZE = BME_FRAME_STRUCT.size
 LEGACY_FRAME_SIZE = LEGACY_FRAME_STRUCT.size
 HEADER_BYTES = struct.pack("<I", HEADER_VALUE)
+
+MISSION_ACTION_MAP = {
+    -1: "None",
+    0: "Takeoff",
+    1: "Hover",
+    2: "Land",
+    3: "Move",
+}
 
 FRAME_FIELDS = [
     "header",
@@ -70,6 +78,10 @@ FRAME_FIELDS = [
     "target_rate_pitch",
     "target_rate_yaw",
     "target_ff_vz",
+    "mission_wp_index",
+    "mission_wp_total",
+    "mission_wp_action",
+    "mission_wp_remaining_dist",
     "bme280_valid",
     "bme280_temp_c",
     "bme280_pressure_pa",
@@ -106,10 +118,13 @@ FRAME_FIELDS = [
     "magic_footer",
 ]
 
-BME_FRAME_FIELDS = [field for field in FRAME_FIELDS if not field.startswith("gps_")]
+BME_FRAME_FIELDS = [
+    field for field in FRAME_FIELDS
+    if not field.startswith("gps_") and not field.startswith("mission_")
+]
 LEGACY_FRAME_FIELDS = [field for field in BME_FRAME_FIELDS if not field.startswith("bme280_")]
 
-assert FRAME_SIZE == 275, f"Unexpected frame size: {FRAME_SIZE}"
+assert FRAME_SIZE == 291, f"Unexpected frame size: {FRAME_SIZE}"
 assert BME_FRAME_SIZE == 243, f"Unexpected BME frame size: {BME_FRAME_SIZE}"
 assert LEGACY_FRAME_SIZE == 223, f"Unexpected legacy frame size: {LEGACY_FRAME_SIZE}"
 
@@ -155,7 +170,7 @@ class FrameParser:
             if len(self.buffer) < LEGACY_FRAME_SIZE:
                 break
 
-            # The firmware now consistently sends the full 275-byte frame.
+            # The firmware now consistently sends the full 291-byte frame.
             # Simplify the parser to only look for this frame.
             if len(self.buffer) < FRAME_SIZE or self.buffer[FRAME_SIZE - 1] != FOOTER_VALUE:
                 self.bad_frames += 1
@@ -295,6 +310,12 @@ def build_status_text(state):
 
     fm_val = latest['flight_mode']
     fm_str = FLIGHT_MODE_MAP.get(fm_val, f"Unknown ({fm_val})")
+    mission_idx = int(float(latest.get("mission_wp_index", -1)))
+    mission_total = int(float(latest.get("mission_wp_total", 0)))
+    mission_action = int(float(latest.get("mission_wp_action", -1)))
+    mission_remaining = float(latest.get("mission_wp_remaining_dist", 0.0))
+    mission_action_name = MISSION_ACTION_MAP.get(mission_action, f"Action {mission_action}")
+    mission_idx_display = mission_idx + 1 if mission_idx >= 0 and mission_total > 0 else 0
     return (
         f"Connection: {conn_state}\n"
         f"Port: {port_line} @ {state['baud']}\n"
@@ -321,6 +342,7 @@ def build_status_text(state):
         f"Motors %: {latest['motor1_pct']:.1f}, {latest['motor2_pct']:.1f}, {latest['motor3_pct']:.1f}, {latest['motor4_pct']:.1f}\n"
         f"Z/VZ: {latest['z']:+.3f} m / {latest['vz']:+.3f} m/s\n"
         f"Target Z/FFvz: {latest['target_z']:+.3f} m / {latest['target_ff_vz']:+.3f}\n"
+        f"Mission WP: {mission_idx_display}/{mission_total} {mission_action_name} rem={mission_remaining:.3f}m\n"
         f"{bme_line}"
         f"GPS: valid={latest['gps_valid']:.0f} sats={latest['gps_sats']:.0f} "
         f"lat={latest['gps_lat_deg']:+.6f} lon={latest['gps_lon_deg']:+.6f} "
