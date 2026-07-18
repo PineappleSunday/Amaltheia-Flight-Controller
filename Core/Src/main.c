@@ -537,6 +537,7 @@ static void SPI5_EnableSharedIRQs(void);
 
 /* Custom ESC Control Functions */
 void ESC_ArmAll(void);
+void ESC_EnableIdleSignal(void);
 void ESC_Disarm(void);
 void ESC_SetThrottle(uint32_t channel, float percentage);
 uint32_t get_timer_channel(int motor_num);
@@ -2344,9 +2345,8 @@ void start_control(void) {
 		Biquad_Set_Lowpass(&filter_gyro_roll,  80.0f, 500.0f);
 		Biquad_Set_Lowpass(&filter_gyro_yaw,   80.0f, 500.0f);
 
-		// Turn off the ESC Beep...un-safe, but oh well
-		ESC_ArmAll();
-		ESC_Disarm();
+		// Keep ESCs quiet with a valid low signal without arming the aircraft.
+		ESC_EnableIdleSignal();
 		HAL_Delay(1000); // Attempting to give time to let frame settle before starting the init loop
 
 		// Accel/Mag (I2C1) - Configure Registers
@@ -3238,8 +3238,33 @@ void ESC_ArmAll(void) {
 	HAL_Delay(3000);
 
 }
+void ESC_EnableIdleSignal(void) {
+	// Send continuous minimum PWM so ESCs see a valid low-throttle signal.
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ESC_ARM_PULSE); // PC6
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ESC_ARM_PULSE); // PB5
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, ESC_ARM_PULSE); // PC8
+	__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, ESC_ARM_PULSE); // PC9
+
+	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+	HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+
+	target_throttle = 0.0f;
+	telem_data.armed = 0x00;
+	telem_data.motor1_T = 0;
+	telem_data.motor2_T = 0;
+	telem_data.motor3_T = 0;
+	telem_data.motor4_T = 0;
+	g_drone_status.armed = 0;
+	g_drone_status.motor1_T = 0;
+	g_drone_status.motor2_T = 0;
+	g_drone_status.motor3_T = 0;
+	g_drone_status.motor4_T = 0;
+	is_system_armed = 0;
+}
 void ESC_Disarm(void) {
-	// Turn off the ESC Beep
+	// Return ESC outputs and flight state to the unarmed low-throttle condition.
 	g_drone_status.flight_mode = 0; // 0 = DISARMED/IDLE/ONGROUND
 	g_drone_status.armed = 0;
 	// Force immediate hardware override to 0%
