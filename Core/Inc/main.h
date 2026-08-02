@@ -89,6 +89,17 @@ uint32_t get_timer_channel(int motor_num);
 #define LD5_GPIO_Port GPIOD
 #define LD6_Pin GPIO_PIN_15
 #define LD6_GPIO_Port GPIOD
+/* Flight-controller PCB LEDs:
+ * PE7: green LED, mirrors Discovery-board LD4 green.
+ * PE8: red LED, mirrors Discovery-board LD5 red.
+ * PE9: blue LED, mirrors Discovery-board LD6 blue.
+ */
+#define FC_GREEN_LED_Pin GPIO_PIN_7
+#define FC_GREEN_LED_GPIO_Port GPIOE
+#define FC_RED_LED_Pin GPIO_PIN_8
+#define FC_RED_LED_GPIO_Port GPIOE
+#define FC_BLUE_LED_Pin GPIO_PIN_9
+#define FC_BLUE_LED_GPIO_Port GPIOE
 #define I2S3_MCK_Pin GPIO_PIN_7
 #define I2S3_MCK_GPIO_Port GPIOC
 #define VBUS_FS_Pin GPIO_PIN_9

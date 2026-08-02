@@ -90,6 +90,9 @@ bool I3GD20_Init(I3GD20* dev, SPI_HandleTypeDef* hspi)
     dev->hspi = hspi;
     dev->initialized = false;
     dev->dps_per_lsb = 0.07f;  // 70 mdps/LSB @ 2000 dps full-scale
+    dev->who_am_i = 0u;
+    dev->ctrl_reg1 = 0u;
+    dev->ctrl_reg4 = 0u;
 
     // 1. Ensure CS is High (Inactive)
     i3gd20_cs_deassert();
@@ -118,17 +121,30 @@ bool I3GD20_Init(I3GD20* dev, SPI_HandleTypeDef* hspi)
     }
 
     if (!found) {
+        dev->who_am_i = who;
         printf("Gyro Init Failed. Last WHO_AM_I = 0x%02X\r\n", who);
         return false;
     }
 
+    dev->who_am_i = who;
     printf("Gyro Detected! ID = 0x%02X\r\n", who);
 
     // 4. Configure Control Registers
     // CTRL1: 0x0F (Normal Mode, XYZ enabled, 100Hz)
     // CTRL4: 0xA0 (BDU=1, FS=10 -> 2000 dps full-scale)
     if (!i3gd20_write_reg(dev->hspi, I3GD20_CTRL_REG1, 0x0F)) return false;
+    if (!i3gd20_read_reg(dev->hspi, I3GD20_CTRL_REG1, &dev->ctrl_reg1, 1)) return false;
+    if (dev->ctrl_reg1 != 0x0F) {
+        printf("I3GD20 CTRL_REG1 readback mismatch: 0x%02X\r\n", dev->ctrl_reg1);
+        return false;
+    }
+
     if (!i3gd20_write_reg(dev->hspi, I3GD20_CTRL_REG4, 0xA0)) return false;
+    if (!i3gd20_read_reg(dev->hspi, I3GD20_CTRL_REG4, &dev->ctrl_reg4, 1)) return false;
+    if (dev->ctrl_reg4 != 0xA0) {
+        printf("I3GD20 CTRL_REG4 readback mismatch: 0x%02X\r\n", dev->ctrl_reg4);
+        return false;
+    }
 
     dev->initialized = true;
     return true;
@@ -182,8 +198,8 @@ bool I3GD20_ReadGyro(I3GD20* dev, I3GD20_Raw* out)
     } */
     
     // Combine bytes and apply offsets
-    out->gx = (int16_t)( (int16_t)buf[1] << 8 | buf[0] ) - dev->gx_offset;
-    out->gy = (int16_t)( (int16_t)buf[3] << 8 | buf[2] ) - dev->gy_offset;
-    out->gz = (int16_t)( (int16_t)buf[5] << 8 | buf[4] ) - dev->gz_offset;
+    out->gx = (int16_t)( (uint16_t)buf[1] << 8 | buf[0] ) - dev->gx_offset;
+    out->gy = (int16_t)( (uint16_t)buf[3] << 8 | buf[2] ) - dev->gy_offset;
+    out->gz = (int16_t)( (uint16_t)buf[5] << 8 | buf[4] ) - dev->gz_offset;
     return true;
 }

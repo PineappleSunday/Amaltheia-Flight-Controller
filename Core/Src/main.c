@@ -17,13 +17,13 @@
 #include "i3gd20.h"
 #include "PID.h"
 #include <math.h>
-#include <stdio.h>   // For printf
-#include <stdlib.h>  // For atof, atoi
-#include <string.h>  // For string manipulation
-#include "state.h"       // Defines VehicleState, TargetState
-#include "AHRS.h"        // Defines ahrsSensor_t and AHRS_Update
-#include "navigation.h"  // Defines MissionManager and Navigation_GetTarget
-#include "flight_logic.h"// Defines FlightLogic_Update
+#include <stdio.h>   		// For printf
+#include <stdlib.h>  		// For atof, atoi
+#include <string.h>  		// For string manipulation
+#include "state.h"       	// Defines VehicleState, TargetState
+#include "AHRS.h"        	// Defines ahrsSensor_t and AHRS_Update
+#include "navigation.h"  	// Defines MissionManager and Navigation_GetTarget
+#include "flight_logic.h"	// Defines FlightLogic_Update
 #include <float.h>
 #include "biquadButter.h"
 #include <ctype.h>
@@ -31,6 +31,7 @@
 #include "mixer.h"
 #include "bme280.h"
 #include "gt_u7.h"
+#include "ibit.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,15 +49,6 @@
 #define SENSOR_STATUS_BME280_READY 	0x40u
 #define SENSOR_STATUS_GPS_FIX    	0x20u
 
-/* Two-stage sensor BIT: comms/alive first, then data-validity second. */
-#define SENSOR_BIT_GPS        0x01u
-#define SENSOR_BIT_ACCEL_MAG  0x02u
-#define SENSOR_BIT_BME280     0x04u
-#define SENSOR_BIT_GYRO       0x08u
-#define SENSOR_BIT_LIDAR      0x10u
-#define SENSOR_BIT_TELEMETRY  0x20u
-#define SENSOR_BIT_SPARE_1    0x40u
-#define SENSOR_BIT_SPARE_2    0x80u
 typedef struct __attribute__((packed)) {
 	uint32_t header; // 0xDEADBEEF
 	float timestamp;
@@ -522,7 +514,7 @@ static bool IsGPSLockReady(void);
 static void BeginSoftLanding(void);
 static void CompleteSoftLanding(void);
 static void EnterPermanentFaultBlink(void);
-static void SetPBITOkLed(bool on);
+static void SetIBITOkLed(bool on);
 static void SetModeSelectLed(bool on);
 static void UpdateGPSLockLed(bool gps_locked);
 static void LSM303_DisableSharedIRQs(void);
@@ -1220,12 +1212,19 @@ static void CompleteSoftLanding(void) {
 	StartControlState = STATE_MODE_SEL;
 }
 
-static void SetPBITOkLed(bool on) {
+static void SetIBITOkLed(bool on) {
 	HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(FC_GREEN_LED_GPIO_Port, FC_GREEN_LED_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 static void SetModeSelectLed(bool on) {
 	HAL_GPIO_WritePin(LD6_GPIO_Port, LD6_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(FC_BLUE_LED_GPIO_Port, FC_BLUE_LED_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void SetSPI5ErrorLed(bool on) {
+	HAL_GPIO_WritePin(LD5_GPIO_Port, LD5_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(FC_RED_LED_GPIO_Port, FC_RED_LED_Pin, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 static void UpdateGPSLockLed(bool gps_locked) {
@@ -1259,10 +1258,13 @@ static void UpdateGPSLockLed(bool gps_locked) {
 
 static void EnterPermanentFaultBlink(void) {
 	const uint16_t all_led_pins = LD4_Pin | LD3_Pin | LD5_Pin | LD6_Pin;
+	const uint16_t all_fc_led_pins = FC_GREEN_LED_Pin | FC_RED_LED_Pin | FC_BLUE_LED_Pin;
 
 	HAL_GPIO_WritePin(GPIOD, all_led_pins, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOE, all_fc_led_pins, GPIO_PIN_RESET);
 	while (1) {
 		HAL_GPIO_TogglePin(GPIOD, all_led_pins);
+		HAL_GPIO_TogglePin(GPIOE, all_fc_led_pins);
 		for (volatile uint32_t i = 0; i < 800000u; i++) {
 			__NOP();
 		}
@@ -2186,6 +2188,9 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
                           |Audio_RST_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOE, FC_GREEN_LED_Pin|FC_RED_LED_Pin|FC_BLUE_LED_Pin, GPIO_PIN_RESET);
+
   /*Configure GPIO pin : PE2 */
   GPIO_InitStruct.Pin = GPIO_PIN_2;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
@@ -2203,6 +2208,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5|MEMS_INT2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : FC_GREEN_LED_Pin FC_RED_LED_Pin FC_BLUE_LED_Pin */
+  GPIO_InitStruct.Pin = FC_GREEN_LED_Pin|FC_RED_LED_Pin|FC_BLUE_LED_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
@@ -2271,37 +2283,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-static uint8_t Sensor_PBIT(void)
-{
-	uint8_t bits = 0u;
-
-	if (gps_ready) {
-		bits |= SENSOR_BIT_GPS;
-	}
-
-	if ((imu.variant != LSM303_UNKNOWN) && (imu.hi2c != NULL)) {
-		bits |= SENSOR_BIT_ACCEL_MAG;
-	}
-
-	if (bme280_ready) {
-		bits |= SENSOR_BIT_BME280;
-	}
-
-	if (i3gd20.initialized) {
-		bits |= SENSOR_BIT_GYRO;
-	}
-
-	if ((telem_data.sensor_status & SENSOR_STATUS_LIDAR_OK) != 0u) {
-		bits |= SENSOR_BIT_LIDAR;
-	}
-
-	if (huzzah_handshake_ok) {
-		bits |= SENSOR_BIT_TELEMETRY;
-	}
-
-	return bits;
-}
-
 void start_control(void) {
 
 	// This function now runs its own loop until a flight mode is selected.
@@ -2312,7 +2293,7 @@ void start_control(void) {
 		// INIT ESC
 
 		g_drone_status.drone_mode = 51; // Init Mode
-		SetPBITOkLed(false);
+		SetIBITOkLed(false);
 		SetModeSelectLed(false);
 		UpdateGPSLockLed(false);
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---\
@@ -2452,12 +2433,18 @@ void start_control(void) {
 				telem_data.sensor_status |= SENSOR_STATUS_MAG_OK;
 			}
 			// 4. Verification Gate
-			// First stage: comms/alive PBIT. Second stage: fresh data validity checks.
-			uint8_t comms_alive_mask = Sensor_PBIT();
-			if ((comms_alive_mask & (SENSOR_BIT_GPS | SENSOR_BIT_ACCEL_MAG | SENSOR_BIT_BME280 |
-					SENSOR_BIT_GYRO | SENSOR_BIT_LIDAR | SENSOR_BIT_TELEMETRY)) ==
-					(SENSOR_BIT_GPS | SENSOR_BIT_ACCEL_MAG | SENSOR_BIT_BME280 |
-						SENSOR_BIT_GYRO | SENSOR_BIT_LIDAR | SENSOR_BIT_TELEMETRY) &&
+			// First stage: comms/alive IBIT. Second stage: fresh data validity checks.
+			const IBIT_StatusInputs ibit_status = {
+					.gps_ready = gps_ready,
+					.bme280_ready = bme280_ready,
+					.lidar_ready = ((telem_data.sensor_status & SENSOR_STATUS_LIDAR_OK) != 0u),
+					.telemetry_ready = huzzah_handshake_ok
+			};
+			const uint8_t ibit_required_mask =
+					IBIT_SENSOR_GPS | IBIT_SENSOR_ACCEL_MAG | IBIT_SENSOR_BME280 |
+					IBIT_SENSOR_GYRO | IBIT_SENSOR_LIDAR | IBIT_SENSOR_TELEMETRY;
+			uint8_t comms_alive_mask = IBIT_Evaluate(&imu, &i3gd20, &ibit_status);
+			if (IBIT_HasRequired(comms_alive_mask, ibit_required_mask) &&
 				(telem_data.sensor_status & required_status_mask) == required_status_mask) {
 
 				// Gravity Vector Check
@@ -2470,7 +2457,7 @@ void start_control(void) {
 				bool mag_ok = (mag_field_strength > 0.2f && mag_field_strength < 0.9f);
 
 				if (gravity_ok && mag_ok) {
-					SetPBITOkLed(true);
+					SetIBITOkLed(true);
 					sensorInit = 1; // Success! Exit loop
 					//printf("ALL SYSTEMS GO: G=%.2fg, Mag=%.2f Gauss\r\n", accel_mag, mag_field_strength);
 				} else {
@@ -2815,9 +2802,9 @@ static void SPI5_ArmNextFrame(void)
 	if (status != HAL_OK) {
 		// DMA arming failed. This is a critical error.
 		// A more robust system might try to re-init the SPI peripheral.
-		HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_SET);
+		SetSPI5ErrorLed(true);
 	} else {
-		HAL_GPIO_WritePin(GPIOD, LD5_Pin, GPIO_PIN_RESET);
+		SetSPI5ErrorLed(false);
 	}
 	spi5_last_arm_tick = HAL_GetTick();
 }
