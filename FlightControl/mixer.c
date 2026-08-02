@@ -88,7 +88,6 @@ static void Mixer_ComputeRaw(MixerFrameType frame_type, float thrust, float roll
 		// X configuration motor order:
 		// M1=FrontRight, M2=RearRight, M3=RearLeft, M4=FrontLeft
 		// Roll/pitch diagonal contribution uses 1/sqrt(2).
-		// Ideall to maintain same + config PID tuning
 		// Yaw follows existing spin convention by channel:
 		// M1/M3 CCW (+yaw), M2/M4 CW (-yaw).
 		const float k = 0.70710678f; // 1/sqrt(2)

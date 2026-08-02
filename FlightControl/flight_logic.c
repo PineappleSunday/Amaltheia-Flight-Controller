@@ -48,23 +48,15 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneSt
 
 	// 2. ATTITUDE OUTER LOOP (Angle -> Rate)
 	// We wrap the Yaw error to ensure we take the shortest path
-	if (state->isTuning) {
-	    // In tune mode: keep injected rate_pitch, force others to 0
-	    target->rate_roll = 0.0f;
-	    target->rate_yaw  = 0.0f;
-        PID_ResetWithMeasurement(&pid_yaw_angle, 0.0f);
-	} else {
-	    // Normal mode: roll/pitch always use angle outer loops
-	    target->rate_roll  = PID_Calculate(&pid_roll_angle,  state->roll,  target->roll);
-	    target->rate_pitch = PID_Calculate(&pid_pitch_angle, state->pitch, target->pitch);
+	target->rate_roll  = PID_Calculate(&pid_roll_angle,  state->roll,  target->roll);
+	target->rate_pitch = PID_Calculate(&pid_pitch_angle, state->pitch, target->pitch);
 
-        if (target->yaw_hold_enabled) {
-            float yaw_err = wrap_deg(target->yaw - state->yaw);
-            target->rate_yaw = PID_Calculate(&pid_yaw_angle, 0.0f, yaw_err);
-        } else {
-            // Rate-command mode: leave target->rate_yaw as set by the caller.
-            PID_ResetWithMeasurement(&pid_yaw_angle, 0.0f);
-        }
+	if (target->yaw_hold_enabled) {
+		float yaw_err = wrap_deg(target->yaw - state->yaw);
+		target->rate_yaw = PID_Calculate(&pid_yaw_angle, 0.0f, yaw_err);
+	} else {
+		// Rate-command mode: leave target->rate_yaw as set by the caller.
+		PID_ResetWithMeasurement(&pid_yaw_angle, 0.0f);
 	}
 	// 3. ATTITUDE INNER LOOP (Rate -> Torque)
 	// We compare the Desired Rate to the RAW Gyro data (state->roll_rate / pitch_rate / yaw_rate)

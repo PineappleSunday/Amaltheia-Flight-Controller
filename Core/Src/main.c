@@ -39,7 +39,6 @@
 
 #define SPI_FRAME_LEN 				80
 #define TELEMETRY_HEADER_NORMAL 	0xDEADBEEFUL
-#define TELEMETRY_HEADER_PID_TUNE 	0x54554E45UL
 #define TELEMETRY_HANDSHAKE_FC		"Arbiter"
 #define TELEMETRY_HANDSHAKE_ESP		"peace"
 #define SENSOR_STATUS_GYRO_READY 	0x01u
@@ -88,39 +87,6 @@ typedef struct __attribute__((packed)) {
 } Telemetry_Packet_t;
 _Static_assert(sizeof(Telemetry_Packet_t) == 80, "Telemetry Struct size mismatch!");
 
-typedef struct __attribute__((packed)) {
-	uint32_t header;
-	float timestamp;
-	uint16_t sequence;
-	uint8_t packet_type;
-	uint8_t loop_id;
-	uint8_t axis_id;
-	uint8_t flags;
-	uint8_t sat_flags;
-	uint8_t reserved0;
-	float setpoint;
-	float measurement;
-	float error;
-	float p_term;
-	float i_term;
-	float d_term;
-	float output_sum;
-	float kp;
-	float ki;
-	float kd;
-	float reference_cmd;
-	float plant_state;
-	int16_t motor1_T_x100;
-	int16_t motor2_T_x100;
-	int16_t motor3_T_x100;
-	int16_t motor4_T_x100;
-	int16_t gyro_p_x100;
-	int16_t gyro_q_x100;
-	int16_t gyro_r_x100;
-	uint8_t magic_footer;
-	uint8_t reserved1;
-} PIDTune_Packet_t;
-_Static_assert(sizeof(PIDTune_Packet_t) == 80, "PID Tune Struct size mismatch!");
 
 typedef struct __attribute__((packed)) {
 	uint32_t header;
@@ -159,40 +125,11 @@ typedef struct __attribute__((packed)) {
 } VCPDumpPacket_t;
 _Static_assert(sizeof(VCPDumpPacket_t) == 291, "VCP dump packet size mismatch!");
 
-static bool normal_telem = true;
-static uint8_t dbg_axis = 1;   // 0=roll, 1=pitch, 2=yaw
-
-typedef enum {
-	TELEM_MODE_NORMAL = 0,
-	TELEM_MODE_PID_TUNE = 1
-} telemetryMode_t;
-
-typedef enum {
-	PID_TUNE_LOOP_ROLL_RATE = 1,
-	PID_TUNE_LOOP_PITCH_RATE = 2,
-	PID_TUNE_LOOP_YAW_RATE = 3
-} pidTuneLoop_t;
-
-
-typedef enum {
-	LOG_TYPE_NONE = 0,
-	LOG_TYPE_ROLL_RATE,   // Inner Loop Roll
-	LOG_TYPE_PITCH_RATE,  // Inner Loop Pitch
-	LOG_TYPE_YAW_RATE,    // Inner Loop Yaw
-	LOG_TYPE_ALT_VEL,     // Vertical Velocity Loop
-	LOG_TYPE_POS_X,       // Outer Loop Position X
-	LOG_TYPE_RAW_SENSORS  // Vibration Analysis
-} LogType_t;
-
-
-
 //_Static_assert(sizeof(Engineer_Packet_t)  == SPI_FRAME_LEN, "Engineer frame != SPI_FRAME_LEN");
 static volatile uint8_t spi5_need_rearm = 0;
 
 typedef enum {
 	STATE_INIT,
-	STATE_TUNE,
-	STATE_DATA_DUMP,
 	STATE_MODE_SEL,
 	STATE_MODE_SEL_COMPLETE
 } StartControlState_t;
@@ -213,32 +150,8 @@ float altitude_base_thrust_raw = ALTITUDE_HOVER_THRUST_RAW;
 
 uint32_t takeoff_count = 1;
 
-typedef enum {
-	AXIS_PITCH,
-	AXIS_ROLL,
-	AXIS_DONE
-} TuneAxis_t;
-
-
-typedef enum {
-	TUNE_IDLE,
-	TUNE_INJECT_PULSE,
-	TUNE_MEASURE_WAIT,
-	TUNE_CALCULATE,
-	TUNE_COOLDOWN
-} TuneState_t;
-
-#define TUNE_LOG_SIZE 1200 // 1.2s at 1kHz
-static uint16_t dump_idx = 0;
-static bool is_dumping = false;
-float gyro_log[TUNE_LOG_SIZE];
-float target_log[TUNE_LOG_SIZE];
-uint16_t log_idx = 0;
-
-volatile bool is_logging = false;
 // Now declare the actual variables
 StartControlState_t StartControlState = STATE_INIT;
-TuneState_t state_tune = TUNE_IDLE;
 takeoff_t takeoff_state = INIT;
 
 void Navigation_Init(MissionManager* mgr, Waypoint* waypoints, uint16_t count, const vehicleState_t* current_state) {
@@ -316,7 +229,6 @@ volatile uint8_t is_system_armed = 0; // 0: Locked, 1: Armed
 volatile uint32_t last_heartbeat_tick = 0; // Tracks last valid command
 volatile uint8_t is_estop_active = 0; // 0: Normal, 1: Emergency STOP
 volatile uint8_t is_land_cmd_active = 0; // 0: Normal, 1: Emergency Landing
-volatile uint8_t tune_request = 0;
 
 typedef enum { READ_ACCEL, READ_MAG } sensor_state_t;
 
@@ -340,7 +252,6 @@ droneState_t g_drone_status; // Global metadata for modes, battery, and status
 volatile float target_throttle = 0.0f; // The throttle we want
 
 Telemetry_Packet_t telem_data;
-PIDTune_Packet_t pid_tune_data;
 static VCPDumpPacket_t vcp_dump_packet;
 static uint16_t vcp_dump_sequence = 0;
 static uint32_t vcp_last_tx_ms = 0;
@@ -375,10 +286,6 @@ static volatile uint32_t huzzah_handshake_tick = 0;
 static float soft_land_x = 0.0f;
 static float soft_land_y = 0.0f;
 static float soft_land_yaw = 0.0f;
-static telemetryMode_t g_telem_mode = TELEM_MODE_NORMAL;
-static pidTuneLoop_t g_pid_tune_loop = PID_TUNE_LOOP_PITCH_RATE;
-static uint16_t g_pid_tune_sequence = 0;
-
 uint8_t command_ready = 0;
 float commandZ = 0;
 
@@ -410,20 +317,7 @@ uint16_t tf_checksum = 0;
 static ahrsSensor_t raw_data;
 
 
-typedef struct {
-	uint32_t start_time;
-	uint32_t duration;
-	float pulse_throttle;
-	float baseline_throttle;
-	bool active;
-	uint32_t channel;
-} MotorPulse_t;
-MotorPulse_t diagnostic_pulse = {0};
-#define DIAGNOSTIC_MAX_THROTTLE 15.0f
-
 // Logic Flags
-volatile uint8_t tuning_triggered = 0;
-volatile uint8_t in_diagnostic_mode = 0;
 uint32_t last = 0;
 
 // PID controllers
@@ -496,10 +390,8 @@ static void MX_ADC1_Init(void);
 void Vehicle_State_Init(droneState_t* state);
 static void SPI5_ArmNextFrame(void);
 void start_control(void);
-bool run_autotune_step(float *rate_setpoint, float current_rate);
 static void ResetActiveFlightPIDsFromState(const vehicleState_t* state);
 static void AcquireSensorsAndUpdateState(float dt_sec);
-static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags);
 static void StageActiveTelemetryFrame(void);
 static void VCP_Dump_TrySend(uint32_t now_ms);
 static bool BME280_TryInit(void);
@@ -900,10 +792,7 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		imu.accel_ready = false; // Clear flag in struct
 		LSM303_EnableSharedIRQs();
 
-		// Parse from snapshot (Little Endian: L, H)
-		raw_data.ax = (int16_t)((accel_snap[1] << 8) | accel_snap[0]) * imu.accel_g_per_lsb;
-		raw_data.ay = (int16_t)((accel_snap[3] << 8) | accel_snap[2]) * imu.accel_g_per_lsb;
-		raw_data.az = (int16_t)((accel_snap[5] << 8) | accel_snap[4]) * imu.accel_g_per_lsb;
+		LSM303_DecodeAccelG(&imu, accel_snap, &raw_data.ax, &raw_data.ay, &raw_data.az);
 	}
 
 	// MAGNETOMETER Parsing
@@ -998,94 +887,10 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 	AHRS_Update(&raw_data, &g_state, dt_sec);
 }
 
-static void BuildPIDTunePacket(float dt_sec, uint8_t sat_flags) {
-	PIDController* pid_active = &pid_pitch_rate;
-	float setpoint = g_target.rate_pitch;
-	float measurement = g_state.pitch_rate;
-	float reference_cmd = g_target.pitch;
-	float plant_state = g_state.pitch;
-	uint8_t axis_id = 1;
-
-	switch (g_pid_tune_loop) {
-	case PID_TUNE_LOOP_ROLL_RATE:
-		pid_active = &pid_roll_rate;
-		setpoint = g_target.rate_roll;
-		measurement = g_state.roll_rate;
-		reference_cmd = g_target.roll;
-		plant_state = g_state.roll;
-		axis_id = 0;
-		break;
-
-	case PID_TUNE_LOOP_YAW_RATE:
-		pid_active = &pid_yaw_rate;
-		setpoint = g_target.rate_yaw;
-		measurement = g_state.yaw_rate;
-		reference_cmd = g_target.yaw;
-		plant_state = g_state.yaw;
-		axis_id = 2;
-		break;
-
-	case PID_TUNE_LOOP_PITCH_RATE:
-	default:
-		break;
-	}
-
-	uint8_t flags = 0;
-	if (is_system_armed) {
-		flags |= (1U << 0);
-	}
-	if (g_drone_status.drone_mode != MODE_MANUAL_LEVEL &&
-			g_drone_status.drone_mode != MODE_MISSION &&
-			g_drone_status.drone_mode != MODE_THRUST_STAND) {
-		flags |= (1U << 1);
-	}
-	if (g_state.isTuning) {
-		flags |= (1U << 2);
-	}
-
-	pid_tune_data.header = TELEMETRY_HEADER_PID_TUNE;
-	pid_tune_data.timestamp = dt_sec;
-	pid_tune_data.sequence = g_pid_tune_sequence++;
-	pid_tune_data.packet_type = 1;
-	pid_tune_data.loop_id = (uint8_t)g_pid_tune_loop;
-	pid_tune_data.axis_id = axis_id;
-	pid_tune_data.flags = flags;
-	pid_tune_data.sat_flags = sat_flags;
-	pid_tune_data.reserved0 = 0;
-	pid_tune_data.setpoint = setpoint;
-	pid_tune_data.measurement = measurement;
-	pid_tune_data.error = pid_active->previous_error;
-	pid_tune_data.p_term = pid_active->p_out;
-	pid_tune_data.i_term = pid_active->i_out;
-	pid_tune_data.d_term = pid_active->d_out;
-	pid_tune_data.output_sum = pid_active->output;
-	pid_tune_data.kp = pid_active->kp;
-	pid_tune_data.ki = pid_active->ki;
-	pid_tune_data.kd = pid_active->kd;
-	pid_tune_data.reference_cmd = reference_cmd;
-	pid_tune_data.plant_state = plant_state;
-	pid_tune_data.motor1_T_x100 = (int16_t)(telem_data.motor1_T * 100);
-	pid_tune_data.motor2_T_x100 = (int16_t)(telem_data.motor2_T * 100);
-	pid_tune_data.motor3_T_x100 = (int16_t)(telem_data.motor3_T * 100);
-	pid_tune_data.motor4_T_x100 = (int16_t)(telem_data.motor4_T * 100);
-	pid_tune_data.gyro_p_x100 = (int16_t)(g_state.roll_rate * 100.0f);
-	pid_tune_data.gyro_q_x100 = (int16_t)(g_state.pitch_rate * 100.0f);
-	pid_tune_data.gyro_r_x100 = (int16_t)(g_state.yaw_rate * 100.0f);
-	pid_tune_data.magic_footer = 0xAB;
-	pid_tune_data.reserved1 = 0;
-}
-
 static void StageActiveTelemetryFrame(void) {
 	if (!huzzah_handshake_ok && StartControlState != STATE_MODE_SEL_COMPLETE) {
 		memset(spi_tx_buf, 0, SPI_FRAME_LEN);
 		memcpy(spi_tx_buf, TELEMETRY_HANDSHAKE_FC, strlen(TELEMETRY_HANDSHAKE_FC));
-		return;
-	}
-
-	if (g_telem_mode == TELEM_MODE_PID_TUNE &&
-			StartControlState == STATE_MODE_SEL_COMPLETE) {
-		BuildPIDTunePacket(g_state.dt_sec, telem_data.sat_flags);
-		memcpy(spi_tx_buf, &pid_tune_data, SPI_FRAME_LEN);
 		return;
 	}
 
@@ -1661,90 +1466,27 @@ int main(void)
 			// 5. UPDATE TELEMETRY (Your Exact Atomic Block)
 			// Mapping g_state back to your required telemetry variables
 
-			if (normal_telem){
-				telem_data.header 				= 0xDEADBEEF;       // UINT32
-				telem_data.timestamp 			= (float)HAL_GetTick() * 0.001f;        // float 1
-				telem_data.roll 				= g_state.roll;       // float 2 (Estimated Roll)
-				telem_data.pitch 				= g_state.pitch;     // float 3 (Estimated Pitch)
-				telem_data.yaw 					= g_state.yaw;         // float 4 (Estimated Yaw)
-				telem_data.altitude 			= range_dist_cm;  // float 5 (Raw Lidar in cm)
-				telem_data.voltage 				= commandZ;           // float 6
-				telem_data.armed 				= is_system_armed ? 0xFF : 0x00;
-				// Map the modes to the telemetry packet
-				telem_data.drone_mode  			= g_drone_status.drone_mode;
-				telem_data.flight_mode 			= g_drone_status.flight_mode;
-				UpdateTelemetryGPSStatus();
-				telem_data.setpoint    			= (gps_ready && gps_fix.valid) ? 1.0f : 0.0f;
-				telem_data.measurement 			= (float)gps_fix.satellites;
-				telem_data.error       			= (float)gps_fix.latitude_deg;
-				telem_data.p_term      			= (float)gps_fix.longitude_deg;
-				telem_data.i_term      			= gps_fix.altitude_m;
-				telem_data.d_term      			= gps_fix.speed_mps;
-				telem_data.output_sum  			= gps_fix.hdop;
-				UpdateCompactTelemetryDiagnostics();
-				telem_data.magic_footer 		= 0xAB;       // UINT8
-			} else {
-				// DEBUG TELEMETRY (multiplex roll/pitch/yaw rate loops)
-				static uint8_t dbg_axis = 0;         // 0=roll, 1=pitch, 2=yaw
-				dbg_axis = (dbg_axis + 1) % 3;
-
-				telem_data.header              = 0xDEADBEEF;   // UINT32
-				telem_data.timestamp           = dt_sec;
-
-				// Keep these exactly as-is
-				telem_data.roll                = g_state.roll;
-				telem_data.pitch               = g_state.pitch;
-				telem_data.yaw                 = g_state.yaw;
-				telem_data.altitude            = range_dist_cm;
-				telem_data.voltage             = commandZ;
-
-				telem_data.armed               = is_system_armed ? 0xFF : 0x00;
-
-				telem_data.flight_mode         = g_drone_status.flight_mode;
-
-				telem_data.cmd_roll_deg_x100   = (int16_t)(g_target.roll  * 100.0f);
-				telem_data.cmd_pitch_deg_x100  = (int16_t)(g_target.pitch * 100.0f);
-				telem_data.cmd_yaw_deg_x100    = (int16_t)(g_target.yaw   * 100.0f);
-
-				// Tag which axis this packet is (use sensor_status low 2 bits)
-				telem_data.sensor_status       = (telem_data.sensor_status & 0xFC) | (dbg_axis & 0x03);
-
-				// MUX the PID debug fields by axis
-				if (dbg_axis == 0) { // Roll rate loop
-					telem_data.setpoint     = g_target.rate_roll;
-					telem_data.measurement  = g_state.roll_rate;
-					telem_data.error        = pid_roll_rate.previous_error;
-					telem_data.p_term       = pid_roll_rate.p_out;
-					telem_data.i_term       = pid_roll_rate.i_out;
-					telem_data.d_term       = pid_roll_rate.d_out;
-					telem_data.output_sum   = pid_roll_rate.output;
-					telem_data.i_state      = (int16_t)(pid_roll_rate.i_out * 100.0f);
-				} else if (dbg_axis == 1) { // Pitch rate loop
-					telem_data.setpoint     = g_target.rate_pitch;
-					telem_data.measurement  = g_state.pitch_rate;
-					telem_data.error        = pid_pitch_rate.previous_error;
-					telem_data.p_term       = pid_pitch_rate.p_out;
-					telem_data.i_term       = pid_pitch_rate.i_out;
-					telem_data.d_term       = pid_pitch_rate.d_out;
-					telem_data.output_sum   = pid_pitch_rate.output;
-					telem_data.i_state      = (int16_t)(pid_pitch_rate.i_out * 100.0f);
-				} else { // Yaw rate loop
-					telem_data.setpoint     = g_target.rate_yaw;
-					telem_data.measurement  = g_state.yaw_rate;
-					telem_data.error        = pid_yaw_rate.previous_error;
-					telem_data.p_term       = pid_yaw_rate.p_out;
-					telem_data.i_term       = pid_yaw_rate.i_out;
-					telem_data.d_term       = pid_yaw_rate.d_out;
-					telem_data.output_sum   = pid_yaw_rate.output;
-					telem_data.i_state      = (int16_t)(pid_yaw_rate.i_out * 100.0f);
-				}
-
-				telem_data.gyro_p              = (int16_t)(g_state.roll_rate  * 100.0f);
-				telem_data.gyro_q              = (int16_t)(g_state.pitch_rate * 100.0f);
-				telem_data.gyro_r              = (int16_t)(g_state.yaw_rate   * 100.0f);
-
-				telem_data.magic_footer        = 0xAB;
-			}
+			telem_data.header 				= 0xDEADBEEF;       // UINT32
+			telem_data.timestamp 			= (float)HAL_GetTick() * 0.001f;        // float 1
+			telem_data.roll 				= g_state.roll;       // float 2 (Estimated Roll)
+			telem_data.pitch 				= g_state.pitch;     // float 3 (Estimated Pitch)
+			telem_data.yaw 					= g_state.yaw;         // float 4 (Estimated Yaw)
+			telem_data.altitude 			= range_dist_cm;  // float 5 (Raw Lidar in cm)
+			telem_data.voltage 				= commandZ;           // float 6
+			telem_data.armed 				= is_system_armed ? 0xFF : 0x00;
+			// Map the modes to the telemetry packet
+			telem_data.drone_mode  			= g_drone_status.drone_mode;
+			telem_data.flight_mode 			= g_drone_status.flight_mode;
+			UpdateTelemetryGPSStatus();
+			telem_data.setpoint    			= (gps_ready && gps_fix.valid) ? 1.0f : 0.0f;
+			telem_data.measurement 			= (float)gps_fix.satellites;
+			telem_data.error       			= (float)gps_fix.latitude_deg;
+			telem_data.p_term      			= (float)gps_fix.longitude_deg;
+			telem_data.i_term      			= gps_fix.altitude_m;
+			telem_data.d_term      			= gps_fix.speed_mps;
+			telem_data.output_sum  			= gps_fix.hdop;
+			UpdateCompactTelemetryDiagnostics();
+			telem_data.magic_footer 		= 0xAB;       // UINT8
 
 			VCP_Dump_TrySend(now);
 		}
@@ -2298,7 +2040,6 @@ void start_control(void) {
 		UpdateGPSLockLed(false);
 		// --- 1. PRE-FLIGHT CONTROLLER SETUP ---\
 
-		// PID Tuning 
 		PID_Init(&pid_pos_z, 0.3f, 0.0f, 0.0f, 0.002f, 5.0f);   // Position P gain
 
 		PID_Init(&pid_vel_z, 0.2f, 0.01f, 0.0f, 0.002f, 10.0f); // Velocity PID with I-limit
@@ -2404,9 +2145,7 @@ void start_control(void) {
 				imu.accel_ready = false;
 				LSM303_EnableSharedIRQs();
 
-				raw_data.ax = (int16_t)((accel_snap[1] << 8) | accel_snap[0]) * imu.accel_g_per_lsb;
-				raw_data.ay = (int16_t)((accel_snap[3] << 8) | accel_snap[2]) * imu.accel_g_per_lsb;
-				raw_data.az = (int16_t)((accel_snap[5] << 8) | accel_snap[4]) * imu.accel_g_per_lsb;
+				LSM303_DecodeAccelG(&imu, accel_snap, &raw_data.ax, &raw_data.ay, &raw_data.az);
 
 				// This bit now means: "I have a fresh, valid gravity sample"
 				telem_data.sensor_status |= SENSOR_STATUS_LSM_READY;
@@ -2482,234 +2221,6 @@ void start_control(void) {
 		StartControlState = STATE_MODE_SEL;
 		break;
 
-	case STATE_TUNE:
-	{
-		// =========================
-		// SAFETY POLICY
-		// =========================
-		// If you want "bench tune" (no motors), keep this.
-		// If you want "in-air tune", require is_system_armed==1 and props on, etc.
-		const bool allow_motor_output = (is_system_armed != 0);
-
-		uint32_t now_ms = HAL_GetTick();
-
-		// Persistent supervisor state
-		static uint8_t entered = 0;
-		static TuneAxis_t axis = AXIS_PITCH;
-		static uint16_t telem_decimator = 0;   // 1kHz -> 100Hz telemetry
-		static uint32_t last_1khz = 0;
-
-
-
-		// -------------------------
-		// One-time entry init
-		// -------------------------
-		if (!entered) {
-			entered = 1;
-			axis = AXIS_PITCH;
-			telem_decimator = 0;
-			g_state.isTuning = true;
-			telem_data.flight_mode = 0x07; // TUNING
-			// Reset logs
-			log_idx = 0;
-			dump_idx = 0;
-			is_logging = false;
-			is_dumping = false;
-
-			// Reset tune FSM + kick it
-			state_tune = TUNE_IDLE;
-			tuning_triggered = 1;
-
-			// Zero setpoints
-			g_target.rate_pitch = 0.0f;
-			g_target.rate_roll  = 0.0f;
-			g_target.rate_yaw   = 0.0f;
-
-			// Optional: force attitude hold targets to 0
-			// g_target.roll = 0; g_target.pitch = 0; g_target.yaw = 0;
-
-			// Timing
-			last_1khz = now_ms;
-
-		}
-
-		// -------------------------
-		// 1 kHz loop gate
-		// -------------------------
-		if ((now_ms - last_1khz) >= 1) {
-			float dt = (now_ms - last_1khz) * 0.001f;
-			dt = clampf(dt, 0.001f, 0.01f);
-			last_1khz = now_ms;
-
-			g_state.dt_sec = dt;
-
-			telem_decimator++;
-
-			// =========================
-			// 1) SENSE / UPDATE STATE
-			// =========================
-			if (i3gd20.initialized && I3GD20_ReadGyro(&i3gd20, &gyro_raw)) {
-				float gx_raw = gyro_raw.gx * i3gd20.dps_per_lsb;
-				float gy_raw = gyro_raw.gy * i3gd20.dps_per_lsb;
-				float gz_raw = gyro_raw.gz * i3gd20.dps_per_lsb;
-
-				// 2. BIQUAD FILTERING (THE NEW STEP)
-				raw_data.gx = Biquad_Process(&filter_gyro_roll,  gx_raw);
-				raw_data.gy = Biquad_Process(&filter_gyro_pitch, gy_raw);
-				raw_data.gz = Biquad_Process(&filter_gyro_yaw,   gz_raw);
-			}
-
-			// accel helps AHRS stability during pokes
-			LSM303_Process_DMA(&imu);
-			if (imu.accel_ready) {
-				uint8_t snap[6];
-				LSM303_DisableSharedIRQs();
-				memcpy(snap, imu.accel_raw, 6);
-				imu.accel_ready = false;
-				LSM303_EnableSharedIRQs();
-
-				raw_data.ax = (int16_t)((snap[1] << 8) | snap[0]) * imu.accel_g_per_lsb;
-				raw_data.ay = (int16_t)((snap[3] << 8) | snap[2]) * imu.accel_g_per_lsb;
-				raw_data.az = (int16_t)((snap[5] << 8) | snap[4]) * imu.accel_g_per_lsb;
-			}
-
-			AHRS_Update(&raw_data, &g_state, dt);
-
-			// =========================
-			// 2) SELECT ACTIVE AXIS
-			// =========================
-			float *sp = NULL;
-			float rate_meas = 0.0f;
-
-			if (axis == AXIS_PITCH) {
-				sp = &g_target.rate_pitch;
-				rate_meas = g_state.pitch_rate;
-				g_target.rate_roll = 0.0f;
-				g_target.rate_yaw  = 0.0f;
-			} else if (axis == AXIS_ROLL) {
-				sp = &g_target.rate_roll;
-				rate_meas = g_state.roll_rate;
-				g_target.rate_pitch = 0.0f;
-				g_target.rate_yaw   = 0.0f;
-			} else {
-				// finished all axes
-				g_state.isTuning = false;
-				StartControlState = STATE_DATA_DUMP;
-				entered = 0; // so tune can be run again later
-				break;
-			}
-
-			// =========================
-			// 3) RUN AUTOTUNE STEP (updates *sp)
-			// =========================
-			bool axis_done = run_autotune_step(sp, rate_meas);
-			static TuneState_t prev_tune_state = TUNE_IDLE;
-
-			// Detect the exact moment we transition INTO a pulse
-			if (state_tune == TUNE_INJECT_PULSE && prev_tune_state != TUNE_INJECT_PULSE) {
-				is_logging = true;
-				log_idx = 0; // Fresh start for this magnitude
-			}
-			prev_tune_state = state_tune;
-			// =========================
-			// 4) CONTROL OUTPUT POLICY
-			// =========================
-			if (allow_motor_output) {
-				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target, &g_drone_status);
-			} else {
-				// hard force motors to 0 while tuning (optional)
-				for (int i = 1; i <= 4; i++) {
-					ESC_SetThrottle(get_timer_channel(i), 0.0f);
-				}
-			}
-
-			// =========================
-			// 5) LOGGING (1kHz, 600 samples)
-			// =========================
-			if (is_logging && log_idx < TUNE_LOG_SIZE) {
-				gyro_log[log_idx]   = rate_meas;  // measured response
-				target_log[log_idx] = *sp;        // commanded poke
-				log_idx++;
-			}
-
-			// =========================
-			// 6) AXIS COMPLETE -> ADVANCE
-			// =========================
-			if (axis_done) {
-				is_logging = false;
-
-				// Pad log if we didn’t fill the entire window
-				for (; log_idx < TUNE_LOG_SIZE; log_idx++) {
-					gyro_log[log_idx]   = gyro_log[(log_idx > 0) ? (log_idx - 1) : 0];
-					target_log[log_idx] = 0.0f;
-				}
-
-				// Next axis
-				if (axis == AXIS_PITCH) {
-					axis = AXIS_ROLL;
-					state_tune = TUNE_IDLE;
-					tuning_triggered = 1;
-					log_idx = 0;
-				} else {
-					axis = AXIS_DONE;
-					g_state.isTuning = false;
-					StartControlState = STATE_DATA_DUMP;
-					entered = 0;
-					for (int i = 1; i <= 4; i++) {
-						ESC_SetThrottle(get_timer_channel(i), 0.0f);
-					}
-				}
-			}
-
-			// =========================
-			// 7) TELEMETRY @ 100Hz
-			// =========================
-			if (telem_decimator >= 10) {
-				telem_decimator = 0;
-
-				// Put useful live signals in packet for your plotter
-				telem_data.setpoint    = *sp;
-				telem_data.measurement = rate_meas;
-
-				PIDController* pid_active = &pid_pitch_rate;
-				if (axis == AXIS_ROLL) pid_active = &pid_roll_rate;
-
-				telem_data.error      = pid_active->previous_error;
-				telem_data.p_term     = pid_active->p_out;
-				telem_data.i_term     = pid_active->i_out;
-				telem_data.d_term     = pid_active->d_out;
-				telem_data.output_sum = pid_active->output;
-				// send one frame
-				SPI5_ArmNextFrame();
-			}
-		}
-	}
-	break;
-
-
-	case STATE_DATA_DUMP:
-	{
-		telem_data.flight_mode = 254;
-		uint32_t now = HAL_GetTick();
-		if (now - last >= 10) {
-			last = now;
-
-			telem_data.timestamp   = (float)dump_idx;
-			telem_data.pitch       = gyro_log[dump_idx];
-			telem_data.voltage     = target_log[dump_idx];
-			telem_data.flight_mode = 0xFE;
-
-			SPI5_ArmNextFrame();
-
-			dump_idx++;
-
-			if (dump_idx >= TUNE_LOG_SIZE) {
-				dump_idx = 0;
-				StartControlState = STATE_MODE_SEL;
-			}
-		}
-		break;
-	}
 
 	case STATE_MODE_SEL: {
 		g_drone_status.flight_mode = 6; // Mode Select
@@ -2758,18 +2269,7 @@ void start_control(void) {
 		telem_data.drone_mode = g_drone_status.drone_mode;
 		VCP_Dump_TrySend(now);
 
-		// --- RESTORED STATE MACHINE CRITERIA ---
-
-		// Criterion A: Autotune Request
-		if (tune_request) {
-			tune_request = 0;
-			SetModeSelectLed(false);
-			entered = 0;
-			StartControlState = STATE_TUNE;
-			break;
-		}
-
-		// Criterion B: Primary Mode Selection
+		// Primary Mode Selection
 		// Fixed: Using your global instance g_drone_status
 		if (g_drone_status.drone_mode != 0) {
 			SetModeSelectLed(false);
@@ -3033,33 +2533,6 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 		command_accepted = true;
 		break;
 
-	case 't': // --- TUNE ---
-		if (cmd[1] == 'u') {
-			tune_request = 1;
-			command_accepted = true;
-		} else if (cmd[1] == 'p') {
-			char* val_ptr = strchr(cmd, ' ');
-			if (val_ptr != NULL) {
-				int requested_loop = atoi(val_ptr + 1);
-				if (requested_loop == PID_TUNE_LOOP_ROLL_RATE ||
-						requested_loop == PID_TUNE_LOOP_PITCH_RATE ||
-						requested_loop == PID_TUNE_LOOP_YAW_RATE) {
-					g_pid_tune_loop = (pidTuneLoop_t)requested_loop;
-					g_telem_mode = TELEM_MODE_PID_TUNE;
-					command_accepted = true;
-				} else {
-					unknownTelemCMD_counter += 1;
-				}
-			} else {
-				unknownTelemCMD_counter += 1;
-			}
-		} else if (cmd[1] == 'n') {
-			g_telem_mode = TELEM_MODE_NORMAL;
-			command_accepted = true;
-		} else {
-			unknownTelemCMD_counter += 1;
-		}
-		break;
 	}
 
 	telem_cmd_ack_counter++;
@@ -3102,98 +2575,6 @@ void ESC_SetThrottle(uint32_t channel, float percentage) {
 		telem_data.motor4_T = percentage;
 	}
 }
-
-void ESC_SetThrottle_Safe(uint32_t channel, float percentage) {
-	if (in_diagnostic_mode && percentage > DIAGNOSTIC_MAX_THROTTLE) {
-		percentage = DIAGNOSTIC_MAX_THROTTLE;
-	}
-	ESC_SetThrottle(channel, percentage);
-}
-
-void Trigger_Motor_Pulse(uint32_t channel, float pulse_val, uint32_t duration_ms) {
-	diagnostic_pulse.channel = channel;
-	diagnostic_pulse.pulse_throttle = pulse_val;
-	diagnostic_pulse.duration = duration_ms;
-	diagnostic_pulse.start_time = HAL_GetTick();
-	diagnostic_pulse.active = true;
-
-	// Immediate physical update
-	ESC_SetThrottle(channel, pulse_val);
-}
-
-void Update_Pulse_Manager(void) {
-	if (!diagnostic_pulse.active) return;
-
-	if (HAL_GetTick() - diagnostic_pulse.start_time >= diagnostic_pulse.duration) {
-		// Time is up! Return to safety baseline
-		ESC_SetThrottle(diagnostic_pulse.channel, 0.0f);
-		diagnostic_pulse.active = false;
-	}
-}
-
-bool run_autotune_step(float *rate_setpoint, float current_rate)
-{
-	static uint32_t state_timer = 0;
-	static float max_rate_observed = 0.0f;
-	static const float magnitudes[] = {10.0f, -10.0f, 20.0f, -20.0f, 30.0f, -30.0f};
-	static int mag_idx = 0;
-
-	switch (state_tune)
-	{
-	case TUNE_IDLE:
-		*rate_setpoint = 0.0f;
-		if (tuning_triggered) {
-			tuning_triggered = 0;
-			state_tune = TUNE_INJECT_PULSE;
-			state_timer = HAL_GetTick();
-			max_rate_observed = 0.0f;
-		}
-		return false;
-
-	case TUNE_INJECT_PULSE:
-		*rate_setpoint = magnitudes[mag_idx];
-		if (fabsf(current_rate) > fabsf(max_rate_observed)) max_rate_observed = current_rate;
-
-		if (HAL_GetTick() - state_timer >= 80) { // 80ms is perfect
-			state_tune = TUNE_MEASURE_WAIT;
-			state_timer = HAL_GetTick();
-			*rate_setpoint = 0.0f;
-		}
-		return false;
-
-	case TUNE_MEASURE_WAIT:
-		*rate_setpoint = 0.0f;
-		// Raise threshold to 5.0 to ignore ground vibration "jitter"
-		if (fabsf(current_rate) < 5.0f || (HAL_GetTick() - state_timer >= 300)) {
-			state_tune = TUNE_CALCULATE;
-		}
-		return false;
-
-	case TUNE_CALCULATE:
-		mag_idx++;
-		state_tune = TUNE_COOLDOWN;
-		state_timer = HAL_GetTick();
-		return false;
-
-	case TUNE_COOLDOWN:
-		*rate_setpoint = 0.0f;
-		// 300ms is plenty for a 5" or smaller drone to stop ringing
-		if (HAL_GetTick() - state_timer >= 300) {
-			if (mag_idx >= 6) {
-				mag_idx = 0;
-				state_tune = TUNE_IDLE;
-				return true; // Axis Done
-			} else {
-				state_tune = TUNE_IDLE;
-				tuning_triggered = 1; // Trigger next magnitude immediately
-				return false;
-			}
-		}
-		return false;
-	}
-	return false;
-}
-
 
 void ESC_ArmAll(void) {
 	// Set all channels to 1000us (0%)

@@ -67,6 +67,8 @@ typedef struct {
     uint8_t addr_mag;
     LSM303_Variant variant;
     float accel_g_per_lsb;
+    float accel_bias_counts[3];
+    float accel_counts_per_g[3];
     float mag_gauss_per_lsb;
 
     // DMA STATE MACHINE MEMBERS
@@ -89,6 +91,7 @@ void LSM303_XferCpltCallback(LSM303* dev, bool is_rx);
 
 bool LSM303_StartAccelRead_DMA(LSM303* dev, uint8_t* dma_buffer);
 bool LSM303_StartMagRead_DMA(LSM303* dev, uint8_t* dma_buffer);
+void LSM303_DecodeAccelG(const LSM303* dev, const uint8_t raw[6], float* ax_g, float* ay_g, float* az_g);
 // AGR path: issue software reset/reboot command sequence on magnetometer.
 bool LSM303_SoftResetAGR(LSM303* dev);
 // Recovery helper:

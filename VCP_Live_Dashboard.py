@@ -137,14 +137,12 @@ FLIGHT_MODE_MAP = {
     53: "Gyro Zero-Rate Cal",
     54: "GPS Init",
     6: "Mode Select",
-    7: "Tuning",
     8: "Stabilize",
     81: "Takeoff: Init",
     82: "Takeoff: Spoolup",
     83: "Takeoff: Liftoff",
     84: "Takeoff: Transition",
     91: "Telem CMD Pulse",
-    254: "Data Dump",
 }
 
 

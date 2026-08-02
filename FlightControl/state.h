@@ -23,7 +23,6 @@ typedef struct {
     float gyro_x, gyro_y, gyro_z;
     float roll_rate, pitch_rate, yaw_rate;
     bool offGround;
-    bool isTuning;
     float dt_sec;
 } vehicleState_t;
 
