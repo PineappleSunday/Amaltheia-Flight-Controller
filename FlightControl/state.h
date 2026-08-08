@@ -8,7 +8,10 @@
 #define MODE_MANUAL_LEVEL  1  // Auto-level on, but user controls vertical
 #define MODE_MISSION       2  // Following your mission_plan[64] string
 #define MODE_THRUST_STAND  3
-// Mode ID 4 is reserved/unsupported (obsolete AHRS-only mode)
+#define MODE_ENGINEER      4  // Ground diagnostics with raw VCP sensor packets
+
+#define FLIGHT_MODE_PBIT_OK    55
+#define FLIGHT_MODE_PBIT_FAIL  56
 
 #define SUBMODE_STABLE     0
 #define SUBMODE_TAKEOFF    1

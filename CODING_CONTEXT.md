@@ -41,7 +41,7 @@ Mode IDs are defined in `FlightControl/state.h`:
 - `MODE_MANUAL_LEVEL = 1`
 - `MODE_MISSION = 2`
 - `MODE_THRUST_STAND = 3`
-- mode 4 is reserved/unsupported
+- `MODE_ENGINEER = 4`
 
 `EnterMode(MODE_MISSION)` in `Core/Src/main.c` currently:
 

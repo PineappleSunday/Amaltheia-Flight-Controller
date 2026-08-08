@@ -18,17 +18,28 @@ import serial.tools.list_ports
 
 
 HEADER_VALUE = 0x31504356  # "VCP1"
+ENGINEER_HEADER_VALUE = 0x31454356  # "VCE1"
+BIT_HEADER_VALUE = 0x31424356  # "VCB1"
 FOOTER_VALUE = 0xAB
 FRAME_FORMAT = "<IIHBBBB" + ("f" * 69) + "B"
+ENGINEER_FRAME_FORMAT = "<IIHBBBBf" + ("B" * 18) + ("h" * 9) + ("f" * 9) + "B"
+BIT_FRAME_FORMAT = "<IIHI" + ("B" * 18)
 BME_FRAME_FORMAT = "<IIHBBBB" + ("f" * 57) + "B"
 LEGACY_FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
 FRAME_STRUCT = struct.Struct(FRAME_FORMAT)
+ENGINEER_FRAME_STRUCT = struct.Struct(ENGINEER_FRAME_FORMAT)
+BIT_FRAME_STRUCT = struct.Struct(BIT_FRAME_FORMAT)
 BME_FRAME_STRUCT = struct.Struct(BME_FRAME_FORMAT)
 LEGACY_FRAME_STRUCT = struct.Struct(LEGACY_FRAME_FORMAT)
 FRAME_SIZE = FRAME_STRUCT.size
+ENGINEER_FRAME_SIZE = ENGINEER_FRAME_STRUCT.size
+BIT_FRAME_SIZE = BIT_FRAME_STRUCT.size
 BME_FRAME_SIZE = BME_FRAME_STRUCT.size
 LEGACY_FRAME_SIZE = LEGACY_FRAME_STRUCT.size
 HEADER_BYTES = struct.pack("<I", HEADER_VALUE)
+ENGINEER_HEADER_BYTES = struct.pack("<I", ENGINEER_HEADER_VALUE)
+BIT_HEADER_BYTES = struct.pack("<I", BIT_HEADER_VALUE)
+FRAME_HEADERS = (HEADER_BYTES, ENGINEER_HEADER_BYTES, BIT_HEADER_BYTES)
 
 MISSION_ACTION_MAP = {
     -1: "None",
@@ -86,7 +97,7 @@ FRAME_FIELDS = [
     "bme280_temp_c",
     "bme280_pressure_pa",
     "bme280_humidity_rh",
-    "bme280_altitude_m", # BME280 altitude in meters (relative, based on pressure)
+    "bme280_altitude_m", # BME280 altitude in meters, bias-corrected from boot GPS/BME comparison when available
     "gps_valid",
     "gps_sats",
     "gps_lat_deg",
@@ -118,6 +129,82 @@ FRAME_FIELDS = [
     "magic_footer",
 ]
 
+ENGINEER_FRAME_FIELDS = [
+    "header",
+    "tick_ms",
+    "sequence",
+    "armed",
+    "drone_mode",
+    "flight_mode",
+    "sat_flags",
+    "dt_sec",
+    "accel_raw_b0",
+    "accel_raw_b1",
+    "accel_raw_b2",
+    "accel_raw_b3",
+    "accel_raw_b4",
+    "accel_raw_b5",
+    "mag_raw_b0",
+    "mag_raw_b1",
+    "mag_raw_b2",
+    "mag_raw_b3",
+    "mag_raw_b4",
+    "mag_raw_b5",
+    "gyro_raw_b0",
+    "gyro_raw_b1",
+    "gyro_raw_b2",
+    "gyro_raw_b3",
+    "gyro_raw_b4",
+    "gyro_raw_b5",
+    "accel_raw_x",
+    "accel_raw_y",
+    "accel_raw_z",
+    "mag_raw_x",
+    "mag_raw_y",
+    "mag_raw_z",
+    "gyro_raw_x",
+    "gyro_raw_y",
+    "gyro_raw_z",
+    "accel_x",
+    "accel_y",
+    "accel_z",
+    "mag_x",
+    "mag_y",
+    "mag_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z",
+    "magic_footer",
+]
+
+BIT_FRAME_FIELDS = [
+    "header",
+    "tick_ms",
+    "sequence",
+    "timestamp_us",
+    "lsm303_accel_whoami",
+    "lsm303_mag_whoami_agr",
+    "lsm303_mag_id_a",
+    "lsm303_mag_id_b",
+    "lsm303_mag_id_c",
+    "lsm303_variant",
+    "lsm303_init_ok",
+    "gyro_whoami",
+    "gyro_init_ok",
+    "lsm303_accel_ctrl1",
+    "lsm303_accel_ctrl4",
+    "lsm303_mag_cfg_a",
+    "lsm303_mag_cfg_b",
+    "lsm303_mag_cfg_c",
+    "lsm303_temp_cfg",
+    "gyro_ctrl_reg1",
+    "gyro_ctrl_reg4",
+    "magic_footer",
+]
+
+NORMAL_CSV_FIELDS = ["host_time_s", "packet_type"] + FRAME_FIELDS
+ENGINEER_CSV_FIELDS = ["host_time_s", "packet_type"] + list(dict.fromkeys(ENGINEER_FRAME_FIELDS + BIT_FRAME_FIELDS))
+
 BME_FRAME_FIELDS = [
     field for field in FRAME_FIELDS
     if not field.startswith("gps_") and not field.startswith("mission_")
@@ -125,6 +212,8 @@ BME_FRAME_FIELDS = [
 LEGACY_FRAME_FIELDS = [field for field in BME_FRAME_FIELDS if not field.startswith("bme280_")]
 
 assert FRAME_SIZE == 291, f"Unexpected frame size: {FRAME_SIZE}"
+assert ENGINEER_FRAME_SIZE == 91, f"Unexpected engineer frame size: {ENGINEER_FRAME_SIZE}"
+assert BIT_FRAME_SIZE == 32, f"Unexpected BIT frame size: {BIT_FRAME_SIZE}"
 assert BME_FRAME_SIZE == 243, f"Unexpected BME frame size: {BME_FRAME_SIZE}"
 assert LEGACY_FRAME_SIZE == 223, f"Unexpected legacy frame size: {LEGACY_FRAME_SIZE}"
 
@@ -136,7 +225,10 @@ FLIGHT_MODE_MAP = {
     52: "Sensor Init",
     53: "Gyro Zero-Rate Cal",
     54: "GPS Init",
+    55: "PBIT OK",
+    56: "PBIT Fail",
     6: "Mode Select",
+    7: "Engineer",
     8: "Stabilize",
     81: "Takeoff: Init",
     82: "Takeoff: Spoolup",
@@ -156,7 +248,9 @@ class FrameParser:
         frames = []
 
         while True:
-            idx = self.buffer.find(HEADER_BYTES)
+            header_positions = [self.buffer.find(header) for header in FRAME_HEADERS]
+            header_positions = [idx for idx in header_positions if idx >= 0]
+            idx = min(header_positions) if header_positions else -1
             if idx < 0:
                 if len(self.buffer) > 3:
                     del self.buffer[:-3]
@@ -165,27 +259,45 @@ class FrameParser:
             if idx > 0:
                 del self.buffer[:idx]
 
-            if len(self.buffer) < LEGACY_FRAME_SIZE:
+            if len(self.buffer) < BIT_FRAME_SIZE:
                 break
 
-            # The firmware now consistently sends the full 291-byte frame.
-            # Simplify the parser to only look for this frame.
-            if len(self.buffer) < FRAME_SIZE or self.buffer[FRAME_SIZE - 1] != FOOTER_VALUE:
+            if self.buffer.startswith(ENGINEER_HEADER_BYTES):
+                frame_size = ENGINEER_FRAME_SIZE
+                frame_struct = ENGINEER_FRAME_STRUCT
+                frame_fields = ENGINEER_FRAME_FIELDS
+                packet_type = "engineer"
+            elif self.buffer.startswith(BIT_HEADER_BYTES):
+                frame_size = BIT_FRAME_SIZE
+                frame_struct = BIT_FRAME_STRUCT
+                frame_fields = BIT_FRAME_FIELDS
+                packet_type = "bit"
+            elif self.buffer.startswith(HEADER_BYTES):
+                frame_size = FRAME_SIZE
+                frame_struct = FRAME_STRUCT
+                frame_fields = FRAME_FIELDS
+                packet_type = "normal"
+            else:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
-            frame_size = FRAME_SIZE
-            frame_struct = FRAME_STRUCT
-            frame_fields = FRAME_FIELDS
+            if len(self.buffer) < frame_size:
+                break
+            if self.buffer[frame_size - 1] != FOOTER_VALUE:
+                self.bad_frames += 1
+                del self.buffer[0]
+                continue
+
             candidate = bytes(self.buffer[:frame_size])
             values = frame_struct.unpack(candidate)
             frame = dict(zip(frame_fields, values))
-            if frame["header"] != HEADER_VALUE or frame["magic_footer"] != FOOTER_VALUE:
+            if frame["header"] not in (HEADER_VALUE, ENGINEER_HEADER_VALUE, BIT_HEADER_VALUE) or frame["magic_footer"] != FOOTER_VALUE:
                 self.bad_frames += 1
                 del self.buffer[0]
                 continue
 
+            frame["packet_type"] = packet_type
             frames.append(frame)
             del self.buffer[:frame_size]
 
@@ -238,7 +350,7 @@ def serial_reader(ser, out_q, stop_event, stats):
                 stats["queue_drops"] += 1
 
 
-def csv_logger(log_q, csv_file, csv_writer, stop_event):
+def csv_logger(log_q, normal_csv_file, normal_csv_writer, engineer_csv_file, engineer_csv_writer, stop_event):
     flush_counter = 0
     last_flush = time.perf_counter()
 
@@ -251,19 +363,25 @@ def csv_logger(log_q, csv_file, csv_writer, stop_event):
         if row is None:
             now = time.perf_counter()
             if flush_counter > 0 and (now - last_flush) >= 0.5:
-                csv_file.flush()
+                normal_csv_file.flush()
+                engineer_csv_file.flush()
                 flush_counter = 0
                 last_flush = now
             continue
 
-        csv_writer.writerow(row)
+        if row.get("packet_type") == "normal":
+            normal_csv_writer.writerow(row)
+        else:
+            engineer_csv_writer.writerow(row)
         flush_counter += 1
         if flush_counter >= 200:
-            csv_file.flush()
+            normal_csv_file.flush()
+            engineer_csv_file.flush()
             flush_counter = 0
             last_flush = time.perf_counter()
 
-    csv_file.flush()
+    normal_csv_file.flush()
+    engineer_csv_file.flush()
 
 
 def build_status_text(state):
@@ -283,6 +401,78 @@ def build_status_text(state):
             f"Frames parsed: {state['frames_seen']}\n"
             f"Queue drops: {state['queue_drops']}\n"
             f"Bad frames: {state['bad_frames']}\n"
+        )
+
+    if latest.get("packet_type") == "engineer":
+        fm_val = latest["flight_mode"]
+        fm_str = FLIGHT_MODE_MAP.get(fm_val, f"Unknown ({fm_val})")
+        raw_byte_line = (
+            "Raw bytes:\n"
+            f"  ACC: {latest['accel_raw_b0']:02X} {latest['accel_raw_b1']:02X} "
+            f"{latest['accel_raw_b2']:02X} {latest['accel_raw_b3']:02X} "
+            f"{latest['accel_raw_b4']:02X} {latest['accel_raw_b5']:02X}\n"
+            f"  MAG: {latest['mag_raw_b0']:02X} {latest['mag_raw_b1']:02X} "
+            f"{latest['mag_raw_b2']:02X} {latest['mag_raw_b3']:02X} "
+            f"{latest['mag_raw_b4']:02X} {latest['mag_raw_b5']:02X}\n"
+            f"  GYR: {latest['gyro_raw_b0']:02X} {latest['gyro_raw_b1']:02X} "
+            f"{latest['gyro_raw_b2']:02X} {latest['gyro_raw_b3']:02X} "
+            f"{latest['gyro_raw_b4']:02X} {latest['gyro_raw_b5']:02X}\n"
+        )
+        return (
+            f"Connection: {conn_state}\n"
+            f"Port: {port_line} @ {state['baud']}\n"
+            f"Detected Ports: {ports_preview}\n"
+            f"{state['conn_msg']}\n"
+            f"FPS: {state['fps']:.1f}\n"
+            f"Frames parsed: {state['frames_seen']}\n"
+            f"Seq drops: {state['seq_drops']}\n"
+            f"Queue drops: {state['queue_drops']}\n"
+            f"Bad frames: {state['bad_frames']}\n"
+            "\n"
+            f"ENGINEER PACKET  Armed: {latest['armed']}  Mode: {latest['drone_mode']}  FM: {fm_str}\n"
+            f"PBIT: 0b{latest['sat_flags']:08b}  dt: {latest['dt_sec']:.4f}s\n"
+            "\n"
+            f"{raw_byte_line}"
+            "\n"
+            "Raw counts:\n"
+            f"  ACC X/Y/Z: {latest['accel_raw_x']:7d} {latest['accel_raw_y']:7d} {latest['accel_raw_z']:7d}\n"
+            f"  MAG X/Y/Z: {latest['mag_raw_x']:7d} {latest['mag_raw_y']:7d} {latest['mag_raw_z']:7d}\n"
+            f"  GYR X/Y/Z: {latest['gyro_raw_x']:7d} {latest['gyro_raw_y']:7d} {latest['gyro_raw_z']:7d}\n"
+            "\n"
+            "Calibrated/body values:\n"
+            f"  ACC g:     {latest['accel_x']:+8.4f} {latest['accel_y']:+8.4f} {latest['accel_z']:+8.4f}\n"
+            f"  MAG gauss: {latest['mag_x']:+8.4f} {latest['mag_y']:+8.4f} {latest['mag_z']:+8.4f}\n"
+            f"  GYR dps:   {latest['gyro_x']:+8.3f} {latest['gyro_y']:+8.3f} {latest['gyro_z']:+8.3f}\n"
+        )
+
+    if latest.get("packet_type") == "bit":
+        return (
+            f"Connection: {conn_state}\n"
+            f"Port: {port_line} @ {state['baud']}\n"
+            f"Detected Ports: {ports_preview}\n"
+            f"{state['conn_msg']}\n"
+            f"FPS: {state['fps']:.1f}\n"
+            f"Frames parsed: {state['frames_seen']}\n"
+            f"Seq drops: {state['seq_drops']}\n"
+            f"Queue drops: {state['queue_drops']}\n"
+            f"Bad frames: {state['bad_frames']}\n"
+            "\n"
+            "IBIT SNAPSHOT\n"
+            f"timestamp_us: {latest['timestamp_us']}\n"
+            f"LSM init={latest['lsm303_init_ok']} variant={latest['lsm303_variant']}\n"
+            f"  accel WHOAMI: 0x{latest['lsm303_accel_whoami']:02X}\n"
+            f"  AGR mag WHOAMI: 0x{latest['lsm303_mag_whoami_agr']:02X}\n"
+            f"  mag ID A/B/C: 0x{latest['lsm303_mag_id_a']:02X} "
+            f"0x{latest['lsm303_mag_id_b']:02X} 0x{latest['lsm303_mag_id_c']:02X}\n"
+            f"  accel CTRL1/CTRL4: 0x{latest['lsm303_accel_ctrl1']:02X} "
+            f"0x{latest['lsm303_accel_ctrl4']:02X}\n"
+            f"  mag CFG A/B/C: 0x{latest['lsm303_mag_cfg_a']:02X} "
+            f"0x{latest['lsm303_mag_cfg_b']:02X} 0x{latest['lsm303_mag_cfg_c']:02X}\n"
+            f"  temp CFG: 0x{latest['lsm303_temp_cfg']:02X}\n"
+            f"Gyro init={latest['gyro_init_ok']}\n"
+            f"  WHOAMI: 0x{latest['gyro_whoami']:02X}\n"
+            f"  CTRL_REG1/CTRL_REG4: 0x{latest['gyro_ctrl_reg1']:02X} "
+            f"0x{latest['gyro_ctrl_reg4']:02X}\n"
         )
 
     bme_status = int(float(latest["bme280_valid"]))
@@ -360,6 +550,7 @@ def main():
     parser.add_argument("--window-sec", type=float, default=15.0, help="Plot history window in seconds")
     parser.add_argument("--update-ms", type=int, default=100, help="UI refresh interval")
     parser.add_argument("--plot-sample-hz", type=float, default=50.0, help="Maximum rate stored in plot history")
+    parser.add_argument("--3d-update-ms", dest="three_d_update_ms", type=int, default=200, help="3D view refresh interval")
     parser.add_argument("--drain-budget-ms", type=float, default=12.0, help="Maximum queue-drain time per UI tick")
     parser.add_argument("--queue-size", type=int, default=4096, help="Frame queue size")
     parser.add_argument("--no-log", action="store_true", help="Disable CSV logging")
@@ -368,7 +559,7 @@ def main():
 
     initial_port = args.port or auto_pick_port() or ""
     print("Dashboard started in offline mode. Use the GUI controls to connect.")
-    print(f"Frame size: {FRAME_SIZE} bytes ({LEGACY_FRAME_SIZE} byte legacy frames also accepted)")
+    print(f"Frame sizes: normal={FRAME_SIZE} bytes, engineer={ENGINEER_FRAME_SIZE} bytes, bit={BIT_FRAME_SIZE} bytes")
 
     max_points = max(200, int(args.window_sec * max(1.0, args.plot_sample_hz)))
     t = deque(maxlen=max_points)
@@ -393,27 +584,32 @@ def main():
     vz = deque(maxlen=max_points)
     ff_vz = deque(maxlen=max_points)
 
-    csv_file = None
-    csv_writer = None
+    normal_csv_file = None
+    engineer_csv_file = None
     log_q = None
     logger_thread = None
     logger_stop_event = None
     if not args.no_log:
         os.makedirs(args.log_dir, exist_ok=True)
-        log_name = datetime.now().strftime("vcp_dump_%Y%m%d_%H%M%S.csv")
-        log_path = os.path.join(args.log_dir, log_name)
-        csv_file = open(log_path, "w", newline="", encoding="utf-8")
-        csv_writer = csv.DictWriter(csv_file, fieldnames=["host_time_s"] + FRAME_FIELDS)
-        csv_writer.writeheader()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        normal_log_path = os.path.join(args.log_dir, f"vcp_dump_{timestamp}.csv")
+        engineer_log_path = os.path.join(args.log_dir, f"engineer_dump_{timestamp}.csv")
+        normal_csv_file = open(normal_log_path, "w", newline="", encoding="utf-8")
+        engineer_csv_file = open(engineer_log_path, "w", newline="", encoding="utf-8")
+        normal_csv_writer = csv.DictWriter(normal_csv_file, fieldnames=NORMAL_CSV_FIELDS, extrasaction="ignore")
+        engineer_csv_writer = csv.DictWriter(engineer_csv_file, fieldnames=ENGINEER_CSV_FIELDS, extrasaction="ignore")
+        normal_csv_writer.writeheader()
+        engineer_csv_writer.writeheader()
         log_q = queue.Queue(maxsize=8192)
         logger_stop_event = threading.Event()
         logger_thread = threading.Thread(
             target=csv_logger,
-            args=(log_q, csv_file, csv_writer, logger_stop_event),
+            args=(log_q, normal_csv_file, normal_csv_writer, engineer_csv_file, engineer_csv_writer, logger_stop_event),
             daemon=True,
         )
         logger_thread.start()
-        print(f"Logging CSV: {log_path}")
+        print(f"Logging normal CSV: {normal_log_path}")
+        print(f"Logging engineer CSV: {engineer_log_path}")
 
     frame_q = queue.Queue(maxsize=args.queue_size)
     reader_stats = {"bytes_in": 0, "frames_parsed": 0, "queue_drops": 0, "bad_frames": 0}
@@ -652,7 +848,7 @@ def main():
             state["frames_seen"] += 1
             state["latest"] = frame
 
-            if (now_s - last_plot_sample_s) >= plot_sample_period_s:
+            if frame.get("packet_type") == "normal" and (now_s - last_plot_sample_s) >= plot_sample_period_s:
                 last_plot_sample_s = now_s
                 plot_dirty = True
                 t.append(now_s)
@@ -770,27 +966,41 @@ def main():
     state["3d_fig"] = None
     state["3d_ax"] = None
     state["3d_ani"] = None
+    state["3d_arm_lines"] = []
+    state["3d_motor_scatters"] = []
+    state["3d_thrust_lines"] = []
 
     # --- 3D Model Constants ---
     ARM_LEN = 0.15  # meters
     MOTOR_POS = np.array([
-        [ ARM_LEN,  0, 0],  # Motor 1 (Front, +X)
-        [ 0, -ARM_LEN, 0],  # Motor 2 (Right, -Y)
-        [-ARM_LEN,  0, 0],  # Motor 3 (Back, -X)
-        [ 0,  ARM_LEN, 0]   # Motor 4 (Left, +Y)
+        [-ARM_LEN,  0.0,      0.0],  # M1 = -X
+        [ 0.0,     -ARM_LEN,  0.0],  # M2 = -Y
+        [ ARM_LEN,  0.0,      0.0],  # M3 = +X
+        [ 0.0,      ARM_LEN,  0.0],  # M4 = +Y
     ])
+    MOTOR_COLORS = ['r', 'g', 'b', 'c']
+    MOTOR_LABELS = [
+        'M1 (-X)',
+        'M2 (-Y)',
+        'M3 (+X)',
+        'M4 (+Y)'
+    ]
 
     def _update_3d_view(_):
-        if not state["3d_view_open"] or state["latest"] is None:
+        if (
+            not state["3d_view_open"]
+            or state["latest"] is None
+            or state["latest"].get("packet_type") != "normal"
+        ):
             return []
-
-        ax = state["3d_ax"]
-        ax.clear()
 
         # --- Attitude Processing ---
         # Get attitude in radians from the telemetry frame, same as the 2D plots.
-        roll_rad = np.deg2rad(state["latest"]["roll"])
-        pitch_rad = np.deg2rad(state["latest"]["pitch"])
+        # TEMPORARY diagnostic mapping:
+        # Physical M1/M3 motion is rotation about body Y -> pitch.
+        # Physical M2/M4 motion is rotation about body X -> roll.
+        roll_rad  = np.deg2rad(state["latest"]["pitch"])
+        pitch_rad = np.deg2rad(state["latest"]["roll"])
         yaw_rad = np.deg2rad(state["latest"]["yaw"])
 
         # --- 3D Rotation Matrices (Standard Aerospace Convention) ---
@@ -804,43 +1014,46 @@ def main():
         # Rotate motor positions
         rotated_pos = (R @ MOTOR_POS.T).T
 
-        # Draw arms
-        ax.plot([rotated_pos[0, 0], rotated_pos[2, 0]], [rotated_pos[0, 1], rotated_pos[2, 1]], [rotated_pos[0, 2], rotated_pos[2, 2]], 'k-')
-        ax.plot([rotated_pos[1, 0], rotated_pos[3, 0]], [rotated_pos[1, 1], rotated_pos[3, 1]], [rotated_pos[1, 2], rotated_pos[3, 2]], 'k-')
+        arm_pairs = ((0, 2), (1, 3))
+        for line, (a, b) in zip(state["3d_arm_lines"], arm_pairs):
+            line.set_data_3d(
+                [rotated_pos[a, 0], rotated_pos[b, 0]],
+                [rotated_pos[a, 1], rotated_pos[b, 1]],
+                [rotated_pos[a, 2], rotated_pos[b, 2]]
+            )
 
-        # Draw motors and thrust vectors
         motor_thrusts = [
             state["latest"]["motor1_pct"],
             state["latest"]["motor2_pct"],
             state["latest"]["motor3_pct"],
             state["latest"]["motor4_pct"]
         ]
-        
-        motor_colors = ['r', 'g', 'b', 'c']
-        motor_labels = ['M1 (Front)', 'M2 (Right)', 'M3 (Back)', 'M4 (Left)']
 
         for i in range(4):
             pos = rotated_pos[i]
-            ax.scatter(pos[0], pos[1], pos[2], c=motor_colors[i], s=100, label=motor_labels[i])
+            state["3d_motor_scatters"][i]._offsets3d = ([pos[0]], [pos[1]], [pos[2]])
 
             thrust_mag = motor_thrusts[i] / 100.0 * 0.35  # Increased scale for better visibility
             thrust_vec_local = np.array([0, 0, thrust_mag]) # Thrust is along local Z
             thrust_vec_world = R @ thrust_vec_local
+            thrust_end = pos + thrust_vec_world
 
-            ax.quiver(pos[0], pos[1], pos[2], thrust_vec_world[0], thrust_vec_world[1], thrust_vec_world[2], length=thrust_mag, normalize=False, color=motor_colors[i])
-
-        # Set plot limits and labels
-        lim = ARM_LEN * 1.5
-        ax.set_xlim(-lim, lim)
-        ax.set_ylim(-lim, lim)
-        ax.set_zlim(-lim, lim)
-        ax.set_xlabel("X (North)")
-        ax.set_ylabel("Y (West)")
-        ax.set_zlabel("Z (Up)")
-        ax.set_title(f"3D Orientation | R:{state['latest']['roll']:.1f} P:{state['latest']['pitch']:.1f} Y:{state['latest']['yaw']:.1f}")
-        ax.legend()
+            state["3d_thrust_lines"][i].set_data_3d(
+                [pos[0], thrust_end[0]],
+                [pos[1], thrust_end[1]],
+                [pos[2], thrust_end[2]]
+            )
         
-        return ax.patches + ax.lines + ax.collections
+        state["3d_ax"].set_title(
+            f"3D Orientation | R:{state['latest']['roll']:.1f} "
+            f"P:{state['latest']['pitch']:.1f} Y:{state['latest']['yaw']:.1f}"
+        )
+
+        return (
+            state["3d_arm_lines"]
+            + state["3d_motor_scatters"]
+            + state["3d_thrust_lines"]
+        )
 
     def on_3d_close(event):
         state["3d_view_open"] = False
@@ -849,6 +1062,9 @@ def main():
         state["3d_fig"] = None
         state["3d_ax"] = None
         state["3d_ani"] = None
+        state["3d_arm_lines"] = []
+        state["3d_motor_scatters"] = []
+        state["3d_thrust_lines"] = []
         print("3D view closed.")
 
     def show_3d_view(_event=None):
@@ -858,7 +1074,36 @@ def main():
         state["3d_fig"] = plt.figure(figsize=(8, 8))
         state["3d_fig"].canvas.mpl_connect('close_event', on_3d_close)
         state["3d_ax"] = state["3d_fig"].add_subplot(111, projection='3d')
-        state["3d_ani"] = animation.FuncAnimation(state["3d_fig"], _update_3d_view, interval=50, blit=False)
+        ax = state["3d_ax"]
+        lim = ARM_LEN * 1.5
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, lim)
+        ax.set_xlabel("X (North)")
+        ax.set_ylabel("Y (West)")
+        ax.set_zlabel("Z (Up)")
+
+        state["3d_arm_lines"] = [
+            ax.plot([], [], [], 'k-')[0],
+            ax.plot([], [], [], 'k-')[0],
+        ]
+        state["3d_motor_scatters"] = [
+            ax.scatter(MOTOR_POS[i, 0], MOTOR_POS[i, 1], MOTOR_POS[i, 2], c=MOTOR_COLORS[i], s=100, label=MOTOR_LABELS[i])
+            for i in range(4)
+        ]
+        state["3d_thrust_lines"] = [
+            ax.plot([], [], [], color=MOTOR_COLORS[i], linewidth=2.0)[0]
+            for i in range(4)
+        ]
+        ax.legend()
+
+        state["3d_ani"] = animation.FuncAnimation(
+            state["3d_fig"],
+            _update_3d_view,
+            interval=max(50, args.three_d_update_ms),
+            blit=False,
+            cache_frame_data=False,
+        )
         plt.show(block=False)
         print("3D view opened.")
 
@@ -882,9 +1127,12 @@ def main():
             logger_stop_event.set()
         if logger_thread is not None:
             logger_thread.join(timeout=2.0)
-        if csv_file is not None:
-            csv_file.flush()
-            csv_file.close()
+        if normal_csv_file is not None:
+            normal_csv_file.flush()
+            normal_csv_file.close()
+        if engineer_csv_file is not None:
+            engineer_csv_file.flush()
+            engineer_csv_file.close()
         del ani
         print("Closed.")
 

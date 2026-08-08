@@ -70,6 +70,17 @@ typedef struct {
     float accel_bias_counts[3];
     float accel_counts_per_g[3];
     float mag_gauss_per_lsb;
+    uint8_t accel_who_am_i;
+    uint8_t mag_who_am_i_agr;
+    uint8_t mag_id_a;
+    uint8_t mag_id_b;
+    uint8_t mag_id_c;
+    uint8_t accel_ctrl1;
+    uint8_t accel_ctrl4;
+    uint8_t mag_cfg_a;
+    uint8_t mag_cfg_b;
+    uint8_t mag_cfg_c;
+    uint8_t temp_cfg;
 
     // DMA STATE MACHINE MEMBERS
     LSM303_State state;         // Tracks the current I2C phase

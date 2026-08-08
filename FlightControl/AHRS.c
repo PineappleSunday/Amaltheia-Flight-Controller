@@ -2,23 +2,59 @@
 #include <stdbool.h>
 #include <math.h>
 
-AHRS_Offsets_t g_offsets = {0.0f, 0.0f, 0.0f, false};
+/*
+ * Frame convention established by calibration:
+ *
+ *   Body +X = FC +X = Accel X = Gyro X = Mag X = toward M3
+ *   Body +Y = FC +Y = Accel Y = Gyro Y = Mag Y = toward M4
+ *   Body +Z = FC +Z = Accel Z = Gyro Z = Mag Z
+ *
+ * No X/Y/Z remapping is performed inside the AHRS.
+ * Sensor calibration and PCB/body transformation should occur upstream.
+ */
+
 static bool accel_trust = true;
 static bool mag_trust = true;
-static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // [w, x, y, z]
+
+static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; /* [w, x, y, z] */
 static float beta = AHRS_MADGWICK_BETA;
+
+/* Magnetometer field-strength reference. */
+static float mag_ref = 0.0f;
+static bool mag_ref_set = false;
 
 static float wrap_deg(float a)
 {
     a = fmodf(a + 180.0f, 360.0f);
-    if (a < 0) a += 360.0f;
+
+    if (a < 0.0f) {
+        a += 360.0f;
+    }
+
     return a - 180.0f;
+}
+
+static float wrap_rad(float a)
+{
+    a = fmodf(a + (float)M_PI, 2.0f * (float)M_PI);
+
+    if (a < 0.0f) {
+        a += 2.0f * (float)M_PI;
+    }
+
+    return a - (float)M_PI;
 }
 
 static float clampf(float x, float lo, float hi)
 {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
+    if (x < lo) {
+        return lo;
+    }
+
+    if (x > hi) {
+        return hi;
+    }
+
     return x;
 }
 
@@ -27,9 +63,15 @@ static float vec3_norm(float x, float y, float z)
     return sqrtf(x * x + y * y + z * z);
 }
 
-static void quat_normalize(float* qv)
+static void quat_normalize(float *qv)
 {
-    float n = sqrtf(qv[0] * qv[0] + qv[1] * qv[1] + qv[2] * qv[2] + qv[3] * qv[3]);
+    const float n = sqrtf(
+        qv[0] * qv[0] +
+        qv[1] * qv[1] +
+        qv[2] * qv[2] +
+        qv[3] * qv[3]
+    );
+
     if (n < 1e-9f) {
         qv[0] = 1.0f;
         qv[1] = 0.0f;
@@ -37,48 +79,91 @@ static void quat_normalize(float* qv)
         qv[3] = 0.0f;
         return;
     }
-    qv[0] /= n;
-    qv[1] /= n;
-    qv[2] /= n;
-    qv[3] /= n;
-}
-static float wrap_rad(float a)
-{
-    a = fmodf(a + (float)M_PI, 2.0f*(float)M_PI);
-    if (a < 0) a += 2.0f*(float)M_PI;
-    return a - (float)M_PI;
+
+    const float inv_n = 1.0f / n;
+
+    qv[0] *= inv_n;
+    qv[1] *= inv_n;
+    qv[2] *= inv_n;
+    qv[3] *= inv_n;
 }
 
-
-static void quat_mul(const float a[4], const float b[4], float out[4])
+static void quat_mul(
+    const float a[4],
+    const float b[4],
+    float out[4]
+)
 {
-    out[0] = a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3];
-    out[1] = a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2];
-    out[2] = a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1];
-    out[3] = a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0];
+    out[0] =
+        a[0] * b[0] -
+        a[1] * b[1] -
+        a[2] * b[2] -
+        a[3] * b[3];
+
+    out[1] =
+        a[0] * b[1] +
+        a[1] * b[0] +
+        a[2] * b[3] -
+        a[3] * b[2];
+
+    out[2] =
+        a[0] * b[2] -
+        a[1] * b[3] +
+        a[2] * b[0] +
+        a[3] * b[1];
+
+    out[3] =
+        a[0] * b[3] +
+        a[1] * b[2] -
+        a[2] * b[1] +
+        a[3] * b[0];
 }
 
-
-static void quat_to_euler_deg(const float* qv, float* roll_deg, float* pitch_deg, float* yaw_deg)
+static void quat_to_euler_deg(
+    const float *qv,
+    float *roll_deg,
+    float *pitch_deg,
+    float *yaw_deg
+)
 {
-    const float q0 = qv[0], q1 = qv[1], q2 = qv[2], q3 = qv[3];
+    const float q0 = qv[0];
+    const float q1 = qv[1];
+    const float q2 = qv[2];
+    const float q3 = qv[3];
 
-    float sinr_cosp = 2.0f * (q0 * q1 + q2 * q3);
-    float cosr_cosp = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
-    float roll = atan2f(sinr_cosp, cosr_cosp);
+    /* Roll: rotation about body X. */
+    const float sinr_cosp =
+        2.0f * (q0 * q1 + q2 * q3);
 
-    float sinp = 2.0f * (q0 * q2 - q3 * q1);
+    const float cosr_cosp =
+        1.0f - 2.0f * (q1 * q1 + q2 * q2);
+
+    const float roll =
+        atan2f(sinr_cosp, cosr_cosp);
+
+    /* Pitch: rotation about body Y. */
+    float sinp =
+        2.0f * (q0 * q2 - q3 * q1);
+
     sinp = clampf(sinp, -1.0f, 1.0f);
-    float pitch = asinf(sinp);
 
-    float siny_cosp = 2.0f * (q0 * q3 + q1 * q2);
-    float cosy_cosp = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
-    float yaw = atan2f(siny_cosp, cosy_cosp);
+    const float pitch = asinf(sinp);
+
+    /* Yaw: rotation about body Z. */
+    const float siny_cosp =
+        2.0f * (q0 * q3 + q1 * q2);
+
+    const float cosy_cosp =
+        1.0f - 2.0f * (q2 * q2 + q3 * q3);
+
+    const float yaw =
+        atan2f(siny_cosp, cosy_cosp);
 
     const float r2d = 57.2957795f;
-    *roll_deg = roll * r2d;
+
+    *roll_deg  = roll  * r2d;
     *pitch_deg = pitch * r2d;
-    *yaw_deg = yaw * r2d;
+    *yaw_deg   = yaw   * r2d;
 }
 
 void AHRS_Init(void)
@@ -87,9 +172,12 @@ void AHRS_Init(void)
     q[1] = 0.0f;
     q[2] = 0.0f;
     q[3] = 0.0f;
+
     accel_trust = true;
     mag_trust = true;
 
+    mag_ref = 0.0f;
+    mag_ref_set = false;
 }
 
 void AHRS_SetBeta(float b)
@@ -100,229 +188,478 @@ void AHRS_SetBeta(float b)
 }
 
 /**
- * @brief Performs sensor fusion to update the global VehicleState.
+ * @brief Update attitude estimate.
+ *
+ * Input requirements:
+ *
+ *   raw->ax, ay, az : calibrated acceleration in body frame, units of g
+ *   raw->gx, gy, gz : calibrated angular rate in body frame, deg/s
+ *   raw->mx, my, mz : calibrated magnetic field in body frame
+ *
+ * Level stationary vehicle should read approximately:
+ *
+ *   accel = [0, 0, +1] g
  */
-void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
+void AHRS_Update(
+    ahrsSensor_t *raw,
+    vehicleState_t *state,
+    float dt
+)
 {
-    if (dt < 0.001f) dt = 0.001f;
-    if (dt > 0.010f) dt = 0.010f;
-
-    // Gyro mapping aligned to body frame with accel/mag already aligned:
-    // [gx_body, gy_body, gz_body] = [-Gy_sensor, Gx_sensor, Gz_sensor]
-    float gx_dps = -raw->gy - g_offsets.roll_bias;  // body X
-    float gy_dps =  raw->gx - g_offsets.pitch_bias; // body Y
-    float gz_dps =  raw->gz - g_offsets.yaw_bias;   // body Z
-    // Remap gyro to Accel/Mag Frame, also Body Frame
-    float ax = raw->ax; // body X
-    float ay = raw->ay; // body Y
-    float az = raw->az; // body Z
-
-    float mx = raw->mx;
-    float my = raw->my;
-    float mz = raw->mz;
-
-    static bool mag_trust = true;
-    static float mag_ref = 0.0f;   // nominal |m| in your units (learned)
-    static bool mag_ref_set = false;
-
-
-
-    float a_mag = vec3_norm(ax, ay, az);
-    float amag_err = fabsf(a_mag - 1.0f);
-    if (accel_trust) {
-        if (amag_err > 0.25f) accel_trust = false;
-    } else {
-        if (amag_err < 0.15f) accel_trust = true;
+    if (raw == NULL || state == NULL) {
+        return;
     }
 
+    /*
+     * Do not silently truncate a large elapsed time.
+     * Reject obviously invalid scheduling intervals instead.
+     *
+     * Normal flight operation is expected to be much faster than 50 ms.
+     */
+    if (dt <= 0.0f || dt > 0.050f) {
+        return;
+    }
+
+    /*
+     * -------------------------------------------------------------------------
+     * SENSOR INPUT
+     * -------------------------------------------------------------------------
+     *
+     * Calibration testing showed:
+     *
+     *   Accel X = Gyro X = Mag X = body X
+     *   Accel Y = Gyro Y = Mag Y = body Y
+     *   Accel Z = Gyro Z = Mag Z = body Z
+     *
+     * Therefore there is no remapping here.
+     */
+
+    const float gx_dps = raw->gx;
+    const float gy_dps = raw->gy;
+    const float gz_dps = raw->gz;
+
+    float ax = raw->ax;
+    float ay = raw->ay;
+    float az = raw->az;
+
+    const float mx = raw->mx;
+    const float my = raw->my;
+    const float mz = raw->mz;
+
+    /*
+     * -------------------------------------------------------------------------
+     * ACCELEROMETER TRUST / NORMALIZATION
+     * -------------------------------------------------------------------------
+     */
+
+    const float a_mag = vec3_norm(ax, ay, az);
+
+    float accel_weight = 0.0f;
+
     if (a_mag > 1e-6f) {
-        ax /= a_mag;
-        ay /= a_mag;
-        az /= a_mag;
+        const float amag_err =
+            fabsf(a_mag - 1.0f);
+
+        /*
+         * Full accel correction:
+         *     |a| error <= 0.10 g
+         *
+         * Correction fades to zero:
+         *     0.10 g -> 0.25 g
+         *
+         * No accel correction:
+         *     |a| error >= 0.25 g
+         */
+        accel_weight =
+            1.0f -
+            clampf(
+                (amag_err - 0.10f) / 0.15f,
+                0.0f,
+                1.0f
+            );
+
+        /*
+         * Separate hysteretic flag retained for diagnostics and
+         * initialization logic.
+         */
+        if (accel_trust) {
+            if (amag_err > 0.25f) {
+                accel_trust = false;
+            }
+        } else {
+            if (amag_err < 0.15f) {
+                accel_trust = true;
+            }
+        }
+
+        const float inv_a_mag = 1.0f / a_mag;
+
+        ax *= inv_a_mag;
+        ay *= inv_a_mag;
+        az *= inv_a_mag;
     } else {
         ax = 0.0f;
         ay = 0.0f;
         az = 0.0f;
+
+        accel_weight = 0.0f;
+        accel_trust = false;
     }
 
-    float m_mag_raw = vec3_norm(mx, my, mz);
-    // magnitude-based trust (raw)
-    if (m_mag_raw < 1e-6f) {
-        mag_trust = false;
-    } else {
+    /*
+     * -------------------------------------------------------------------------
+     * MAGNETOMETER TRUST
+     * -------------------------------------------------------------------------
+     *
+     * IMPORTANT:
+     * hard-iron / soft-iron calibration should be applied BEFORE this function.
+     */
+
+    const float m_mag_raw =
+        vec3_norm(mx, my, mz);
+
+    float mx_u = 0.0f;
+    float my_u = 0.0f;
+    float mz_u = 0.0f;
+
+    if (m_mag_raw > 1e-6f) {
+
+        /*
+         * Establish field-strength reference once.
+         *
+         * Do not continuously adapt the reference during flight; otherwise
+         * a sustained magnetic disturbance can slowly become "normal".
+         */
         if (!mag_ref_set && accel_trust) {
             mag_ref = m_mag_raw;
             mag_ref_set = true;
             mag_trust = true;
-        } else if (mag_ref_set && accel_trust) {
-            mag_ref = 0.999f*mag_ref + 0.001f*m_mag_raw;
         }
 
         if (mag_ref_set) {
-            float mm_err = fabsf(m_mag_raw - mag_ref) / (mag_ref + 1e-6f);
-            if (mag_trust) { if (mm_err > 0.25f) mag_trust = false; }
-            else           { if (mm_err < 0.15f) mag_trust = true;  }
+            const float mm_err =
+                fabsf(m_mag_raw - mag_ref) /
+                (mag_ref + 1e-6f);
+
+            /*
+             * Hysteresis:
+             * >25% field-strength deviation -> reject
+             * <15% deviation -> allow recovery
+             */
+            if (mag_trust) {
+                if (mm_err > 0.25f) {
+                    mag_trust = false;
+                }
+            } else {
+                if (mm_err < 0.15f) {
+                    mag_trust = true;
+                }
+            }
         } else {
             mag_trust = false;
         }
+
+        const float inv_m =
+            1.0f / m_mag_raw;
+
+        mx_u = mx * inv_m;
+        my_u = my * inv_m;
+        mz_u = mz * inv_m;
+
+    } else {
+        mag_trust = false;
     }
 
+    /*
+     * -------------------------------------------------------------------------
+     * GYROSCOPE PROPAGATION
+     * -------------------------------------------------------------------------
+     */
 
-    // normalize for heading use
+    const float d2r = 0.017453292519943295f;
 
-    float mx_u=0, my_u=0, mz_u=0;
-    if (m_mag_raw > 1e-6f) {
-        mx_u = mx / m_mag_raw;
-        my_u = my/ m_mag_raw;
-        mz_u = mz / m_mag_raw;
-    }
-
-
-    const float d2r = 0.0174532925f;
-    float gx = gx_dps * d2r;
-    float gy = gy_dps * d2r;
-    float gz = gz_dps * d2r;
+    const float gx = gx_dps * d2r;
+    const float gy = gy_dps * d2r;
+    const float gz = gz_dps * d2r;
 
     float q0 = q[0];
     float q1 = q[1];
     float q2 = q[2];
     float q3 = q[3];
 
-    // Quaternion derivative from gyro
-    float qDot0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-    float qDot1 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
-    float qDot2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
-    float qDot3 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
+    float qDot0 =
+        0.5f * (-q1 * gx - q2 * gy - q3 * gz);
 
-    // Added weight to the accelerometer correction based on how close the accel magnitude is to 1g.
-    // Date and rationale: During aggressive maneuvers, the accelerometer can deviate significantly from 1g, leading to incorrect attitude corrections. By reducing the influence of the accelerometer when its magnitude is far from 1g, we can improve the stability and accuracy of the AHRS in dynamic conditions.
-    // Date: 2024-06-15
-    float weight = 1.0f - clampf((amag_err - 0.1f) / 0.15f, 0.0f, 1.0f); 
-    if (weight > 0.001f) {
-        float f1 = 2.0f * (q1 * q3 - q0 * q2) - ax;
-        float f2 = 2.0f * (q0 * q1 + q2 * q3) - ay;
-        float f3 = 2.0f * (0.5f - q1 * q1 - q2 * q2) - az;
+    float qDot1 =
+        0.5f * ( q0 * gx + q2 * gz - q3 * gy);
 
-        // Gradient s = J^T * f
-        float s0 = (-2.0f * q2) * f1 + ( 2.0f * q1) * f2;
-        float s1 = ( 2.0f * q3) * f1 + ( 2.0f * q0) * f2 + (-4.0f * q1) * f3;
-        float s2 = (-2.0f * q0) * f1 + ( 2.0f * q3) * f2 + (-4.0f * q2) * f3;
-        float s3 = ( 2.0f * q1) * f1 + ( 2.0f * q2) * f2;
+    float qDot2 =
+        0.5f * ( q0 * gy - q1 * gz + q3 * gx);
 
-        float s_norm = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
-        if (s_norm > 1e-9f) {
-            // Apply weight to beta to scale the correction strength
-            float beta_eff = beta * weight;
-            
-            float inv_s = 1.0f / s_norm;
-            qDot0 -= beta_eff * (s0 * inv_s);
-            qDot1 -= beta_eff * (s1 * inv_s);
-            qDot2 -= beta_eff * (s2 * inv_s);
-            qDot3 -= beta_eff * (s3 * inv_s);
-        }
-    }
+    float qDot3 =
+        0.5f * ( q0 * gz + q1 * gy - q2 * gx);
+
     /*
-    if (accel_trust) {
-        float f1 = 2.0f * (q1 * q3 - q0 * q2) - ax;
-        float f2 = 2.0f * (q0 * q1 + q2 * q3) - ay;
-        float f3 = 2.0f * (0.5f - q1 * q1 - q2 * q2) - az;
+     * -------------------------------------------------------------------------
+     * MADGWICK ACCELEROMETER CORRECTION
+     * -------------------------------------------------------------------------
+     */
 
-        // Canonical Madgwick IMU gradient: s = J^T * f
-        float s0 = (-2.0f * q2) * f1 + ( 2.0f * q1) * f2;
-        float s1 = ( 2.0f * q3) * f1 + ( 2.0f * q0) * f2 + (-4.0f * q1) * f3;
-        float s2 = (-2.0f * q0) * f1 + ( 2.0f * q3) * f2 + (-4.0f * q2) * f3;
-        float s3 = ( 2.0f * q1) * f1 + ( 2.0f * q2) * f2;
+    if (accel_weight > 0.001f) {
+        /*
+        * Accelerometer vector used by the Madgwick gravity objective.
+        *
+        * IMPORTANT:
+        * This is NOT a sensor-axis or body-frame remapping.
+        *
+        * Calibration and rotation testing established that the physical
+        * sensor axes are already aligned:
+        *
+        *     accel X <-> gyro X <-> body X
+        *     accel Y <-> gyro Y <-> body Y
+        *     accel Z <-> gyro Z <-> body Z
+        *
+        * The quaternion propagation also uses those body axes directly.
+        *
+        * However, testing showed that the horizontal accelerometer
+        * components have the opposite sign from the gravity-vector
+        * convention assumed by the Madgwick objective below.
+        *
+        * Therefore only the vector presented to the gravity correction
+        * is converted:
+        *
+        *     Madgwick X = -Accel X
+        *     Madgwick Y = -Accel Y
+        *     Madgwick Z = +Accel Z
+        *
+        * Z remains positive because the calibrated level orientation
+        * measures approximately [0, 0, +1 g], which matches the
+        * identity-quaternion gravity prediction [0, 0, +1].
+        *
+        * This convention was validated experimentally by comparing
+        * AHRS roll/pitch against gyro body rates and accel-derived
+        * attitude with the original nonzero beta.
+        */
+        const float ax_mad = -ax;
+        const float ay_mad = -ay;
+        const float az_mad =  az;
+        /*
+         * Gravity-vector residual.
+         *
+         * At q = [1, 0, 0, 0]:
+         *
+         *     predicted gravity = [0, 0, +1]
+         */
+        const float f1 =
+            2.0f * (q1 * q3 - q0 * q2) - ax_mad;
 
-        float s_norm = sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        const float f2 =
+            2.0f * (q0 * q1 + q2 * q3) - ay_mad;
+
+        const float f3 =
+            2.0f * (0.5f - q1 * q1 - q2 * q2) - az_mad;
+
+        const float s0 =
+            (-2.0f * q2) * f1 +
+            ( 2.0f * q1) * f2;
+
+        const float s1 =
+            ( 2.0f * q3) * f1 +
+            ( 2.0f * q0) * f2 +
+            (-4.0f * q1) * f3;
+
+        const float s2 =
+            (-2.0f * q0) * f1 +
+            ( 2.0f * q3) * f2 +
+            (-4.0f * q2) * f3;
+
+        const float s3 =
+            ( 2.0f * q1) * f1 +
+            ( 2.0f * q2) * f2;
+
+        const float s_norm =
+            sqrtf(
+                s0 * s0 +
+                s1 * s1 +
+                s2 * s2 +
+                s3 * s3
+            );
+
         if (s_norm > 1e-9f) {
-            s0 /= s_norm;
-            s1 /= s_norm;
-            s2 /= s_norm;
-            s3 /= s_norm;
-            qDot0 -= beta * s0;
-            qDot1 -= beta * s1;
-            qDot2 -= beta * s2;
-            qDot3 -= beta * s3;
+
+            const float beta_eff =
+                beta * accel_weight;
+
+            const float inv_s =
+                1.0f / s_norm;
+
+            qDot0 -= beta_eff * s0 * inv_s;
+            qDot1 -= beta_eff * s1 * inv_s;
+            qDot2 -= beta_eff * s2 * inv_s;
+            qDot3 -= beta_eff * s3 * inv_s;
         }
     }
-    */
 
+    /*
+     * Integrate quaternion.
+     */
     q[0] += qDot0 * dt;
     q[1] += qDot1 * dt;
     q[2] += qDot2 * dt;
     q[3] += qDot3 * dt;
+
     quat_normalize(q);
+
+    /*
+     * -------------------------------------------------------------------------
+     * MAGNETOMETER YAW CORRECTION
+     * -------------------------------------------------------------------------
+     */
 
     if (mag_trust) {
 
-        // 1) roll/pitch from quaternion (rad)
-        float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+        q0 = q[0];
+        q1 = q[1];
+        q2 = q[2];
+        q3 = q[3];
 
-        float sinr_cosp = 2.0f*(q0*q1 + q2*q3);
-        float cosr_cosp = 1.0f - 2.0f*(q1*q1 + q2*q2);
-        float roll = atan2f(sinr_cosp, cosr_cosp);
+        /*
+         * Current roll / pitch from quaternion.
+         */
+        const float sinr_cosp =
+            2.0f * (q0 * q1 + q2 * q3);
 
-        float sinp = 2.0f*(q0*q2 - q3*q1);
-        sinp = clampf(sinp, -1.0f, 1.0f);
-        float pitch = asinf(sinp);
+        const float cosr_cosp =
+            1.0f - 2.0f * (q1 * q1 + q2 * q2);
 
-        // 2) tilt-comp mag (body -> horizontal)
-        float cr = cosf(roll),  sr = sinf(roll);
-        float cp = cosf(pitch), sp = sinf(pitch);
+        const float roll =
+            atan2f(sinr_cosp, cosr_cosp);
 
-        float mxh = mx_u*cp + mz_u*sp;
-        float myh = mx_u*sr*sp + my_u*cr - mz_u*sr*cp;
+        float sinp =
+            2.0f * (q0 * q2 - q3 * q1);
 
-        // 3) yaw from mag (rad)  (may need sign flip depending on your frame)
-        float yaw_mag = atan2f(-myh, mxh);
+        sinp =
+            clampf(sinp, -1.0f, 1.0f);
 
-        // 4) yaw estimate from quaternion (rad)
-        float siny_cosp = 2.0f*(q0*q3 + q1*q2);
-        float cosy_cosp = 1.0f - 2.0f*(q2*q2 + q3*q3);
-        float yaw_est = atan2f(siny_cosp, cosy_cosp);
+        const float pitch =
+            asinf(sinp);
 
-        // 5) innovation (rad!)
-        float yaw_err = wrap_rad(yaw_mag - yaw_est);
+        /*
+         * Tilt compensation.
+         */
+        const float cr = cosf(roll);
+        const float sr = sinf(roll);
+        const float cp = cosf(pitch);
+        const float sp = sinf(pitch);
 
-        // gate
+        const float mxh =
+            mx_u * cp +
+            mz_u * sp;
+
+        const float myh =
+            mx_u * sr * sp +
+            my_u * cr -
+            mz_u * sr * cp;
+
+        /*
+         * Magnetic heading.
+         *
+         * NOTE:
+         * The "-myh" sign must still be confirmed by the final positive-Z
+         * heading test on the assembled quad.
+         */
+        const float yaw_mag =
+            atan2f(-myh, mxh);
+
+        /*
+         * Quaternion yaw estimate.
+         */
+        const float siny_cosp =
+            2.0f * (q0 * q3 + q1 * q2);
+
+        const float cosy_cosp =
+            1.0f - 2.0f * (q2 * q2 + q3 * q3);
+
+        const float yaw_est =
+            atan2f(siny_cosp, cosy_cosp);
+
+        const float yaw_err =
+            wrap_rad(yaw_mag - yaw_est);
+
+        /*
+         * Gross innovation gate.
+         */
         if (fabsf(yaw_err) > 1.0f) {
+
             mag_trust = false;
+
         } else {
-            // Changing this from 2.5 to 0.1-0.5 to reduce YAW elasticity
-            /* Date: 2024-06-15
-             * Rationale: The original gain of 2.5 was found to cause excessive yaw corrections, leading to a "rubber band" effect where the drone would overcompensate for heading errors. By reducing the gain to a range of 0.1-0.5, we can achieve a more stable and responsive yaw control, improving overall flight performance and user experience.
+
+            /*
+             * Reduced heading correction gain to avoid yaw "rubber banding".
              */
             const float K0 = 0.5f;
-            float yaw_rate = fabsf(gz);                // rad/s
-            float K = K0 / (1.0f + 2.0f*yaw_rate);
 
-            float delta = K * yaw_err * dt;
-            delta = clampf(delta, -0.05f, 0.05f);
+            const float yaw_rate =
+                fabsf(gz);
 
-            float half = 0.5f * delta;
-            float qcorr[4] = { cosf(half), 0.0f, 0.0f, sinf(half) };
+            const float K =
+                K0 /
+                (1.0f + 2.0f * yaw_rate);
+
+            float delta =
+                K * yaw_err * dt;
+
+            delta =
+                clampf(
+                    delta,
+                    -0.05f,
+                    0.05f
+                );
+
+            const float half =
+                0.5f * delta;
+
+            const float qcorr[4] = {
+                cosf(half),
+                0.0f,
+                0.0f,
+                sinf(half)
+            };
 
             float qnew[4];
-            quat_mul(qcorr, q, qnew);
-            q[0]=qnew[0]; q[1]=qnew[1]; q[2]=qnew[2]; q[3]=qnew[3];
+
+            quat_mul(
+                qcorr,
+                q,
+                qnew
+            );
+
+            q[0] = qnew[0];
+            q[1] = qnew[1];
+            q[2] = qnew[2];
+            q[3] = qnew[3];
+
             quat_normalize(q);
         }
     }
 
-    float yaw_deg = 0.0f;
-    float dummy_roll = 0.0f, dummy_pitch = 0.0f;
-    quat_to_euler_deg(q, &dummy_roll, &dummy_pitch, &yaw_deg);
+    /*
+     * -------------------------------------------------------------------------
+     * OUTPUT STATE
+     * -------------------------------------------------------------------------
+     */
 
-    // Build roll/pitch from predicted gravity in body frame using the same
-    // convention as legacy accel equations:
-    // accel_roll  = atan2(-ay, az)
-    // accel_pitch = atan2(ax, sqrt(ay^2 + az^2))
-    float ax_pred = 2.0f * (q[1] * q[3] - q[0] * q[2]);
-    float ay_pred = 2.0f * (q[0] * q[1] + q[2] * q[3]);
-    float az_pred = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
-    const float r2d = 57.2957795f;
-    float roll_deg  = atan2f(-ax_pred, sqrtf(ay_pred * ay_pred + az_pred * az_pred)) * r2d;
-    float pitch_deg = atan2f( ay_pred, az_pred) * r2d;
+    float roll_deg;
+    float pitch_deg;
+    float yaw_deg;
+
+    quat_to_euler_deg(
+        q,
+        &roll_deg,
+        &pitch_deg,
+        &yaw_deg
+    );
 
     state->roll  = roll_deg;
     state->pitch = pitch_deg;
@@ -333,12 +670,17 @@ void AHRS_Update(ahrsSensor_t* raw, vehicleState_t* state, float dt)
     state->q2 = q[2];
     state->q3 = q[3];
 
+    /*
+     * Store angular velocity in radians/sec.
+     */
     state->gyro_x = gx;
     state->gyro_y = gy;
     state->gyro_z = gz;
 
-    state->roll_rate  = gy_dps;
-    state->pitch_rate = gx_dps;
+    /*
+     * Controller-facing body rates remain degrees/sec.
+     */
+    state->roll_rate  = gx_dps;
+    state->pitch_rate = gy_dps;
     state->yaw_rate   = gz_dps;
 }
-

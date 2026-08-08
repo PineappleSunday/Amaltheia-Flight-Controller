@@ -12,3 +12,10 @@ const AccelCalibration g_lsm303agr_accel_cal = {
 		1016.0f
 	}
 };
+
+GyroCalibration g_gyro_calibration = {
+	.gx_bias_dps = 0.0f,
+	.gy_bias_dps = 0.0f,
+	.gz_bias_dps = 0.0f,
+	.valid = false
+};

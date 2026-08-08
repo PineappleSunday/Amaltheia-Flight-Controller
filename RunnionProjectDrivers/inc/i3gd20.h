@@ -14,6 +14,7 @@ typedef struct {
     int16_t gx_offset; /* zero-rate offset for gx */
     int16_t gy_offset; /* zero-rate offset for gy */
     int16_t gz_offset; /* zero-rate offset for gz */
+    uint8_t raw[6];    /* last raw OUT_X..OUT_Z register bytes */
     uint8_t who_am_i;  /* last WHO_AM_I value observed during init */
     uint8_t ctrl_reg1; /* last CTRL_REG1 readback */
     uint8_t ctrl_reg4; /* last CTRL_REG4 readback */

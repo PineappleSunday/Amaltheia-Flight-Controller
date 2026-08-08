@@ -187,6 +187,9 @@ bool I3GD20_ReadGyro(I3GD20* dev, I3GD20_Raw* out)
         printf("I3GD20: Failed to read OUT_X..OUT_Z\r\n");
         return false;
     }
+    for (uint8_t i = 0; i < 6u; i++) {
+        dev->raw[i] = buf[i];
+    }
     
     // DEBUG: Print raw values occasionally so we can see if bytes change
     /*
