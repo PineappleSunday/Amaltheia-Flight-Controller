@@ -20,7 +20,7 @@ typedef struct {
 // Override with compiler define, e.g.:
 // -DMIXER_DEFAULT_FRAME_TYPE=MIXER_FRAME_X
 #ifndef MIXER_DEFAULT_FRAME_TYPE
-#define MIXER_DEFAULT_FRAME_TYPE MIXER_FRAME_X
+#define MIXER_DEFAULT_FRAME_TYPE MIXER_FRAME_PLUS
 #endif
 
 void Mixer_ResetMotorScales(void);

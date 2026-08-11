@@ -38,6 +38,30 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneSt
 	pid_pos_z.cycle_time_seconds = dt;
 	pid_vel_z.cycle_time_seconds = dt;
 
+	/*
+	* Convert estimator frame to operational aircraft frame.
+	*
+	* AHRS:
+	*   +X -> M3
+	*   +Y -> M4
+	*
+	* Aircraft:
+	*   +X -> M1 (front)
+	*   +Y -> M2 (right)
+	*
+	* 180 deg rotation about Z:
+	*   X_aircraft = -X_ahrs
+	*   Y_aircraft = -Y_ahrs
+	*   Z_aircraft = +Z_ahrs
+	*/
+	const float aircraft_roll       = -state->roll;
+	const float aircraft_pitch      = -state->pitch;
+
+	const float aircraft_roll_rate  = -state->roll_rate;
+	const float aircraft_pitch_rate = -state->pitch_rate;
+
+	const float aircraft_yaw_rate   =  state->yaw_rate;
+
 	// 1. ALTITUDE CONTROL (Cascaded)
 	float corr_vel_z = PID_Calculate(&pid_pos_z, state->z, target->z); // Setpoint last
 	float target_vz  = corr_vel_z + target->ff_vz;
@@ -48,8 +72,19 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneSt
 
 	// 2. ATTITUDE OUTER LOOP (Angle -> Rate)
 	// We wrap the Yaw error to ensure we take the shortest path
-	target->rate_roll  = PID_Calculate(&pid_roll_angle,  state->roll,  target->roll);
-	target->rate_pitch = PID_Calculate(&pid_pitch_angle, state->pitch, target->pitch);
+	target->rate_roll =
+		PID_Calculate(
+			&pid_roll_angle,
+			aircraft_roll,
+			target->roll
+		);
+
+	target->rate_pitch =
+		PID_Calculate(
+			&pid_pitch_angle,
+			aircraft_pitch,
+			target->pitch
+		);
 
 	if (target->yaw_hold_enabled) {
 		float yaw_err = wrap_deg(target->yaw - state->yaw);
@@ -61,9 +96,26 @@ uint8_t FlightLogic_Update(vehicleState_t* state, targetState_t* target, droneSt
 	// 3. ATTITUDE INNER LOOP (Rate -> Torque)
 	// We compare the Desired Rate to the RAW Gyro data (state->roll_rate / pitch_rate / yaw_rate)
 	// Note: Use the 'rate' variables from your state struct
-	float roll_torque  = PID_Calculate(&pid_roll_rate,  state->roll_rate,  target->rate_roll);
-	float pitch_torque = PID_Calculate(&pid_pitch_rate, state->pitch_rate, target->rate_pitch);
-	float yaw_torque   = PID_Calculate(&pid_yaw_rate,   state->yaw_rate,   target->rate_yaw);
+	float roll_torque =
+    PID_Calculate(
+        &pid_roll_rate,
+        aircraft_roll_rate,
+        target->rate_roll
+    );
+
+	float pitch_torque =
+		PID_Calculate(
+			&pid_pitch_rate,
+			aircraft_pitch_rate,
+			target->rate_pitch
+		);
+
+	float yaw_torque =
+		PID_Calculate(
+			&pid_yaw_rate,
+			aircraft_yaw_rate,
+			target->rate_yaw
+		);
 
 	// 4. MOTOR MIXING (frame selected inside mixer config)
 	float motor_pcts[4];

@@ -6,6 +6,24 @@
 #define MOTOR_SCALE_MIN 0.1f
 #define MOTOR_SCALE_MAX 3.0f
 
+/*
+ * PLUS AIRCRAFT CONFIGURATION
+ *
+ * Operational aircraft frame:
+ *
+ *            M1 Front (+X)
+ *
+ * M4 Left (-Y)        M2 Right (+Y)
+ *
+ *            M3 Rear (-X)
+ *
+ * Inputs roll/pitch/yaw are aircraft-frame torque commands,
+ * NOT raw AHRS/FC-frame quantities.
+ *
+ * +Roll  -> M4 increase / M2 decrease
+ * +Pitch -> M1 increase / M3 decrease
+ */
+
 static float g_motor_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 static MixerConfig g_mixer_config = {
 	.frame_type = MIXER_DEFAULT_FRAME_TYPE

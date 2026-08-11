@@ -5,6 +5,7 @@
 #include <math.h>
 #include <string.h>
 
+#define VCP_TX_ENABLE        1U  // DEVELOPMENT ONLY: disables USB VCP telemetry transmit.
 #define VCP_DUMP_ENABLE      1U
 #define VCP_DUMP_PERIOD_MS   10U
 #define VCP_DUMP_HEADER      0x31504356UL  // "VCP1"
@@ -12,6 +13,7 @@
 #define VCP_BIT_HEADER       0x31424356UL  // "VCB1"
 #define VCP_DUMP_FOOTER      0xABU
 
+#if VCP_TX_ENABLE
 typedef struct __attribute__((packed)) {
 	uint32_t header;
 	uint32_t tick_ms;
@@ -97,19 +99,24 @@ typedef struct __attribute__((packed)) {
 	uint8_t gyro_ctrl_reg4;
 	uint8_t magic_footer;
 } VCPBitPacket_t;
+#endif
 
 _Static_assert(sizeof(Telemetry_Packet_t) == 80, "Telemetry Struct size mismatch!");
+#if VCP_TX_ENABLE
 _Static_assert(sizeof(VCPDumpPacket_t) == 291, "VCP dump packet size mismatch!");
 _Static_assert(sizeof(VCPEngineerPacket_t) == 91, "VCP engineer packet size mismatch!");
 _Static_assert(sizeof(VCPBitPacket_t) == 32, "VCP BIT packet size mismatch!");
+#endif
 
 Telemetry_Packet_t telem_data;
 
+#if VCP_TX_ENABLE
 static VCPDumpPacket_t vcp_dump_packet;
 static VCPEngineerPacket_t vcp_engineer_packet;
 static VCPBitPacket_t vcp_bit_packet;
 static uint16_t vcp_dump_sequence = 0;
 static uint32_t vcp_last_tx_ms = 0;
+#endif
 
 static uint8_t sensor_raw_accel_bytes[6];
 static uint8_t sensor_raw_mag_bytes[6];
@@ -133,10 +140,12 @@ static int16_t lsm303_accel_raw_count(const uint8_t raw[6], uint8_t axis)
 	return (int16_t)(little_endian_i16(raw[(uint8_t)(axis * 2u)], raw[(uint8_t)(axis * 2u + 1u)]) >> 4);
 }
 
+#if VCP_TX_ENABLE
 static uint32_t telemetry_micros(uint32_t now_ms)
 {
 	return now_ms * 1000u;
 }
+#endif
 
 void Telemetry_UpdateGPSStatus(bool gps_ready, bool gps_fix_valid)
 {
@@ -245,6 +254,7 @@ void Telemetry_RecordGyroRaw(const uint8_t raw[6])
 
 void Telemetry_VCP_SendBIT(uint32_t now_ms, const TelemetryVCPContext* ctx)
 {
+#if VCP_TX_ENABLE
 	const LSM303* imu = (ctx != 0) ? ctx->imu : 0;
 	const I3GD20* gyro = (ctx != 0) ? ctx->gyro : 0;
 
@@ -272,8 +282,13 @@ void Telemetry_VCP_SendBIT(uint32_t now_ms, const TelemetryVCPContext* ctx)
 	vcp_bit_packet.magic_footer = VCP_DUMP_FOOTER;
 
 	(void)CDC_Transmit_FS((uint8_t*)&vcp_bit_packet, (uint16_t)sizeof(vcp_bit_packet));
+#else
+	(void)now_ms;
+	(void)ctx;
+#endif
 }
 
+#if VCP_TX_ENABLE
 static void vcp_engineer_fill_and_send(uint32_t now_ms, const TelemetryVCPContext* ctx)
 {
 	const vehicleState_t* state = (ctx != 0) ? ctx->state : 0;
@@ -309,9 +324,11 @@ static void vcp_engineer_fill_and_send(uint32_t now_ms, const TelemetryVCPContex
 
 	(void)CDC_Transmit_FS((uint8_t*)&vcp_engineer_packet, (uint16_t)sizeof(vcp_engineer_packet));
 }
+#endif
 
 void Telemetry_VCP_TrySend(uint32_t now_ms, const TelemetryVCPContext* ctx)
 {
+#if VCP_TX_ENABLE
 #if VCP_DUMP_ENABLE
 	if ((now_ms - vcp_last_tx_ms) < VCP_DUMP_PERIOD_MS) {
 		return;
@@ -438,5 +455,9 @@ void Telemetry_VCP_TrySend(uint32_t now_ms, const TelemetryVCPContext* ctx)
 	vcp_dump_packet.magic_footer = VCP_DUMP_FOOTER;
 
 	(void)CDC_Transmit_FS((uint8_t*)&vcp_dump_packet, (uint16_t)sizeof(vcp_dump_packet));
+#endif
+#else
+	(void)now_ms;
+	(void)ctx;
 #endif
 }

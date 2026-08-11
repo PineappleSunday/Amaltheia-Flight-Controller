@@ -3,14 +3,19 @@
 #include <math.h>
 
 /*
- * Frame convention established by calibration:
+ * FC / AHRS estimator frame established by calibration:
  *
- *   Body +X = FC +X = Accel X = Gyro X = Mag X = toward M3
- *   Body +Y = FC +Y = Accel Y = Gyro Y = Mag Y = toward M4
- *   Body +Z = FC +Z = Accel Z = Gyro Z = Mag Z
+ *   AHRS +X = FC +X = Accel X = Gyro X = Mag X = toward M3
+ *   AHRS +Y = FC +Y = Accel Y = Gyro Y = Mag Y = toward M4
+ *   AHRS +Z = FC +Z = Accel Z = Gyro Z = Mag Z
  *
- * No X/Y/Z remapping is performed inside the AHRS.
- * Sensor calibration and PCB/body transformation should occur upstream.
+ * The operational aircraft frame is rotated 180 deg about +Z:
+ *
+ *   Aircraft +X = toward M1 (nose)
+ *   Aircraft +Y = toward M2 (right)
+ *
+ * AHRS remains in the calibrated FC frame. Conversion to the aircraft
+ * control frame occurs downstream before flight-control PID calculations.
  */
 
 static bool accel_trust = true;
@@ -88,6 +93,7 @@ static void quat_normalize(float *qv)
     qv[3] *= inv_n;
 }
 
+// Quaternion multiplication: out = a * b
 static void quat_mul(
     const float a[4],
     const float b[4],

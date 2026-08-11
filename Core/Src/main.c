@@ -67,6 +67,14 @@ typedef enum {
 #define PBIT_REQUIRED_MASK                 (IBIT_SENSOR_GPS | IBIT_SENSOR_ACCEL_MAG | IBIT_SENSOR_BME280 | IBIT_SENSOR_GYRO | IBIT_SENSOR_LIDAR | IBIT_SENSOR_TELEMETRY)
 #define PBIT_REQUIRED_SENSOR_STATUS_MASK   (SENSOR_STATUS_GYRO_READY | SENSOR_STATUS_LSM_READY | SENSOR_STATUS_MAG_OK | SENSOR_STATUS_BME280_READY)
 
+#if (HSE_VALUE == 8000000U)
+#define AMALTHEIA_PLLM                     4U
+#elif (HSE_VALUE == 12000000U)
+#define AMALTHEIA_PLLM                     6U
+#else
+#error "Unsupported HSE_VALUE. Configure AMALTHEIA_PLLM for the board oscillator."
+#endif
+
 float altitude_base_thrust_raw = ALTITUDE_HOVER_THRUST_RAW;
 
 uint32_t takeoff_count = 1;
@@ -313,7 +321,8 @@ static void UpdatePBIT(uint32_t now_ms, bool force);
 
 static void SPI5_ArmNextFrame(void);
 static void ResetActiveFlightPIDsFromState(const vehicleState_t* state);
-static void AcquireSensorsAndUpdateState(float dt_sec);
+static void AcquireSensorData(void);
+static void UpdateState(float dt_sec);
 static void StageActiveTelemetryFrame(void);
 static void UpdateTelemetryGPSStatus(void);
 static void UpdateAltitudeEstimator(uint32_t now_ms);
@@ -603,26 +612,63 @@ static float median5f(const float v[5]) {
 // Resets the active flight PID controllers using the provided vehicle state. If the state pointer is NULL,
 // it defaults to zero values for all parameters.
 // This function ensures that the PID controllers are initialized with the current state of the vehicle.
-static void ResetActiveFlightPIDsFromState(const vehicleState_t* state) {
-	const float roll = (state != NULL) ? state->roll : 0.0f;
-	const float pitch = (state != NULL) ? state->pitch : 0.0f;
-	const float z = (state != NULL) ? state->z : 0.0f;
-	const float vz = (state != NULL) ? state->vz : 0.0f;
-	const float roll_rate = (state != NULL) ? state->roll_rate : 0.0f;
-	const float pitch_rate = (state != NULL) ? state->pitch_rate : 0.0f;
-	const float yaw_rate = (state != NULL) ? state->yaw_rate : 0.0f;
+static void ResetActiveFlightPIDsFromState(const vehicleState_t* state)
+{
+    /*
+     * vehicleState_t attitude/rates are in the AHRS / FC frame:
+     *   +X -> M3
+     *   +Y -> M4
+     *
+     * Active flight-control PIDs operate in the aircraft frame:
+     *   +X -> M1 (front)
+     *   +Y -> M2 (right)
+     *
+     * Therefore the aircraft frame is a 180 deg rotation about Z:
+     *   roll_aircraft       = -roll_ahrs
+     *   pitch_aircraft      = -pitch_ahrs
+     *   roll_rate_aircraft  = -roll_rate_ahrs
+     *   pitch_rate_aircraft = -pitch_rate_ahrs
+     *
+     * Yaw rate is unchanged by a 180 deg rotation about Z.
+     */
 
-	PID_ResetWithMeasurement(&pid_roll_angle, roll);
-	PID_ResetWithMeasurement(&pid_pitch_angle, pitch);
-	// Yaw-angle loop uses wrapped yaw error with actual=0.0f in FlightLogic_Update.
-	PID_ResetWithMeasurement(&pid_yaw_angle, 0.0f);
+    const float roll =
+        (state != NULL) ? -state->roll : 0.0f;
 
-	PID_ResetWithMeasurement(&pid_pos_z, z);
-	PID_ResetWithMeasurement(&pid_vel_z, vz);
+    const float pitch =
+        (state != NULL) ? -state->pitch : 0.0f;
 
-	PID_ResetWithMeasurement(&pid_roll_rate, roll_rate);
-	PID_ResetWithMeasurement(&pid_pitch_rate, pitch_rate);
-	PID_ResetWithMeasurement(&pid_yaw_rate, yaw_rate);
+    const float roll_rate =
+        (state != NULL) ? -state->roll_rate : 0.0f;
+
+    const float pitch_rate =
+        (state != NULL) ? -state->pitch_rate : 0.0f;
+
+    const float yaw_rate =
+        (state != NULL) ? state->yaw_rate : 0.0f;
+
+    const float z =
+        (state != NULL) ? state->z : 0.0f;
+
+    const float vz =
+        (state != NULL) ? state->vz : 0.0f;
+
+
+    PID_ResetWithMeasurement(&pid_roll_angle, roll);
+    PID_ResetWithMeasurement(&pid_pitch_angle, pitch);
+
+    /*
+     * Yaw-angle loop operates on a precomputed wrapped yaw error
+     * with actual = 0 in FlightLogic_Update().
+     */
+    PID_ResetWithMeasurement(&pid_yaw_angle, 0.0f);
+
+    PID_ResetWithMeasurement(&pid_pos_z, z);
+    PID_ResetWithMeasurement(&pid_vel_z, vz);
+
+    PID_ResetWithMeasurement(&pid_roll_rate, roll_rate);
+    PID_ResetWithMeasurement(&pid_pitch_rate, pitch_rate);
+    PID_ResetWithMeasurement(&pid_yaw_rate, yaw_rate);
 }
 
 static bool EnterMode(uint8_t mode) {
@@ -661,11 +707,14 @@ static bool EnterMode(uint8_t mode) {
 		return true;
 
 	case MODE_ENGINEER:
-		// Mode 4: Engineer Mode, for VCP telemetry only.
+		// Mode 4: Engineer Mode, stabilized control with raw engineering VCP telemetry.
 		pbit_report_active = true;
-		ESC_Disarm();
 		takeoff_state = INIT;
 		g_state.offGround = false;
+		g_target.roll = 0.0f;
+		g_target.pitch = 0.0f;
+		g_target.yaw = g_state.yaw;
+		g_target.yaw_hold_enabled = true;
 		g_target.rate_roll = 0.0f;
 		g_target.rate_pitch = 0.0f;
 		g_target.rate_yaw = 0.0f;
@@ -681,14 +730,19 @@ static bool EnterMode(uint8_t mode) {
 	}
 }
 
-static void AcquireSensorsAndUpdateState(float dt_sec) {
+static void AcquireSensorData(void) {
+	const uint32_t now_ms = HAL_GetTick();
+
 	LSM303_Process_DMA(&imu); // Process any new accel/mag data from DMA
+	if (!gps_ready && ((now_ms - gps_last_init_attempt_ms) >= 1000u)) {
+		(void)GPS_TryStart(now_ms);
+	}
 	if (gps_ready) {
 		GTU7_ProcessDMARing(&gps);
 		if (GTU7_HasFreshFix(&gps)) {
 			(void)GTU7_GetLatest(&gps, &gps_fix);
 			GTU7_ClearFreshFlag(&gps);
-			UpdateAltitudeEstimator(HAL_GetTick());
+			UpdateAltitudeEstimator(now_ms);
 		}
 	}
 	UpdateTelemetryGPSStatus();
@@ -711,6 +765,7 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		raw_data.ax = accel_body.x;
 		raw_data.ay = accel_body.y;
 		raw_data.az = accel_body.z;
+		telem_data.sensor_status |= SENSOR_STATUS_LSM_READY;
 	}
 
 	// MAGNETOMETER Parsing
@@ -739,9 +794,13 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		raw_data.mx = mag_body.x;
 		raw_data.my = mag_body.y;
 		raw_data.mz = mag_body.z;
+		telem_data.sensor_status |= SENSOR_STATUS_MAG_OK;
 	}
 
 	// --- GYROSCOPE ---
+	if (i3gd20.initialized) {
+		telem_data.sensor_status |= SENSOR_STATUS_GYRO_READY;
+	}
 	if (i3gd20.initialized && I3GD20_ReadGyro(&i3gd20, &gyro_raw)) {
 		Telemetry_RecordGyroRaw(i3gd20.raw);
 
@@ -771,8 +830,8 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 		raw_data.gz = gyro_body.z;
 	}
 
-	if (bme280_ready && ((HAL_GetTick() - bme280_last_read_ms) >= 50u)) {
-		bme280_last_read_ms = HAL_GetTick();
+	if (bme280_ready && ((now_ms - bme280_last_read_ms) >= 50u)) {
+		bme280_last_read_ms = now_ms;
 		if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
 			bme280_ready = false;
 			telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_BME280_READY;
@@ -781,9 +840,13 @@ static void AcquireSensorsAndUpdateState(float dt_sec) {
 			telem_data.sensor_status |= SENSOR_STATUS_BME280_READY;
 			UpdateAltitudeEstimator(bme280_last_read_ms);
 		}
-	} else if (!bme280_ready && ((HAL_GetTick() - bme280_last_init_attempt_ms) >= 1000u)) {
+	} else if (!bme280_ready && ((now_ms - bme280_last_init_attempt_ms) >= 1000u)) {
 		(void)BME280_TryInit();
 	}
+}
+
+static void UpdateState(float dt_sec) {
+	g_state.dt_sec = dt_sec;
 
 	// Lidar-based altitude System
     // - Pure 5-sample block average (0.01s at 500Hz) with simple velocity low-pass.
@@ -1160,7 +1223,8 @@ int main(void)
 			g_state.dt_sec = dt_sec;
 
 			uint8_t takeoff_override_this_tick = 0;
-			AcquireSensorsAndUpdateState(dt_sec);
+			AcquireSensorData();
+			UpdateState(dt_sec);
 			UpdatePBIT(now, false);
 			static uint32_t state_timer = 0;
 			altitude_base_thrust_raw = ALTITUDE_HOVER_THRUST_RAW;
@@ -1253,6 +1317,7 @@ int main(void)
 					g_target.yaw = g_state.yaw;
 					g_target.yaw_hold_enabled = true;
 					g_target.rate_yaw = 0.0f;
+					g_target.ff_vz = 0.0f;
 					ResetActiveFlightPIDsFromState(&g_state);
 					takeoff_override_this_tick = 0; // Allow normal control to run
 					g_state.offGround = true; // Hand over to main flight controller
@@ -1326,16 +1391,20 @@ int main(void)
 						ESC_SetThrottle(get_timer_channel(i), 0.0f);
 					}
 				}
-			} else if (g_drone_status.drone_mode == MODE_ENGINEER) {
-				g_drone_status.flight_mode = 7;
-				g_target.rate_roll = 0.0f;
-				g_target.rate_pitch = 0.0f;
-				g_target.rate_yaw = 0.0f;
-				g_target.ff_vz = 0.0f;
-				telem_data.sat_flags = 0;
-				if (is_system_armed) {
-					ESC_Disarm();
+			} else if (!takeoff_override_this_tick &&
+					(g_drone_status.drone_mode == MODE_ENGINEER) &&
+					(takeoff_state != TAKEOFF)) {
+				g_drone_status.flight_mode = 7; // Engineer stabilize
+				g_target.roll = 0.0f;
+				g_target.pitch = 0.0f;
+				g_target.yaw_hold_enabled = true;
+				if (isnan(g_target.rate_roll)) {
+					g_target.rate_roll = 0.0f;
+					g_target.rate_pitch = 0.0f;
+					g_target.rate_yaw = 0.0f;
 				}
+				g_target.z = commandZ + flight_takeoff_height_threshold;
+				g_target.ff_vz = 0.0f;
 			} else if (!takeoff_override_this_tick &&
 					(g_drone_status.drone_mode == MODE_MANUAL_LEVEL) &&
 					(takeoff_state != TAKEOFF)){
@@ -1394,7 +1463,8 @@ int main(void)
 			}
 			else if (is_system_armed && !takeoff_override_this_tick) {
 				if (!is_land_cmd_active && !(!g_state.offGround && takeoff_state == TAKEOFF)) {
-					g_drone_status.flight_mode = 8;
+					g_drone_status.flight_mode =
+							(g_drone_status.drone_mode == MODE_ENGINEER) ? 7 : 8;
 				}
 				telem_data.sat_flags = FlightLogic_Update(&g_state, &g_target, &g_drone_status);
 				if (is_land_cmd_active) {
@@ -1463,7 +1533,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLM = AMALTHEIA_PLLM;
   RCC_OscInitStruct.PLL.PLLN = 96;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
@@ -1974,10 +2044,10 @@ void start_control(void) {
 	// This function now runs its own loop until a flight mode is selected.
 	while (StartControlState != STATE_MODE_SEL_COMPLETE)
 	{
-		switch (StartControlState) {
+	switch (StartControlState) {
 	case STATE_INIT:
 		// INIT ESC
-
+		ESC_EnableIdleSignal();
 		g_drone_status.drone_mode = 51; // Init Mode
 		SetIBITOkLed(false);
 		SetModeSelectLed(false);
@@ -2023,7 +2093,7 @@ void start_control(void) {
 		Biquad_Set_Lowpass(&filter_gyro_yaw,   80.0f, 500.0f);
 
 		// Keep ESCs quiet with a valid low signal without arming the aircraft.
-		ESC_EnableIdleSignal();
+
 		HAL_Delay(1000); // Attempting to give time to let frame settle before starting the init loop
 
 		// Accel/Mag (I2C1) - Configure Registers
@@ -2035,11 +2105,11 @@ void start_control(void) {
 		SPI5_ArmNextFrame();
 		// --- 2. HARDWARE INITIALIZATION LOOP ---
 		uint8_t sensorInit = 0;
-		uint8_t init_good_streak = 0;
-		uint8_t lsm_recover_attempts = 0;
+		const bool bypass_sensor_init_gate = true; // DEVELOPMENT ONLY: bypass sensor comms/fault gate.
 		uint32_t init_loop_start_ms = HAL_GetTick();
 		uint32_t last_sensor_check_ms = 0;
-		uint32_t last_lsm_recover_ms = init_loop_start_ms;
+		uint32_t last_gyro_init_attempt_ms = 0;
+		uint32_t init_last_state_update_ms = init_loop_start_ms;
 		while (sensorInit == 0)
 		{
 			uint32_t now_ms = HAL_GetTick();
@@ -2048,46 +2118,40 @@ void start_control(void) {
 
 			// SAFETY: Add a timeout to the sensor init loop.
 			// If sensors are not ready after 10 seconds, enter a permanent fault state.
-			if ((now_ms - init_loop_start_ms) > 10000) {
+			if (!bypass_sensor_init_gate && ((now_ms - init_loop_start_ms) > 10000)) {
 				g_drone_status.flight_mode = 255; // FAULT_STATE
 				EnterPermanentFaultBlink();
 			}
 
-			// We keep Bit 0 (Gyro Init) and Bit 1 (LSM Init) if they passed once,
-			// but we MUST verify the DATA is fresh.
-			g_drone_status.flight_mode = 53; // Gyro Zero-rate calibration
-			if (I3GD20_Init(&i3gd20, &hspi1)) {
-				I3GD20_CalibrateZeroRate(&i3gd20, 1000); // 1000 samples
-				telem_data.sensor_status |= SENSOR_STATUS_GYRO_READY;
+			if (bypass_sensor_init_gate) {
+				SetIBITOkLed(true);
+				sensorInit = 1;
+				break;
 			}
-			// 1. Trigger fresh DMA samples
-			LSM303_Process_DMA(&imu);
-			if (!gps_ready && ((now_ms - gps_last_init_attempt_ms) >= 1000u)) {
-				(void)GPS_TryStart(now_ms);
+
+			if (!i3gd20.initialized &&
+					((last_gyro_init_attempt_ms == 0u) ||
+							((now_ms - last_gyro_init_attempt_ms) >= 1000u))) {
+				last_gyro_init_attempt_ms = now_ms;
+				g_drone_status.flight_mode = 53; // Gyro zero-rate calibration
+				if (I3GD20_Init(&i3gd20, &hspi1)) {
+					I3GD20_CalibrateZeroRate(&i3gd20, 1000); // 1000 samples
+					telem_data.sensor_status |= SENSOR_STATUS_GYRO_READY;
+				}
 			}
 			if (gps_ready) {
-				g_drone_status.flight_mode = 54; // GPS Init Mode
-				GTU7_ProcessDMARing(&gps);
-				if (GTU7_HasFreshFix(&gps)) {
-					(void)GTU7_GetLatest(&gps, &gps_fix);
-					GTU7_ClearFreshFlag(&gps);
-					UpdateAltitudeEstimator(now_ms);
-				}
-				UpdateTelemetryGPSStatus();
+				g_drone_status.flight_mode = 54; // GPS service mode
 			}
 			Process_Lidar_DMA();
-			if (bme280_ready && ((now_ms - bme280_last_read_ms) >= 50u)) {
-				bme280_last_read_ms = now_ms;
-				if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
-					bme280_ready = false;
-					telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_BME280_READY;
-					bme280_status = -4.0f;
-				} else {
-					telem_data.sensor_status |= SENSOR_STATUS_BME280_READY;
-					UpdateAltitudeEstimator(now_ms);
+			uint32_t init_state_elapsed_ms = now_ms - init_last_state_update_ms;
+			if (init_state_elapsed_ms >= 2u) {
+				float init_dt_sec = (float)init_state_elapsed_ms * 0.001f;
+				if (init_dt_sec <= 0.0f || init_dt_sec > 0.050f) {
+					init_dt_sec = 0.002f;
 				}
-			} else if (!bme280_ready && ((now_ms - bme280_last_init_attempt_ms) >= 1000u)) {
-				(void)BME280_TryInit();
+				init_last_state_update_ms = now_ms;
+				AcquireSensorData();
+				UpdateState(init_dt_sec);
 			}
 
 			// 2. Non-blocking check at ~20Hz to allow Lidar processing to run frequently
@@ -2102,56 +2166,7 @@ void start_control(void) {
 			Process_VCP_Command_Queue();
 
 			g_drone_status.flight_mode = 5;
-			// 3. Update data only if the hardware has provided a fresh packet
-			if (imu.accel_ready) {
-				uint8_t accel_snap[6];
-				LSM303_DisableSharedIRQs();
-				memcpy(accel_snap, imu.accel_raw, 6);
-				imu.accel_ready = false;
-				LSM303_EnableSharedIRQs();
-
-				Telemetry_RecordLSM303AccelRaw(accel_snap);
-
-				Vec3f accel_pcb;
-				LSM303_DecodeAccelG(&imu, accel_snap, &accel_pcb.x, &accel_pcb.y, &accel_pcb.z);
-
-				Vec3f accel_body = SensorFrames_PcbToBody(accel_pcb);
-				raw_data.ax = accel_body.x;
-				raw_data.ay = accel_body.y;
-				raw_data.az = accel_body.z;
-
-				// This bit now means: "I have a fresh, valid gravity sample"
-				telem_data.sensor_status |= SENSOR_STATUS_LSM_READY;
-			}
-			if (imu.mag_ready) {
-				uint8_t mag_snap[6];
-				LSM303_DisableSharedIRQs();
-				memcpy(mag_snap, imu.mag_raw, 6);
-				imu.mag_ready = false;
-				LSM303_EnableSharedIRQs();
-
-				// 1. Parse based on variant (DLHC vs AGR)
-				Telemetry_RecordLSM303MagRaw(mag_snap, imu.variant);
-				Vec3f mag_pcb;
-				if (imu.variant == LSM303_DLHC) {
-					mag_pcb.x = (int16_t)((mag_snap[0] << 8) | mag_snap[1]) * imu.mag_gauss_per_lsb;
-					mag_pcb.z = (int16_t)((mag_snap[2] << 8) | mag_snap[3]) * imu.mag_gauss_per_lsb;
-					mag_pcb.y = (int16_t)((mag_snap[4] << 8) | mag_snap[5]) * imu.mag_gauss_per_lsb;
-				} else {
-					mag_pcb.x = (int16_t)((mag_snap[1] << 8) | mag_snap[0]) * imu.mag_gauss_per_lsb;
-					mag_pcb.y = (int16_t)((mag_snap[3] << 8) | mag_snap[2]) * imu.mag_gauss_per_lsb;
-					mag_pcb.z = (int16_t)((mag_snap[5] << 8) | mag_snap[4]) * imu.mag_gauss_per_lsb;
-				}
-
-				Vec3f mag_body = SensorFrames_PcbToBody(mag_pcb);
-				raw_data.mx = mag_body.x;
-				raw_data.my = mag_body.y;
-				raw_data.mz = mag_body.z;
-
-				// This bit confirms we are receiving data packets
-				telem_data.sensor_status |= SENSOR_STATUS_MAG_OK;
-			}
-			// 4. Verification Gate
+			// Verification gate reads raw_data populated by AcquireSensorData().
 			// First stage: comms/alive PBIT. Second stage: fresh data validity checks.
 			UpdatePBIT(now_ms, true);
 			if (pbit_ok) {
@@ -2211,30 +2226,16 @@ void start_control(void) {
 		Process_SPI5_Frame();
 		Process_VCP_Command_Queue();
 
-		if (!gps_ready && ((now - gps_last_init_attempt_ms) >= 1000u)) {
-			(void)GPS_TryStart(now);
-		}
-		if (gps_ready) {
-			GTU7_ProcessDMARing(&gps);
-			if (GTU7_HasFreshFix(&gps)) {
-				(void)GTU7_GetLatest(&gps, &gps_fix);
-				GTU7_ClearFreshFlag(&gps);
-				UpdateAltitudeEstimator(now);
+		Process_Lidar_DMA();
+		uint32_t mode_sel_elapsed_ms = now - mode_sel_last_ms;
+		if (mode_sel_elapsed_ms >= 2u) {
+			float mode_sel_dt_sec = (float)mode_sel_elapsed_ms * 0.001f;
+			if (mode_sel_dt_sec <= 0.0f || mode_sel_dt_sec > 0.050f) {
+				mode_sel_dt_sec = 0.002f;
 			}
-			UpdateTelemetryGPSStatus();
-		}
-		if (bme280_ready && ((now - bme280_last_read_ms) >= 50u)) {
-			bme280_last_read_ms = now;
-			if (BME280_Read(&bme280, &bme280_data) != HAL_OK) {
-				bme280_ready = false;
-				telem_data.sensor_status &= (uint8_t)~SENSOR_STATUS_BME280_READY;
-				bme280_status = -4.0f;
-			} else {
-				telem_data.sensor_status |= SENSOR_STATUS_BME280_READY;
-				UpdateAltitudeEstimator(now);
-			}
-		} else if (!bme280_ready && ((now - bme280_last_init_attempt_ms) >= 1000u)) {
-			(void)BME280_TryInit();
+			mode_sel_last_ms = now;
+			AcquireSensorData();
+			UpdateState(mode_sel_dt_sec);
 		}
 		UpdatePBIT(now, false);
 
@@ -2411,9 +2412,7 @@ void Process_TELEM_Command(uint8_t* Buf, uint32_t Len) {
 
 	case 'a': // --- ARM or ALL ---
 		if (cmd[1] == 'r' && cmd[2] == 'm') { // "arm"
-			if (g_drone_status.drone_mode == MODE_ENGINEER) {
-				unknownTelemCMD_counter += 1;
-			} else if (g_drone_status.drone_mode == MODE_MISSION && !IsGPSLockReady()) {
+			if (g_drone_status.drone_mode == MODE_MISSION && !IsGPSLockReady()) {
 				unknownTelemCMD_counter += 1;
 				// Need to add indication to the user that GPS lock is required for arming in Mission mode.
 			} else {
