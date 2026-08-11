@@ -11,6 +11,7 @@
 
 
 #include "lsm303.h"
+#include "calibration.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -49,6 +50,8 @@
 #define AGR_CFG_C_M         0x62
 #define AGR_OUTX_L_M        0x68   // OUTX_L..OUTZ_H continuous
 #define AGR_STATUS_M        0x67
+#define AGR_CFG_A_M_REBOOT  0x40
+#define AGR_CFG_A_M_SOFT_RST 0x20
 
 
 // --- AGR Registers (Temp) ---
@@ -57,7 +60,6 @@
 #define AGR_OUT_TEMP_H_A   0x0D
 #define LSM303AGR_TEMPSENSOR_ENABLE         ((uint8_t) 0x80)   /*!< Temp sensor Enable */
 #define LSM303AGR_TEMPSENSOR_DISABLE        ((uint8_t) 0x00)   /*!< Temp sensor Disable */
-
 
 // --- KEEP THESE AT THE TOP ---
 static HAL_StatusTypeDef i2c_write(I2C_HandleTypeDef* hi2c, uint8_t addr7, uint8_t reg, uint8_t val) {
@@ -70,6 +72,10 @@ static HAL_StatusTypeDef i2c_read(I2C_HandleTypeDef* hi2c, uint8_t addr7, uint8_
 
 static uint8_t rd8(I2C_HandleTypeDef* hi2c, uint8_t a, uint8_t r) {
 	uint8_t v=0; i2c_read(hi2c, a, r, &v, 1); return v;
+}
+
+static int16_t little_endian_i16(uint8_t lo, uint8_t hi) {
+	return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
 }
 
 // Internal helper to kick off the next phase
@@ -114,11 +120,13 @@ void LSM303_XferCpltCallback(LSM303* dev, bool is_rx) {
 static LSM303_Variant probe_variant(LSM303* dev) {
 	// First, accel WHO_AM_I (both should be 0x33)
 	uint8_t who_a = rd8(dev->hi2c, dev->addr_acc, DLHC_WHO_AM_I_A);
+	dev->accel_who_am_i = who_a;
 	printf("LSM303: accel WHO_AM_I = 0x%02X\r\n", who_a);
 	if (who_a != 0x33) return LSM303_UNKNOWN;
 
 	// Try AGR magnetometer WHO_AM_I (0x4F -> 0x40)
 	uint8_t who_m = rd8(dev->hi2c, dev->addr_mag, AGR_WHO_AM_I_M);
+	dev->mag_who_am_i_agr = who_m;
 	printf("LSM303: mag WHO_AM_I probe = 0x%02X\r\n", who_m);
 	if (who_m == 0x40) return LSM303_AGR;
 
@@ -126,6 +134,9 @@ static LSM303_Variant probe_variant(LSM303* dev) {
 	uint8_t ida = rd8(dev->hi2c, dev->addr_mag, 0x0A);
 	uint8_t idb = rd8(dev->hi2c, dev->addr_mag, 0x0B);
 	uint8_t idc = rd8(dev->hi2c, dev->addr_mag, 0x0C);
+	dev->mag_id_a = ida;
+	dev->mag_id_b = idb;
+	dev->mag_id_c = idc;
 	printf("LSM303: mag ID bytes = 0x%02X 0x%02X 0x%02X ('%c' '%c' '%c')\r\n", ida, idb, idc, ida, idb, idc);
 	if (ida=='H' && idb=='4' && idc=='3') return LSM303_DLHC;
 
@@ -137,29 +148,46 @@ bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale) 
 	dev->addr_acc = 0x19; // SA0=1 default on many boards
 	dev->addr_mag = 0x1E; // default
 	dev->variant  = LSM303_UNKNOWN;
+	dev->accel_who_am_i = 0u;
+	dev->mag_who_am_i_agr = 0u;
+	dev->mag_id_a = 0u;
+	dev->mag_id_b = 0u;
+	dev->mag_id_c = 0u;
+	dev->accel_ctrl1 = 0u;
+	dev->accel_ctrl4 = 0u;
+	dev->mag_cfg_a = 0u;
+	dev->mag_cfg_b = 0u;
+	dev->mag_cfg_c = 0u;
+	dev->temp_cfg = 0u;
 
 	// --- Accel: 100 Hz ODR, all axes enable, normal mode ---
 	// CTRL1_A: ODR=100Hz(0b0101<<4), Xen=Yen=Zen=1 => 0x57
 	if (i2c_write(hi2c, dev->addr_acc, DLHC_CTRL1_A, 0x57) != HAL_OK) return false;
+	dev->accel_ctrl1 = rd8(hi2c, dev->addr_acc, DLHC_CTRL1_A);
 
 	// --- Accel scale and resolution ---
 	// CTRL4_A: BDU=1 (bit 7), HR=1 (bit 3, AGR only), FS (bits 5-4)
 	uint8_t ctrl4_val = 0x88; // BDU=1, HR=1
 	float lsb_per_g;
 	switch(scale) {
-	case LSM303_ACCEL_SCALE_2G:  ctrl4_val |= (0b00 << 4); lsb_per_g = 16384.0f; break;
-	case LSM303_ACCEL_SCALE_4G:  ctrl4_val |= (0b01 << 4); lsb_per_g = 8192.0f;  break;
-	case LSM303_ACCEL_SCALE_8G:  ctrl4_val |= (0b10 << 4); lsb_per_g = 4096.0f;  break;
-	case LSM303_ACCEL_SCALE_16G: ctrl4_val |= (0b11 << 4); lsb_per_g = 1365.0f;  break; // approx
+	case LSM303_ACCEL_SCALE_2G:  ctrl4_val |= (0b00 << 4); lsb_per_g = 1000.0f; break;
+	case LSM303_ACCEL_SCALE_4G:  ctrl4_val |= (0b01 << 4); lsb_per_g = 500.0f;  break;
+	case LSM303_ACCEL_SCALE_8G:  ctrl4_val |= (0b10 << 4); lsb_per_g = 250.0f;  break;
+	case LSM303_ACCEL_SCALE_16G: ctrl4_val |= (0b11 << 4); lsb_per_g = 83.3333f; break;
 	default: return false; // Invalid scale
 	}
 	if (i2c_write(hi2c, dev->addr_acc, DLHC_CTRL4_A, ctrl4_val) != HAL_OK) return false;
+	dev->accel_ctrl4 = rd8(hi2c, dev->addr_acc, DLHC_CTRL4_A);
 
-	// The sensitivity depends on the mode (Normal, High-Res, Low-Power).
-	// The values here are for High-Resolution mode on the AGR.
-	// DLHC is slightly different but close enough for this driver.
-	// The value is the number of LSBs per g. We store the inverse.
+	// High-resolution accel samples are left-justified 12-bit values.
+	// The value here is the number of right-shifted counts per g.
 	dev->accel_g_per_lsb = 1.0f / lsb_per_g;
+	dev->accel_bias_counts[0] = 0.0f;
+	dev->accel_bias_counts[1] = 0.0f;
+	dev->accel_bias_counts[2] = 0.0f;
+	dev->accel_counts_per_g[0] = lsb_per_g;
+	dev->accel_counts_per_g[1] = lsb_per_g;
+	dev->accel_counts_per_g[2] = lsb_per_g;
 
 	// --- Magnetometer init: detect variant ---
 	dev->variant = probe_variant(dev);
@@ -172,10 +200,17 @@ bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale) 
 		i2c_write(hi2c, dev->addr_mag, DLHC_CRB_M, 0x20);
 		// MR_REG_M: Continuous-conversion mode (0x00)
 		i2c_write(hi2c, dev->addr_mag, DLHC_MR_M,  0x00);
+		dev->mag_cfg_a = rd8(hi2c, dev->addr_mag, DLHC_CRA_M);
+		dev->mag_cfg_b = rd8(hi2c, dev->addr_mag, DLHC_CRB_M);
+		dev->mag_cfg_c = rd8(hi2c, dev->addr_mag, DLHC_MR_M);
 		// Scale: datasheet ~1100 LSB/gauss on X/Y at ±1.3g range; use 1/1100 as a starting point
 		dev->mag_gauss_per_lsb = 1.0f / 1100.0f;
 
 	} else { // LSM303_AGR
+		for (uint8_t i = 0; i < 3u; i++) {
+			dev->accel_bias_counts[i] = g_lsm303agr_accel_cal.bias[i];
+			dev->accel_counts_per_g[i] = g_lsm303agr_accel_cal.counts_per_g[i];
+		}
 		// CFG_REG_A_M: Temperature comp=1, ODR=100Hz (0b100 << 2), LPF=1 => 0b1 100 1 00 = 0x9C
 		i2c_write(hi2c, dev->addr_mag, AGR_CFG_A_M, 0x9C);
 		// CFG_REG_B_M: OFF_CANC=1 (offset cancel), LPF=1 (already set), set range ±50 gauss fixed on AGR
@@ -184,9 +219,49 @@ bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale) 
 		i2c_write(hi2c, dev->addr_mag, AGR_CFG_C_M, 0x00);
 		// enable temp sensor
 		i2c_write(hi2c, dev->addr_acc, AGR_TEMP_CFG_A, LSM303AGR_TEMPSENSOR_ENABLE);
+		dev->mag_cfg_a = rd8(hi2c, dev->addr_mag, AGR_CFG_A_M);
+		dev->mag_cfg_b = rd8(hi2c, dev->addr_mag, AGR_CFG_B_M);
+		dev->mag_cfg_c = rd8(hi2c, dev->addr_mag, AGR_CFG_C_M);
+		dev->temp_cfg = rd8(hi2c, dev->addr_acc, AGR_TEMP_CFG_A);
 		dev->mag_gauss_per_lsb = 0.0015f;
 	}
 	return true;
+}
+
+bool LSM303_SoftResetAGR(LSM303* dev) {
+	if (!dev || !dev->hi2c) return false;
+	if (dev->variant != LSM303_AGR) return false;
+
+	// Preserve current config bits, pulse SOFT_RST then REBOOT.
+	uint8_t cfg_a = rd8(dev->hi2c, dev->addr_mag, AGR_CFG_A_M);
+	if (i2c_write(dev->hi2c, dev->addr_mag, AGR_CFG_A_M, (uint8_t)(cfg_a | AGR_CFG_A_M_SOFT_RST)) != HAL_OK) {
+		return false;
+	}
+	HAL_Delay(5);
+
+	cfg_a = rd8(dev->hi2c, dev->addr_mag, AGR_CFG_A_M);
+	if (i2c_write(dev->hi2c, dev->addr_mag, AGR_CFG_A_M, (uint8_t)(cfg_a | AGR_CFG_A_M_REBOOT)) != HAL_OK) {
+		return false;
+	}
+	HAL_Delay(5);
+
+	return true;
+}
+
+bool LSM303_Recover(LSM303* dev, LSM303_AccelScale scale) {
+	if (!dev || !dev->hi2c) return false;
+
+	// AGR supports software reset/reboot; DLHC falls back to full re-init.
+	if (dev->variant == LSM303_AGR) {
+		(void)LSM303_SoftResetAGR(dev);
+	}
+
+	// Reset software state machine flags before re-initializing.
+	dev->state = LSM303_IDLE;
+	dev->accel_ready = false;
+	dev->mag_ready = false;
+
+	return LSM303_Init(dev, dev->hi2c, scale);
 }
 
 // Non-blocking Accelerometer Start
@@ -217,44 +292,18 @@ bool LSM303_StartMagRead_DMA(LSM303* dev, uint8_t* dma_buffer) {
 	return (status == HAL_OK);
 }
 
-/*
-bool LSM303_ReadAccel(LSM303* dev, LSM303_Raw* out) {
-    uint8_t buf[6];
-    // auto-increment bit 0x80
-    if (HAL_OK != i2c_read(dev->hi2c, dev->addr_acc, DLHC_OUT_X_L_A | 0x80, buf, 6)) return false;
-    // Data are Little Endian: XL, XH, YL, YH, ZL, ZH
-    out->ax = (int16_t)((buf[1]<<8)|buf[0]);
-    out->ay = (int16_t)((buf[3]<<8)|buf[2]);
-    out->az = (int16_t)((buf[5]<<8)|buf[4]);
-    return true;
-}
- */
-/*
-bool LSM303_ReadMag(LSM303* dev, LSM303_Raw* out) {
-	uint8_t b[6];
+void LSM303_DecodeAccelG(const LSM303* dev, const uint8_t raw[6], float* ax_g, float* ay_g, float* az_g) {
+	if (!dev || !raw || !ax_g || !ay_g || !az_g) return;
 
-	if (dev->variant == LSM303_DLHC) {
-		// Order is X, Z, Y and each is big-endian H,L !
-		uint8_t raw[6];
-		if (HAL_OK != i2c_read(dev->hi2c, dev->addr_mag, DLHC_OUT_X_H_M, raw, 6)) return false;
-		int16_t x = (int16_t)((raw[0]<<8)|raw[1]);
-		int16_t z = (int16_t)((raw[2]<<8)|raw[3]);
-		int16_t y = (int16_t)((raw[4]<<8)|raw[5]);
-		out->mx = x; out->my = y; out->mz = z;
-		return true;
-	} else if (dev->variant == LSM303_AGR) {
-		if (HAL_OK != i2c_read(dev->hi2c, dev->addr_mag, AGR_STATUS_M, b, 1)) return false;
+	// AGR High Resolution mode: 12-bit left-justified, so shift right by 4 after sign extension.
+	int16_t x = (int16_t)(little_endian_i16(raw[0], raw[1]) >> 4);
+	int16_t y = (int16_t)(little_endian_i16(raw[2], raw[3]) >> 4);
+	int16_t z = (int16_t)(little_endian_i16(raw[4], raw[5]) >> 4);
 
-		if (HAL_OK != i2c_read(dev->hi2c, dev->addr_mag, AGR_OUTX_L_M, b, 6)) return false;
-		// AGR is little-endian L,H and axis order X,Y,Z
-		out->mx = (int16_t)((b[1]<<8)|b[0]);
-		out->my = (int16_t)((b[3]<<8)|b[2]);
-		out->mz = (int16_t)((b[5]<<8)|b[4]);
-		return true;
-	}
-	return false;
+	*ax_g = ((float)x - dev->accel_bias_counts[0]) / dev->accel_counts_per_g[0];
+	*ay_g = ((float)y - dev->accel_bias_counts[1]) / dev->accel_counts_per_g[1];
+	*az_g = ((float)z - dev->accel_bias_counts[2]) / dev->accel_counts_per_g[2];
 }
- */
 
 bool LSM303_ReadTemp(LSM303* dev, int16_t* out) {
 	// Temperature sensor is only on the AGR variant

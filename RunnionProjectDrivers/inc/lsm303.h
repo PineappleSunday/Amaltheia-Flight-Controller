@@ -67,7 +67,20 @@ typedef struct {
     uint8_t addr_mag;
     LSM303_Variant variant;
     float accel_g_per_lsb;
+    float accel_bias_counts[3];
+    float accel_counts_per_g[3];
     float mag_gauss_per_lsb;
+    uint8_t accel_who_am_i;
+    uint8_t mag_who_am_i_agr;
+    uint8_t mag_id_a;
+    uint8_t mag_id_b;
+    uint8_t mag_id_c;
+    uint8_t accel_ctrl1;
+    uint8_t accel_ctrl4;
+    uint8_t mag_cfg_a;
+    uint8_t mag_cfg_b;
+    uint8_t mag_cfg_c;
+    uint8_t temp_cfg;
 
     // DMA STATE MACHINE MEMBERS
     LSM303_State state;         // Tracks the current I2C phase
@@ -87,9 +100,15 @@ bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale);
 void LSM303_Process_DMA(LSM303* dev);
 void LSM303_XferCpltCallback(LSM303* dev, bool is_rx);
 
-bool LSM303_Init(LSM303* dev, I2C_HandleTypeDef* hi2c, LSM303_AccelScale scale);
 bool LSM303_StartAccelRead_DMA(LSM303* dev, uint8_t* dma_buffer);
 bool LSM303_StartMagRead_DMA(LSM303* dev, uint8_t* dma_buffer);
+void LSM303_DecodeAccelG(const LSM303* dev, const uint8_t raw[6], float* ax_g, float* ay_g, float* az_g);
+// AGR path: issue software reset/reboot command sequence on magnetometer.
+bool LSM303_SoftResetAGR(LSM303* dev);
+// Recovery helper:
+// - AGR: performs software reset sequence then full re-init
+// - DLHC/unknown: full re-init only
+bool LSM303_Recover(LSM303* dev, LSM303_AccelScale scale);
 //bool LSM303_ReadAccel(LSM303* dev, LSM303_Raw* out);
 //bool LSM303_ReadMag(LSM303* dev, LSM303_Raw* out);
 bool LSM303_ReadTemp(LSM303* dev, int16_t* out);

@@ -1,0 +1,1143 @@
+import argparse
+import csv
+import os
+import queue
+import struct
+import threading
+import time
+from collections import deque
+from datetime import datetime
+
+import matplotlib.animation as animation
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, TextBox
+import numpy as np
+import serial
+import serial.tools.list_ports
+
+
+HEADER_VALUE = 0x31504356  # "VCP1"
+ENGINEER_HEADER_VALUE = 0x31454356  # "VCE1"
+BIT_HEADER_VALUE = 0x31424356  # "VCB1"
+FOOTER_VALUE = 0xAB
+FRAME_FORMAT = "<IIHBBBB" + ("f" * 69) + "B"
+ENGINEER_FRAME_FORMAT = "<IIHBBBBf" + ("B" * 18) + ("h" * 9) + ("f" * 9) + "B"
+BIT_FRAME_FORMAT = "<IIHI" + ("B" * 18)
+BME_FRAME_FORMAT = "<IIHBBBB" + ("f" * 57) + "B"
+LEGACY_FRAME_FORMAT = "<IIHBBBB" + ("f" * 52) + "B"
+FRAME_STRUCT = struct.Struct(FRAME_FORMAT)
+ENGINEER_FRAME_STRUCT = struct.Struct(ENGINEER_FRAME_FORMAT)
+BIT_FRAME_STRUCT = struct.Struct(BIT_FRAME_FORMAT)
+BME_FRAME_STRUCT = struct.Struct(BME_FRAME_FORMAT)
+LEGACY_FRAME_STRUCT = struct.Struct(LEGACY_FRAME_FORMAT)
+FRAME_SIZE = FRAME_STRUCT.size
+ENGINEER_FRAME_SIZE = ENGINEER_FRAME_STRUCT.size
+BIT_FRAME_SIZE = BIT_FRAME_STRUCT.size
+BME_FRAME_SIZE = BME_FRAME_STRUCT.size
+LEGACY_FRAME_SIZE = LEGACY_FRAME_STRUCT.size
+HEADER_BYTES = struct.pack("<I", HEADER_VALUE)
+ENGINEER_HEADER_BYTES = struct.pack("<I", ENGINEER_HEADER_VALUE)
+BIT_HEADER_BYTES = struct.pack("<I", BIT_HEADER_VALUE)
+FRAME_HEADERS = (HEADER_BYTES, ENGINEER_HEADER_BYTES, BIT_HEADER_BYTES)
+
+MISSION_ACTION_MAP = {
+    -1: "None",
+    0: "Takeoff",
+    1: "Hover",
+    2: "Land",
+    3: "Move",
+}
+
+FRAME_FIELDS = [
+    "header",
+    "tick_ms",
+    "sequence",
+    "armed",
+    "drone_mode",
+    "flight_mode",
+    "sat_flags",
+    "dt_sec",
+    "x",
+    "y",
+    "z",
+    "vx",
+    "vy",
+    "vz",
+    "roll",
+    "pitch",
+    "yaw",
+    "roll_rate",
+    "pitch_rate",
+    "yaw_rate",
+    "accel_x",
+    "accel_y",
+    "accel_z",
+    "mag_x",
+    "mag_y",
+    "mag_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z",
+    "target_x",
+    "target_y",
+    "target_z",
+    "target_roll",
+    "target_pitch",
+    "target_yaw",
+    "target_rate_roll",
+    "target_rate_pitch",
+    "target_rate_yaw",
+    "target_ff_vz",
+    "mission_wp_index",
+    "mission_wp_total",
+    "mission_wp_action",
+    "mission_wp_remaining_dist",
+    "bme280_valid",
+    "bme280_temp_c",
+    "bme280_pressure_pa",
+    "bme280_humidity_rh",
+    "bme280_altitude_m", # BME280 altitude in meters, bias-corrected from boot GPS/BME comparison when available
+    "gps_valid",
+    "gps_sats",
+    "gps_lat_deg",
+    "gps_lon_deg",
+    "gps_alt_m", # GPS altitude in meters
+    "gps_speed_mps", # GPS speed over ground in m/s
+    "gps_course_deg", # GPS course over ground in degrees
+    "gps_hdop", # GPS horizontal dilution of precision
+    "pid_roll_p",
+    "pid_roll_i",
+    "pid_roll_d",
+    "pid_roll_out",
+    "pid_pitch_p",
+    "pid_pitch_i",
+    "pid_pitch_d",
+    "pid_pitch_out",
+    "pid_yaw_p",
+    "pid_yaw_i",
+    "pid_yaw_d",
+    "pid_yaw_out",
+    "pid_velz_p",
+    "pid_velz_i",
+    "pid_velz_d",
+    "pid_velz_out",
+    "motor1_pct",
+    "motor2_pct",
+    "motor3_pct",
+    "motor4_pct",
+    "magic_footer",
+]
+
+ENGINEER_FRAME_FIELDS = [
+    "header",
+    "tick_ms",
+    "sequence",
+    "armed",
+    "drone_mode",
+    "flight_mode",
+    "sat_flags",
+    "dt_sec",
+    "accel_raw_b0",
+    "accel_raw_b1",
+    "accel_raw_b2",
+    "accel_raw_b3",
+    "accel_raw_b4",
+    "accel_raw_b5",
+    "mag_raw_b0",
+    "mag_raw_b1",
+    "mag_raw_b2",
+    "mag_raw_b3",
+    "mag_raw_b4",
+    "mag_raw_b5",
+    "gyro_raw_b0",
+    "gyro_raw_b1",
+    "gyro_raw_b2",
+    "gyro_raw_b3",
+    "gyro_raw_b4",
+    "gyro_raw_b5",
+    "accel_raw_x",
+    "accel_raw_y",
+    "accel_raw_z",
+    "mag_raw_x",
+    "mag_raw_y",
+    "mag_raw_z",
+    "gyro_raw_x",
+    "gyro_raw_y",
+    "gyro_raw_z",
+    "accel_x",
+    "accel_y",
+    "accel_z",
+    "mag_x",
+    "mag_y",
+    "mag_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z",
+    "magic_footer",
+]
+
+BIT_FRAME_FIELDS = [
+    "header",
+    "tick_ms",
+    "sequence",
+    "timestamp_us",
+    "lsm303_accel_whoami",
+    "lsm303_mag_whoami_agr",
+    "lsm303_mag_id_a",
+    "lsm303_mag_id_b",
+    "lsm303_mag_id_c",
+    "lsm303_variant",
+    "lsm303_init_ok",
+    "gyro_whoami",
+    "gyro_init_ok",
+    "lsm303_accel_ctrl1",
+    "lsm303_accel_ctrl4",
+    "lsm303_mag_cfg_a",
+    "lsm303_mag_cfg_b",
+    "lsm303_mag_cfg_c",
+    "lsm303_temp_cfg",
+    "gyro_ctrl_reg1",
+    "gyro_ctrl_reg4",
+    "magic_footer",
+]
+
+NORMAL_CSV_FIELDS = ["host_time_s", "packet_type"] + FRAME_FIELDS
+ENGINEER_CSV_FIELDS = ["host_time_s", "packet_type"] + list(dict.fromkeys(ENGINEER_FRAME_FIELDS + BIT_FRAME_FIELDS))
+
+BME_FRAME_FIELDS = [
+    field for field in FRAME_FIELDS
+    if not field.startswith("gps_") and not field.startswith("mission_")
+]
+LEGACY_FRAME_FIELDS = [field for field in BME_FRAME_FIELDS if not field.startswith("bme280_")]
+
+assert FRAME_SIZE == 291, f"Unexpected frame size: {FRAME_SIZE}"
+assert ENGINEER_FRAME_SIZE == 91, f"Unexpected engineer frame size: {ENGINEER_FRAME_SIZE}"
+assert BIT_FRAME_SIZE == 32, f"Unexpected BIT frame size: {BIT_FRAME_SIZE}"
+assert BME_FRAME_SIZE == 243, f"Unexpected BME frame size: {BME_FRAME_SIZE}"
+assert LEGACY_FRAME_SIZE == 223, f"Unexpected legacy frame size: {LEGACY_FRAME_SIZE}"
+
+FLIGHT_MODE_MAP = {
+    0: "Disarmed/Idle",
+    4: "Emergency Land",
+    5: "Startup",
+    51: "Init",
+    52: "Sensor Init",
+    53: "Gyro Zero-Rate Cal",
+    54: "GPS Init",
+    55: "PBIT OK",
+    56: "PBIT Fail",
+    6: "Mode Select",
+    7: "Engineer",
+    8: "Stabilize",
+    81: "Takeoff: Init",
+    82: "Takeoff: Spoolup",
+    83: "Takeoff: Liftoff",
+    84: "Takeoff: Transition",
+    91: "Telem CMD Pulse",
+}
+
+
+class FrameParser:
+    def __init__(self):
+        self.buffer = bytearray()
+        self.bad_frames = 0
+
+    def feed(self, chunk):
+        self.buffer.extend(chunk)
+        frames = []
+
+        while True:
+            header_positions = [self.buffer.find(header) for header in FRAME_HEADERS]
+            header_positions = [idx for idx in header_positions if idx >= 0]
+            idx = min(header_positions) if header_positions else -1
+            if idx < 0:
+                if len(self.buffer) > 3:
+                    del self.buffer[:-3]
+                break
+
+            if idx > 0:
+                del self.buffer[:idx]
+
+            if len(self.buffer) < BIT_FRAME_SIZE:
+                break
+
+            if self.buffer.startswith(ENGINEER_HEADER_BYTES):
+                frame_size = ENGINEER_FRAME_SIZE
+                frame_struct = ENGINEER_FRAME_STRUCT
+                frame_fields = ENGINEER_FRAME_FIELDS
+                packet_type = "engineer"
+            elif self.buffer.startswith(BIT_HEADER_BYTES):
+                frame_size = BIT_FRAME_SIZE
+                frame_struct = BIT_FRAME_STRUCT
+                frame_fields = BIT_FRAME_FIELDS
+                packet_type = "bit"
+            elif self.buffer.startswith(HEADER_BYTES):
+                frame_size = FRAME_SIZE
+                frame_struct = FRAME_STRUCT
+                frame_fields = FRAME_FIELDS
+                packet_type = "normal"
+            else:
+                self.bad_frames += 1
+                del self.buffer[0]
+                continue
+
+            if len(self.buffer) < frame_size:
+                break
+            if self.buffer[frame_size - 1] != FOOTER_VALUE:
+                self.bad_frames += 1
+                del self.buffer[0]
+                continue
+
+            candidate = bytes(self.buffer[:frame_size])
+            values = frame_struct.unpack(candidate)
+            frame = dict(zip(frame_fields, values))
+            if frame["header"] not in (HEADER_VALUE, ENGINEER_HEADER_VALUE, BIT_HEADER_VALUE) or frame["magic_footer"] != FOOTER_VALUE:
+                self.bad_frames += 1
+                del self.buffer[0]
+                continue
+
+            frame["packet_type"] = packet_type
+            frames.append(frame)
+            del self.buffer[:frame_size]
+
+        return frames
+
+
+def auto_pick_port():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        return None
+
+    scored = []
+    for p in ports:
+        text = f"{p.device} {p.description} {p.hwid}".lower()
+        score = 0
+        if "stlink" in text or "st-link" in text:
+            score += 5
+        if "vcp" in text:
+            score += 4
+        if "usb serial" in text:
+            score += 3
+        if "stm32" in text:
+            score += 2
+        scored.append((score, p.device))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return scored[0][1]
+
+
+def serial_reader(ser, out_q, stop_event, stats):
+    parser = FrameParser()
+    while not stop_event.is_set():
+        try:
+            chunk = ser.read(4096)
+        except serial.SerialException:
+            break
+
+        if not chunk:
+            continue
+
+        stats["bytes_in"] += len(chunk)
+        frames = parser.feed(chunk)
+        stats["bad_frames"] = parser.bad_frames
+
+        for frame in frames:
+            stats["frames_parsed"] += 1
+            try:
+                out_q.put_nowait(frame)
+            except queue.Full:
+                stats["queue_drops"] += 1
+
+
+def csv_logger(log_q, normal_csv_file, normal_csv_writer, engineer_csv_file, engineer_csv_writer, stop_event):
+    flush_counter = 0
+    last_flush = time.perf_counter()
+
+    while not stop_event.is_set():
+        try:
+            row = log_q.get(timeout=0.1)
+        except queue.Empty:
+            row = None
+
+        if row is None:
+            now = time.perf_counter()
+            if flush_counter > 0 and (now - last_flush) >= 0.5:
+                normal_csv_file.flush()
+                engineer_csv_file.flush()
+                flush_counter = 0
+                last_flush = now
+            continue
+
+        if row.get("packet_type") == "normal":
+            normal_csv_writer.writerow(row)
+        else:
+            engineer_csv_writer.writerow(row)
+        flush_counter += 1
+        if flush_counter >= 200:
+            normal_csv_file.flush()
+            engineer_csv_file.flush()
+            flush_counter = 0
+            last_flush = time.perf_counter()
+
+    normal_csv_file.flush()
+    engineer_csv_file.flush()
+
+
+def build_status_text(state):
+    latest = state["latest"]
+    port_line = state["port"] if state["port"] else "(not selected)"
+    conn_state = "Connected" if state["connected"] else "Disconnected"
+    ports_preview = ", ".join(state["ports"][:6]) if state["ports"] else "none"
+
+    if latest is None:
+        return (
+            f"Connection: {conn_state}\n"
+            f"Port: {port_line} @ {state['baud']}\n"
+            f"Detected Ports: {ports_preview}\n"
+            f"{state['conn_msg']}\n"
+            "Waiting for frames...\n"
+            "\n"
+            f"Frames parsed: {state['frames_seen']}\n"
+            f"Queue drops: {state['queue_drops']}\n"
+            f"Bad frames: {state['bad_frames']}\n"
+        )
+
+    if latest.get("packet_type") == "engineer":
+        fm_val = latest["flight_mode"]
+        fm_str = FLIGHT_MODE_MAP.get(fm_val, f"Unknown ({fm_val})")
+        raw_byte_line = (
+            "Raw bytes:\n"
+            f"  ACC: {latest['accel_raw_b0']:02X} {latest['accel_raw_b1']:02X} "
+            f"{latest['accel_raw_b2']:02X} {latest['accel_raw_b3']:02X} "
+            f"{latest['accel_raw_b4']:02X} {latest['accel_raw_b5']:02X}\n"
+            f"  MAG: {latest['mag_raw_b0']:02X} {latest['mag_raw_b1']:02X} "
+            f"{latest['mag_raw_b2']:02X} {latest['mag_raw_b3']:02X} "
+            f"{latest['mag_raw_b4']:02X} {latest['mag_raw_b5']:02X}\n"
+            f"  GYR: {latest['gyro_raw_b0']:02X} {latest['gyro_raw_b1']:02X} "
+            f"{latest['gyro_raw_b2']:02X} {latest['gyro_raw_b3']:02X} "
+            f"{latest['gyro_raw_b4']:02X} {latest['gyro_raw_b5']:02X}\n"
+        )
+        return (
+            f"Connection: {conn_state}\n"
+            f"Port: {port_line} @ {state['baud']}\n"
+            f"Detected Ports: {ports_preview}\n"
+            f"{state['conn_msg']}\n"
+            f"FPS: {state['fps']:.1f}\n"
+            f"Frames parsed: {state['frames_seen']}\n"
+            f"Seq drops: {state['seq_drops']}\n"
+            f"Queue drops: {state['queue_drops']}\n"
+            f"Bad frames: {state['bad_frames']}\n"
+            "\n"
+            f"ENGINEER PACKET  Armed: {latest['armed']}  Mode: {latest['drone_mode']}  FM: {fm_str}\n"
+            f"PBIT: 0b{latest['sat_flags']:08b}  dt: {latest['dt_sec']:.4f}s\n"
+            "\n"
+            f"{raw_byte_line}"
+            "\n"
+            "Raw counts:\n"
+            f"  ACC X/Y/Z: {latest['accel_raw_x']:7d} {latest['accel_raw_y']:7d} {latest['accel_raw_z']:7d}\n"
+            f"  MAG X/Y/Z: {latest['mag_raw_x']:7d} {latest['mag_raw_y']:7d} {latest['mag_raw_z']:7d}\n"
+            f"  GYR X/Y/Z: {latest['gyro_raw_x']:7d} {latest['gyro_raw_y']:7d} {latest['gyro_raw_z']:7d}\n"
+            "\n"
+            "Calibrated/body values:\n"
+            f"  ACC g:     {latest['accel_x']:+8.4f} {latest['accel_y']:+8.4f} {latest['accel_z']:+8.4f}\n"
+            f"  MAG gauss: {latest['mag_x']:+8.4f} {latest['mag_y']:+8.4f} {latest['mag_z']:+8.4f}\n"
+            f"  GYR dps:   {latest['gyro_x']:+8.3f} {latest['gyro_y']:+8.3f} {latest['gyro_z']:+8.3f}\n"
+        )
+
+    if latest.get("packet_type") == "bit":
+        return (
+            f"Connection: {conn_state}\n"
+            f"Port: {port_line} @ {state['baud']}\n"
+            f"Detected Ports: {ports_preview}\n"
+            f"{state['conn_msg']}\n"
+            f"FPS: {state['fps']:.1f}\n"
+            f"Frames parsed: {state['frames_seen']}\n"
+            f"Seq drops: {state['seq_drops']}\n"
+            f"Queue drops: {state['queue_drops']}\n"
+            f"Bad frames: {state['bad_frames']}\n"
+            "\n"
+            "IBIT SNAPSHOT\n"
+            f"timestamp_us: {latest['timestamp_us']}\n"
+            f"LSM init={latest['lsm303_init_ok']} variant={latest['lsm303_variant']}\n"
+            f"  accel WHOAMI: 0x{latest['lsm303_accel_whoami']:02X}\n"
+            f"  AGR mag WHOAMI: 0x{latest['lsm303_mag_whoami_agr']:02X}\n"
+            f"  mag ID A/B/C: 0x{latest['lsm303_mag_id_a']:02X} "
+            f"0x{latest['lsm303_mag_id_b']:02X} 0x{latest['lsm303_mag_id_c']:02X}\n"
+            f"  accel CTRL1/CTRL4: 0x{latest['lsm303_accel_ctrl1']:02X} "
+            f"0x{latest['lsm303_accel_ctrl4']:02X}\n"
+            f"  mag CFG A/B/C: 0x{latest['lsm303_mag_cfg_a']:02X} "
+            f"0x{latest['lsm303_mag_cfg_b']:02X} 0x{latest['lsm303_mag_cfg_c']:02X}\n"
+            f"  temp CFG: 0x{latest['lsm303_temp_cfg']:02X}\n"
+            f"Gyro init={latest['gyro_init_ok']}\n"
+            f"  WHOAMI: 0x{latest['gyro_whoami']:02X}\n"
+            f"  CTRL_REG1/CTRL_REG4: 0x{latest['gyro_ctrl_reg1']:02X} "
+            f"0x{latest['gyro_ctrl_reg4']:02X}\n"
+        )
+
+    bme_status = int(float(latest["bme280_valid"]))
+    if bme_status == 1:
+        bme_line = (
+            f"BME280: status=1 | temp={latest['bme280_temp_c']:+.2f}C |"
+            f"| alt={latest['bme280_altitude_m']:+.3f}m | "
+            f"pressure={latest['bme280_pressure_pa']:.1f}Pa | RH={latest['bme280_humidity_rh']:.2f}%\n"
+            
+        )
+    elif bme_status == -5:
+        bme_line = "BME280: status=-5 no I2C3 devices ACKed\n"
+    elif bme_status == -6:
+        bme_line = (
+            f"BME280: status=-6 I2C3 alive first=0x{int(float(latest['bme280_pressure_pa'])):02X} "
+            f"count={int(float(latest['bme280_temp_c']))}\n"
+        )
+    else:
+        bme_line = (
+            f"BME280: status={bme_status} addr=0x{int(float(latest['bme280_pressure_pa'])):02X} "
+            f"chip=0x{int(float(latest['bme280_temp_c'])):02X}\n"
+        )
+
+    fm_val = latest['flight_mode']
+    fm_str = FLIGHT_MODE_MAP.get(fm_val, f"Unknown ({fm_val})")
+    mission_idx = int(float(latest.get("mission_wp_index", -1)))
+    mission_total = int(float(latest.get("mission_wp_total", 0)))
+    mission_action = int(float(latest.get("mission_wp_action", -1)))
+    mission_remaining = float(latest.get("mission_wp_remaining_dist", 0.0))
+    mission_action_name = MISSION_ACTION_MAP.get(mission_action, f"Action {mission_action}")
+    mission_idx_display = mission_idx + 1 if mission_idx >= 0 and mission_total > 0 else 0
+    return (
+        f"Connection: {conn_state}\n"
+        f"Port: {port_line} @ {state['baud']}\n"
+        f"Detected Ports: {ports_preview}\n"
+        f"{state['conn_msg']}\n"
+        f"FPS: {state['fps']:.1f}\n"
+        f"Frames parsed: {state['frames_seen']}\n"
+        f"Seq drops: {state['seq_drops']}\n"
+        f"Queue drops: {state['queue_drops']}\n"
+        f"Bad frames: {state['bad_frames']}\n"
+        "\n"
+        f"Armed: {latest['armed']}  Mode: {latest['drone_mode']}  FM: {fm_str}\n"
+        f"Sat: 0b{latest['sat_flags']:08b}\n"
+        f"dt: {latest['dt_sec']:.4f}s\n"
+        "\n"
+        f"AHRS  R/P/Y: {latest['roll']:+7.2f}, {latest['pitch']:+7.2f}, {latest['yaw']:+7.2f}\n"
+        f"Rate  p/q/r: {latest['roll_rate']:+7.2f}, {latest['pitch_rate']:+7.2f}, {latest['yaw_rate']:+7.2f}\n"
+        f"Cmd r/p/y: {latest['target_rate_roll']:+7.2f}, {latest['target_rate_pitch']:+7.2f}, {latest['target_rate_yaw']:+7.2f}\n"
+        "\n"
+        f"PID Roll  P/I/D/O: {latest['pid_roll_p']:+6.3f} {latest['pid_roll_i']:+6.3f} {latest['pid_roll_d']:+6.3f} {latest['pid_roll_out']:+6.3f}\n"
+        f"PID Pitch P/I/D/O: {latest['pid_pitch_p']:+6.3f} {latest['pid_pitch_i']:+6.3f} {latest['pid_pitch_d']:+6.3f} {latest['pid_pitch_out']:+6.3f}\n"
+        f"PID Yaw   P/I/D/O: {latest['pid_yaw_p']:+6.3f} {latest['pid_yaw_i']:+6.3f} {latest['pid_yaw_d']:+6.3f} {latest['pid_yaw_out']:+6.3f}\n"
+        "\n"
+        f"Motors %: {latest['motor1_pct']:.1f}, {latest['motor2_pct']:.1f}, {latest['motor3_pct']:.1f}, {latest['motor4_pct']:.1f}\n"
+        f"Z/VZ: {latest['z']:+.3f} m / {latest['vz']:+.3f} m/s\n"
+        f"Target Z/FFvz: {latest['target_z']:+.3f} m / {latest['target_ff_vz']:+.3f}\n"
+        f"Mission WP: {mission_idx_display}/{mission_total} {mission_action_name} rem={mission_remaining:.3f}m\n"
+        f"{bme_line}"
+        f"GPS: valid={latest['gps_valid']:.0f} sats={latest['gps_sats']:.0f} "
+        f"lat={latest['gps_lat_deg']:+.6f} lon={latest['gps_lon_deg']:+.6f} "
+        f"alt={latest['gps_alt_m']:+.1f}m spd={latest['gps_speed_mps']:.2f}m/s hdop={latest['gps_hdop']:.2f}\n"
+    )
+
+
+def main():
+    # 1. Get the current date and time object
+    now = datetime.now()
+
+    # 2. Format as a string (YYYY-MM-DD HH:MM:SS)
+    date_string = now.strftime("%Y-%m-%d %H:%M:%S")
+    parser = argparse.ArgumentParser(description="Amaltheia VCP live dashboard + logger")
+    parser.add_argument("port", nargs="?", help="Initial COM port (optional)")
+    parser.add_argument("--baud", type=int, default=921600, help="Serial baud rate")
+    parser.add_argument("--window-sec", type=float, default=15.0, help="Plot history window in seconds")
+    parser.add_argument("--update-ms", type=int, default=100, help="UI refresh interval")
+    parser.add_argument("--plot-sample-hz", type=float, default=50.0, help="Maximum rate stored in plot history")
+    parser.add_argument("--3d-update-ms", dest="three_d_update_ms", type=int, default=200, help="3D view refresh interval")
+    parser.add_argument("--drain-budget-ms", type=float, default=12.0, help="Maximum queue-drain time per UI tick")
+    parser.add_argument("--queue-size", type=int, default=4096, help="Frame queue size")
+    parser.add_argument("--no-log", action="store_true", help="Disable CSV logging")
+    parser.add_argument("--log-dir", default=f"flight_log_VCP", help="CSV output directory")
+    args = parser.parse_args()
+
+    initial_port = args.port or auto_pick_port() or ""
+    print("Dashboard started in offline mode. Use the GUI controls to connect.")
+    print(f"Frame sizes: normal={FRAME_SIZE} bytes, engineer={ENGINEER_FRAME_SIZE} bytes, bit={BIT_FRAME_SIZE} bytes")
+
+    max_points = max(200, int(args.window_sec * max(1.0, args.plot_sample_hz)))
+    t = deque(maxlen=max_points)
+    roll = deque(maxlen=max_points)
+    pitch = deque(maxlen=max_points)
+    yaw = deque(maxlen=max_points)
+    roll_rate = deque(maxlen=max_points)
+    pitch_rate = deque(maxlen=max_points)
+    yaw_rate = deque(maxlen=max_points)
+    target_roll_rate = deque(maxlen=max_points)
+    target_pitch_rate = deque(maxlen=max_points)
+    target_yaw_rate = deque(maxlen=max_points)
+    pid_roll_out = deque(maxlen=max_points)
+    pid_pitch_out = deque(maxlen=max_points)
+    pid_yaw_out = deque(maxlen=max_points)
+    motor1 = deque(maxlen=max_points)
+    motor2 = deque(maxlen=max_points)
+    motor3 = deque(maxlen=max_points)
+    motor4 = deque(maxlen=max_points)
+    z = deque(maxlen=max_points)
+    target_z = deque(maxlen=max_points)
+    vz = deque(maxlen=max_points)
+    ff_vz = deque(maxlen=max_points)
+
+    normal_csv_file = None
+    engineer_csv_file = None
+    log_q = None
+    logger_thread = None
+    logger_stop_event = None
+    if not args.no_log:
+        os.makedirs(args.log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        normal_log_path = os.path.join(args.log_dir, f"vcp_dump_{timestamp}.csv")
+        engineer_log_path = os.path.join(args.log_dir, f"engineer_dump_{timestamp}.csv")
+        normal_csv_file = open(normal_log_path, "w", newline="", encoding="utf-8")
+        engineer_csv_file = open(engineer_log_path, "w", newline="", encoding="utf-8")
+        normal_csv_writer = csv.DictWriter(normal_csv_file, fieldnames=NORMAL_CSV_FIELDS, extrasaction="ignore")
+        engineer_csv_writer = csv.DictWriter(engineer_csv_file, fieldnames=ENGINEER_CSV_FIELDS, extrasaction="ignore")
+        normal_csv_writer.writeheader()
+        engineer_csv_writer.writeheader()
+        log_q = queue.Queue(maxsize=8192)
+        logger_stop_event = threading.Event()
+        logger_thread = threading.Thread(
+            target=csv_logger,
+            args=(log_q, normal_csv_file, normal_csv_writer, engineer_csv_file, engineer_csv_writer, logger_stop_event),
+            daemon=True,
+        )
+        logger_thread.start()
+        print(f"Logging normal CSV: {normal_log_path}")
+        print(f"Logging engineer CSV: {engineer_log_path}")
+
+    frame_q = queue.Queue(maxsize=args.queue_size)
+    reader_stats = {"bytes_in": 0, "frames_parsed": 0, "queue_drops": 0, "bad_frames": 0}
+    ser = None
+    reader_thread = None
+    reader_stop_event = None
+
+    start = time.perf_counter()
+    last_seq = None
+    fps_last_t = start
+    fps_last_n = 0
+    last_plot_sample_s = -1.0
+    last_axes_scale_s = -1.0
+    last_status_text_s = -1.0
+
+    state = {
+        "port": initial_port,
+        "baud": args.baud,
+        "frames_seen": 0,
+        "seq_drops": 0,
+        "queue_drops": 0,
+        "bad_frames": 0,
+        "fps": 0.0,
+        "latest": None,
+        "connected": False,
+        "ports": [],
+        "conn_msg": "Select a COM port and click Connect.",
+    }
+
+    fig = plt.figure(figsize=(16, 10))
+    fig.suptitle("Amaltheia VCP Live Telemetry", fontsize=14)
+    fig.subplots_adjust(bottom=0.14)
+    gs = gridspec.GridSpec(5, 2, width_ratios=[4.0, 2.5])
+
+    ax_att = fig.add_subplot(gs[0, 0])
+    l_roll, = ax_att.plot([], [], "r-", label="Roll")
+    l_pitch, = ax_att.plot([], [], "g-", label="Pitch")
+    l_yaw, = ax_att.plot([], [], "b-", alpha=0.7, label="Yaw")
+    ax_att.set_ylabel("deg")
+    ax_att.set_title("AHRS Attitude")
+    ax_att.set_ylim(-180.0, 180.0)
+    ax_att.grid(True)
+    ax_att.legend(loc="upper right")
+
+    ax_rate = fig.add_subplot(gs[1, 0], sharex=ax_att)
+    l_rr, = ax_rate.plot([], [], "r-", label="Roll Rate")
+    l_pr, = ax_rate.plot([], [], "g-", label="Pitch Rate")
+    l_yr, = ax_rate.plot([], [], "b-", label="Yaw Rate")
+    l_rr_cmd, = ax_rate.plot([], [], "r--", alpha=0.5, label="Roll Cmd")
+    l_pr_cmd, = ax_rate.plot([], [], "g--", alpha=0.5, label="Pitch Cmd")
+    l_yr_cmd, = ax_rate.plot([], [], "b--", alpha=0.5, label="Yaw Cmd")
+    ax_rate.set_ylabel("deg/s")
+    ax_rate.set_title("Rate Loop Tracking")
+    ax_rate.grid(True)
+    ax_rate.legend(loc="upper right", ncol=2, fontsize=8)
+
+    ax_pid = fig.add_subplot(gs[2, 0], sharex=ax_att)
+    l_pid_r, = ax_pid.plot([], [], "r-", label="PID Roll Out")
+    l_pid_p, = ax_pid.plot([], [], "g-", label="PID Pitch Out")
+    l_pid_y, = ax_pid.plot([], [], "b-", label="PID Yaw Out")
+    ax_pid.set_ylabel("PID out")
+    ax_pid.set_title("Inner Loop PID Outputs")
+    ax_pid.grid(True)
+    ax_pid.legend(loc="upper right")
+
+    ax_mot = fig.add_subplot(gs[3, 0], sharex=ax_att)
+    l_m1, = ax_mot.plot([], [], "r-", label="M1")
+    l_m2, = ax_mot.plot([], [], "g-", label="M2")
+    l_m3, = ax_mot.plot([], [], "b-", label="M3")
+    l_m4, = ax_mot.plot([], [], "k-", label="M4")
+    ax_mot.set_ylabel("Motor %")
+    ax_mot.set_ylim(-5.0, 105.0)
+    ax_mot.set_title("Motor Outputs")
+    ax_mot.grid(True)
+    ax_mot.legend(loc="upper right", ncol=4, fontsize=8)
+
+    ax_alt = fig.add_subplot(gs[4, 0], sharex=ax_att)
+    l_z, = ax_alt.plot([], [], "m-", label="Z")
+    l_tz, = ax_alt.plot([], [], "m--", alpha=0.7, label="Target Z")
+    l_vz, = ax_alt.plot([], [], "c-", label="VZ")
+    l_ffvz, = ax_alt.plot([], [], "c--", alpha=0.7, label="FF VZ")
+    ax_alt.set_ylabel("m / m/s")
+    ax_alt.set_xlabel("Host Time (s)")
+    ax_alt.set_title("Altitude / Vertical Dynamics")
+    ax_alt.grid(True)
+    ax_alt.legend(loc="upper right", ncol=2, fontsize=8)
+
+    ax_text = fig.add_subplot(gs[:, 1])
+    ax_text.axis("off")
+    status_text = ax_text.text(
+        0.01,
+        0.99,
+        "",
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=9,
+    )
+
+    # Bottom control strip: command, port selection, and connection controls.
+    ax_cmd_box = fig.add_axes([0.08, 0.02, 0.33, 0.04])
+    cmd_box = TextBox(ax_cmd_box, "Command", initial="")
+    ax_btn_send = fig.add_axes([0.42, 0.02, 0.06, 0.04])
+    btn_send = Button(ax_btn_send, "Send")
+    ax_port_box = fig.add_axes([0.72, 0.02, 0.14, 0.04])
+    port_box = TextBox(ax_port_box, "Port", initial=initial_port)
+    ax_btn_connect = fig.add_axes([0.87, 0.02, 0.06, 0.04])
+    ax_btn_disconnect = fig.add_axes([0.94, 0.02, 0.05, 0.04])
+    ax_btn_refresh = fig.add_axes([0.72, 0.07, 0.14, 0.04])
+    btn_connect = Button(ax_btn_connect, "Connect")
+    ax_btn_3d = fig.add_axes([0.5, 0.07, 0.1, 0.04])
+    btn_disconnect = Button(ax_btn_disconnect, "Disconnect")
+    btn_refresh = Button(ax_btn_refresh, "Refresh Ports")
+
+    def refresh_ports(_event=None):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        state["ports"] = ports
+        if ports:
+            state["conn_msg"] = f"Ports: {', '.join(ports[:6])}"
+            if not port_box.text.strip():
+                port_box.set_val(ports[0])
+        else:
+            state["conn_msg"] = "No COM ports detected."
+
+    def disconnect_serial(_event=None):
+        nonlocal ser, reader_thread, reader_stop_event
+        if reader_stop_event is not None:
+            reader_stop_event.set()
+            reader_stop_event = None
+        if reader_thread is not None:
+            try:
+                reader_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
+            reader_thread = None
+        if ser is not None:
+            try:
+                if ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+            ser = None
+        state["connected"] = False
+        state["conn_msg"] = "Disconnected."
+
+    def connect_serial(_event=None):
+        nonlocal ser, reader_thread, reader_stop_event, last_seq, fps_last_t, fps_last_n
+        selected_port = port_box.text.strip()
+        if not selected_port:
+            state["conn_msg"] = "Enter/select a COM port first."
+            return
+
+        disconnect_serial()
+
+        try:
+            ser = serial.Serial(selected_port, args.baud, timeout=0.02)
+        except serial.SerialException as exc:
+            state["conn_msg"] = f"Open failed: {exc}"
+            state["port"] = selected_port
+            return
+
+        while True:
+            try:
+                frame_q.get_nowait()
+            except queue.Empty:
+                break
+
+        reader_stats["bytes_in"] = 0
+        reader_stats["frames_parsed"] = 0
+        reader_stats["queue_drops"] = 0
+        reader_stats["bad_frames"] = 0
+
+        reader_stop_event = threading.Event()
+        reader_thread = threading.Thread(
+            target=serial_reader,
+            args=(ser, frame_q, reader_stop_event, reader_stats),
+            daemon=True,
+        )
+        reader_thread.start()
+
+        state["port"] = selected_port
+        state["connected"] = True
+        state["conn_msg"] = f"Connected to {selected_port}"
+        last_seq = None
+        fps_last_t = time.perf_counter()
+        fps_last_n = state["frames_seen"]
+
+    def send_command(_event=None):
+        command = cmd_box.text.strip()
+        if not command:
+            state["conn_msg"] = "Enter a command first."
+            return
+        if ser is None or not ser.is_open:
+            state["conn_msg"] = "Connect before sending commands."
+            return
+
+        try:
+            ser.write((command + "\n").encode("ascii", errors="ignore"))
+            state["conn_msg"] = f"Sent command: {command}"
+            cmd_box.set_val("")
+        except serial.SerialException as exc:
+            state["conn_msg"] = f"Command send failed: {exc}"
+
+    btn_connect.on_clicked(connect_serial)
+    btn_disconnect.on_clicked(disconnect_serial)
+    btn_refresh.on_clicked(refresh_ports)
+    btn_send.on_clicked(send_command)
+    cmd_box.on_submit(send_command)
+    btn_3d = Button(ax_btn_3d, "3D View")
+    refresh_ports()
+
+    def update(_):
+        nonlocal last_seq, fps_last_t, fps_last_n
+        nonlocal last_plot_sample_s, last_axes_scale_s, last_status_text_s
+
+        drained = 0
+        tick_start = time.perf_counter()
+        drain_budget_s = max(0.001, args.drain_budget_ms * 0.001)
+        plot_sample_period_s = 1.0 / max(1.0, args.plot_sample_hz)
+        plot_dirty = False
+
+        while drained < 600 and (time.perf_counter() - tick_start) < drain_budget_s:
+            try:
+                frame = frame_q.get_nowait()
+            except queue.Empty:
+                break
+
+            now_s = time.perf_counter() - start
+            seq = frame["sequence"]
+            if last_seq is not None:
+                expected = (last_seq + 1) & 0xFFFF
+                if seq != expected:
+                    state["seq_drops"] += (seq - expected) & 0xFFFF
+            last_seq = seq
+
+            state["frames_seen"] += 1
+            state["latest"] = frame
+
+            if frame.get("packet_type") == "normal" and (now_s - last_plot_sample_s) >= plot_sample_period_s:
+                last_plot_sample_s = now_s
+                plot_dirty = True
+                t.append(now_s)
+                roll.append(frame["roll"])
+                pitch.append(frame["pitch"])
+                yaw.append(frame["yaw"])
+                roll_rate.append(frame["roll_rate"])
+                pitch_rate.append(frame["pitch_rate"])
+                yaw_rate.append(frame["yaw_rate"])
+                target_roll_rate.append(frame["target_rate_roll"])
+                target_pitch_rate.append(frame["target_rate_pitch"])
+                target_yaw_rate.append(frame["target_rate_yaw"])
+                pid_roll_out.append(frame["pid_roll_out"])
+                pid_pitch_out.append(frame["pid_pitch_out"])
+                pid_yaw_out.append(frame["pid_yaw_out"])
+                motor1.append(frame["motor1_pct"])
+                motor2.append(frame["motor2_pct"])
+                motor3.append(frame["motor3_pct"])
+                motor4.append(frame["motor4_pct"])
+                z.append(frame["z"])
+                target_z.append(frame["target_z"])
+                vz.append(frame["vz"])
+                ff_vz.append(frame["target_ff_vz"])
+
+            if log_q is not None:
+                row = {"host_time_s": now_s}
+                row.update(frame)
+                try:
+                    log_q.put_nowait(row)
+                except queue.Full:
+                    state["queue_drops"] += 1
+
+            drained += 1
+
+        now_perf = time.perf_counter()
+        elapsed = now_perf - fps_last_t
+        if elapsed >= 0.5:
+            state["fps"] = (state["frames_seen"] - fps_last_n) / elapsed
+            fps_last_n = state["frames_seen"]
+            fps_last_t = now_perf
+
+        state["queue_drops"] = reader_stats["queue_drops"]
+        state["bad_frames"] = reader_stats["bad_frames"]
+
+        
+        if plot_dirty and len(t) > 0:
+            t_list = list(t)
+            l_roll.set_data(t_list, list(roll))
+            l_pitch.set_data(t_list, list(pitch))
+            l_yaw.set_data(t_list, list(yaw))
+
+            l_rr.set_data(t_list, list(roll_rate))
+            l_pr.set_data(t_list, list(pitch_rate))
+            l_yr.set_data(t_list, list(yaw_rate))
+            l_rr_cmd.set_data(t_list, list(target_roll_rate))
+            l_pr_cmd.set_data(t_list, list(target_pitch_rate))
+            l_yr_cmd.set_data(t_list, list(target_yaw_rate))
+
+            l_pid_r.set_data(t_list, list(pid_roll_out))
+            l_pid_p.set_data(t_list, list(pid_pitch_out))
+            l_pid_y.set_data(t_list, list(pid_yaw_out))
+
+            l_m1.set_data(t_list, list(motor1))
+            l_m2.set_data(t_list, list(motor2))
+            l_m3.set_data(t_list, list(motor3))
+            l_m4.set_data(t_list, list(motor4))
+
+            l_z.set_data(t_list, list(z))
+            l_tz.set_data(t_list, list(target_z))
+            l_vz.set_data(t_list, list(vz))
+            l_ffvz.set_data(t_list, list(ff_vz))
+
+            tmax = t[-1]
+            tmin = max(0.0, tmax - args.window_sec)
+            for ax in (ax_att, ax_rate, ax_pid, ax_mot, ax_alt):
+                ax.set_xlim(tmin, tmax + 0.05)
+
+            if (now_perf - last_axes_scale_s) >= 0.5:
+                last_axes_scale_s = now_perf
+                for ax in (ax_att, ax_rate, ax_pid, ax_mot, ax_alt):
+                    ax.relim()
+                    ax.autoscale_view()
+
+        state["port"] = port_box.text.strip()
+        if (now_perf - last_status_text_s) >= 0.2:
+            last_status_text_s = now_perf
+            status_text.set_text(build_status_text(state))
+
+        return (
+            l_roll,
+            l_pitch,
+            l_yaw,
+            l_rr,
+            l_pr,
+            l_yr,
+            l_rr_cmd,
+            l_pr_cmd,
+            l_yr_cmd,
+            l_pid_r,
+            l_pid_p,
+            l_pid_y,
+            l_m1,
+            l_m2,
+            l_m3,
+            l_m4,
+            l_z,
+            l_tz,
+            l_vz,
+            l_ffvz,
+            status_text,
+        )
+        
+    # --- 3D Visualization ---
+    state["3d_view_open"] = False
+    state["3d_fig"] = None
+    state["3d_ax"] = None
+    state["3d_ani"] = None
+    state["3d_arm_lines"] = []
+    state["3d_motor_scatters"] = []
+    state["3d_thrust_lines"] = []
+
+    # --- 3D Model Constants ---
+    ARM_LEN = 0.15  # meters
+    MOTOR_POS = np.array([
+        [-ARM_LEN,  0.0,      0.0],  # M1 = -X
+        [ 0.0,     -ARM_LEN,  0.0],  # M2 = -Y
+        [ ARM_LEN,  0.0,      0.0],  # M3 = +X
+        [ 0.0,      ARM_LEN,  0.0],  # M4 = +Y
+    ])
+    MOTOR_COLORS = ['r', 'g', 'b', 'c']
+    MOTOR_LABELS = [
+        'M1 (-X)',
+        'M2 (-Y)',
+        'M3 (+X)',
+        'M4 (+Y)'
+    ]
+
+    def _update_3d_view(_):
+        if (
+            not state["3d_view_open"]
+            or state["latest"] is None
+            or state["latest"].get("packet_type") != "normal"
+        ):
+            return []
+
+        # --- Attitude Processing ---
+        # Get attitude in radians from the telemetry frame, same as the 2D plots.
+        # TEMPORARY diagnostic mapping:
+        # Physical M1/M3 motion is rotation about body Y -> pitch.
+        # Physical M2/M4 motion is rotation about body X -> roll.
+        roll_rad  = np.deg2rad(state["latest"]["pitch"])
+        pitch_rad = np.deg2rad(state["latest"]["roll"])
+        yaw_rad = np.deg2rad(state["latest"]["yaw"])
+
+        # --- 3D Rotation Matrices (Standard Aerospace Convention) ---
+        Rx = np.array([[1, 0, 0], [0, np.cos(roll_rad), -np.sin(roll_rad)], [0, np.sin(roll_rad), np.cos(roll_rad)]])
+        # A positive pitch value should be a pitch-up rotation. We negate the angle
+        # to align with the standard rotation matrix definition.
+        Ry = np.array([[np.cos(-pitch_rad), 0, np.sin(-pitch_rad)], [0, 1, 0], [-np.sin(-pitch_rad), 0, np.cos(-pitch_rad)]])
+        Rz = np.array([[np.cos(yaw_rad), -np.sin(yaw_rad), 0], [np.sin(yaw_rad), np.cos(yaw_rad), 0], [0, 0, 1]])
+        R = Rz @ Ry @ Rx
+
+        # Rotate motor positions
+        rotated_pos = (R @ MOTOR_POS.T).T
+
+        arm_pairs = ((0, 2), (1, 3))
+        for line, (a, b) in zip(state["3d_arm_lines"], arm_pairs):
+            line.set_data_3d(
+                [rotated_pos[a, 0], rotated_pos[b, 0]],
+                [rotated_pos[a, 1], rotated_pos[b, 1]],
+                [rotated_pos[a, 2], rotated_pos[b, 2]]
+            )
+
+        motor_thrusts = [
+            state["latest"]["motor1_pct"],
+            state["latest"]["motor2_pct"],
+            state["latest"]["motor3_pct"],
+            state["latest"]["motor4_pct"]
+        ]
+
+        for i in range(4):
+            pos = rotated_pos[i]
+            state["3d_motor_scatters"][i]._offsets3d = ([pos[0]], [pos[1]], [pos[2]])
+
+            thrust_mag = motor_thrusts[i] / 100.0 * 0.35  # Increased scale for better visibility
+            thrust_vec_local = np.array([0, 0, thrust_mag]) # Thrust is along local Z
+            thrust_vec_world = R @ thrust_vec_local
+            thrust_end = pos + thrust_vec_world
+
+            state["3d_thrust_lines"][i].set_data_3d(
+                [pos[0], thrust_end[0]],
+                [pos[1], thrust_end[1]],
+                [pos[2], thrust_end[2]]
+            )
+        
+        state["3d_ax"].set_title(
+            f"3D Orientation | R:{state['latest']['roll']:.1f} "
+            f"P:{state['latest']['pitch']:.1f} Y:{state['latest']['yaw']:.1f}"
+        )
+
+        return (
+            state["3d_arm_lines"]
+            + state["3d_motor_scatters"]
+            + state["3d_thrust_lines"]
+        )
+
+    def on_3d_close(event):
+        state["3d_view_open"] = False
+        if state["3d_ani"] is not None:
+            state["3d_ani"].event_source.stop()
+        state["3d_fig"] = None
+        state["3d_ax"] = None
+        state["3d_ani"] = None
+        state["3d_arm_lines"] = []
+        state["3d_motor_scatters"] = []
+        state["3d_thrust_lines"] = []
+        print("3D view closed.")
+
+    def show_3d_view(_event=None):
+        if state["3d_view_open"]:
+            return
+        state["3d_view_open"] = True
+        state["3d_fig"] = plt.figure(figsize=(8, 8))
+        state["3d_fig"].canvas.mpl_connect('close_event', on_3d_close)
+        state["3d_ax"] = state["3d_fig"].add_subplot(111, projection='3d')
+        ax = state["3d_ax"]
+        lim = ARM_LEN * 1.5
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, lim)
+        ax.set_xlabel("X (North)")
+        ax.set_ylabel("Y (West)")
+        ax.set_zlabel("Z (Up)")
+
+        state["3d_arm_lines"] = [
+            ax.plot([], [], [], 'k-')[0],
+            ax.plot([], [], [], 'k-')[0],
+        ]
+        state["3d_motor_scatters"] = [
+            ax.scatter(MOTOR_POS[i, 0], MOTOR_POS[i, 1], MOTOR_POS[i, 2], c=MOTOR_COLORS[i], s=100, label=MOTOR_LABELS[i])
+            for i in range(4)
+        ]
+        state["3d_thrust_lines"] = [
+            ax.plot([], [], [], color=MOTOR_COLORS[i], linewidth=2.0)[0]
+            for i in range(4)
+        ]
+        ax.legend()
+
+        state["3d_ani"] = animation.FuncAnimation(
+            state["3d_fig"],
+            _update_3d_view,
+            interval=max(50, args.three_d_update_ms),
+            blit=False,
+            cache_frame_data=False,
+        )
+        plt.show(block=False)
+        print("3D view opened.")
+
+    btn_3d.on_clicked(show_3d_view)
+
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        interval=max(10, args.update_ms),
+        blit=True, # Changed on 6-3-2026
+        cache_frame_data=False,
+    )
+
+    try:
+        plt.show()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        disconnect_serial()
+        if logger_stop_event is not None:
+            logger_stop_event.set()
+        if logger_thread is not None:
+            logger_thread.join(timeout=2.0)
+        if normal_csv_file is not None:
+            normal_csv_file.flush()
+            normal_csv_file.close()
+        if engineer_csv_file is not None:
+            engineer_csv_file.flush()
+            engineer_csv_file.close()
+        del ani
+        print("Closed.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

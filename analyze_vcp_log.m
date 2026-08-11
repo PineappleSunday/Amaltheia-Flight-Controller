@@ -1,0 +1,808 @@
+function results = analyze_vcp_log(csvPath, outDir)
+% ANALYZE_VCP_LOG Full analysis for Amaltheia VCP telemetry CSV logs.
+%
+% Usage:
+%   analyze_vcp_log()
+%   analyze_vcp_log("flight_log_VCP/vcp_dump_20260317_111353.csv")
+%   analyze_vcp_log(csvPath, outDir)
+%
+% Outputs:
+%   - Console summary
+%   - <outDir>/summary.txt
+%   - <outDir>/figure_*.png
+%   - <outDir>/analysis_results.mat
+
+if nargin < 1 || strlength(string(csvPath)) == 0
+    csvPath = find_default_csv();
+end
+
+if nargin < 2 || strlength(string(outDir)) == 0
+    [p, n, ~] = fileparts(csvPath);
+    outDir = fullfile(p, sprintf('%s_analysis', char(n)));
+end
+
+if ~exist(outDir, "dir")
+    mkdir(outDir);
+end
+
+fprintf("Loading CSV: %s\n", csvPath);
+T = readtable(csvPath, "PreserveVariableNames", true);
+N = height(T);
+if N < 2
+    error("CSV has insufficient rows (%d).", N);
+end
+
+% --- Resolve timeline ---
+t = get_numeric_column(T, {"host_time_s"});
+if isempty(t)
+    tick_ms = get_numeric_column(T, {"tick_ms"});
+    if ~isempty(tick_ms)
+        t = (tick_ms - tick_ms(1)) / 1000.0;
+    end
+end
+if isempty(t)
+    t = (0:N-1)';
+end
+t = t(:);
+t = t - t(1);
+
+% --- Core channels ---
+seq = get_numeric_column_or_nan(T, {"sequence"}, N);
+armed = get_numeric_column_or_nan(T, {"armed"}, N);
+drone_mode = get_numeric_column_or_nan(T, {"drone_mode"}, N);
+flight_mode = get_numeric_column_or_nan(T, {"flight_mode"}, N);
+sat_flags = get_numeric_column_or_nan(T, {"sat_flags"}, N);
+dt_sec = get_numeric_column_or_nan(T, {"dt_sec"}, N);
+
+roll = get_numeric_column_or_nan(T, {"roll"}, N);
+pitch = get_numeric_column_or_nan(T, {"pitch"}, N);
+yaw = get_numeric_column_or_nan(T, {"yaw"}, N);
+roll_rate = get_numeric_column_or_nan(T, {"roll_rate"}, N);
+pitch_rate = get_numeric_column_or_nan(T, {"pitch_rate"}, N);
+yaw_rate = get_numeric_column_or_nan(T, {"yaw_rate"}, N);
+
+tgt_roll_rate = get_numeric_column_or_nan(T, {"target_rate_roll"}, N);
+tgt_pitch_rate = get_numeric_column_or_nan(T, {"target_rate_pitch"}, N);
+tgt_yaw_rate = get_numeric_column_or_nan(T, {"target_rate_yaw"}, N);
+
+pid_roll_p = get_numeric_column_or_nan(T, {"pid_roll_p"}, N);
+pid_roll_i = get_numeric_column_or_nan(T, {"pid_roll_i"}, N);
+pid_roll_d = get_numeric_column_or_nan(T, {"pid_roll_d"}, N);
+pid_roll_out = get_numeric_column_or_nan(T, {"pid_roll_out"}, N);
+
+pid_pitch_p = get_numeric_column_or_nan(T, {"pid_pitch_p"}, N);
+pid_pitch_i = get_numeric_column_or_nan(T, {"pid_pitch_i"}, N);
+pid_pitch_d = get_numeric_column_or_nan(T, {"pid_pitch_d"}, N);
+pid_pitch_out = get_numeric_column_or_nan(T, {"pid_pitch_out"}, N);
+
+pid_yaw_p = get_numeric_column_or_nan(T, {"pid_yaw_p"}, N);
+pid_yaw_i = get_numeric_column_or_nan(T, {"pid_yaw_i"}, N);
+pid_yaw_d = get_numeric_column_or_nan(T, {"pid_yaw_d"}, N);
+pid_yaw_out = get_numeric_column_or_nan(T, {"pid_yaw_out"}, N);
+
+m1 = get_numeric_column_or_nan(T, {"motor1_pct"}, N);
+m2 = get_numeric_column_or_nan(T, {"motor2_pct"}, N);
+m3 = get_numeric_column_or_nan(T, {"motor3_pct"}, N);
+m4 = get_numeric_column_or_nan(T, {"motor4_pct"}, N);
+
+z = get_numeric_column_or_nan(T, {"z"}, N);
+vz = get_numeric_column_or_nan(T, {"vz"}, N);
+tgt_z = get_numeric_column_or_nan(T, {"target_z"}, N);
+tgt_ff_vz = get_numeric_column_or_nan(T, {"target_ff_vz"}, N);
+
+accel_x = get_numeric_column_or_nan(T, {"accel_x"}, N);
+accel_y = get_numeric_column_or_nan(T, {"accel_y"}, N);
+accel_z = get_numeric_column_or_nan(T, {"accel_z"}, N);
+gyro_x = get_numeric_column_or_nan(T, {"gyro_x"}, N);
+gyro_y = get_numeric_column_or_nan(T, {"gyro_y"}, N);
+gyro_z = get_numeric_column_or_nan(T, {"gyro_z"}, N);
+
+accel_norm = vecnorm([accel_x, accel_y, accel_z], 2, 2);
+gyro_norm = vecnorm([gyro_x, gyro_y, gyro_z], 2, 2);
+
+% --- Timing / stream quality ---
+dt_host = diff(t);
+dt_host = dt_host(dt_host > 0);
+if isempty(dt_host)
+    dt_host = nan;
+end
+fs_est = 1 / median(dt_host, "omitnan");
+duration_s = t(end) - t(1);
+
+seq_drops = compute_sequence_drops(seq);
+
+% --- Loop tracking metrics ---
+err_roll = tgt_roll_rate - roll_rate;
+err_pitch = tgt_pitch_rate - pitch_rate;
+err_yaw = tgt_yaw_rate - yaw_rate;
+
+metrics.roll = tracking_metrics(err_roll);
+metrics.pitch = tracking_metrics(err_pitch);
+metrics.yaw = tracking_metrics(err_yaw);
+
+% --- Saturation stats ---
+[sat_low_counts, sat_high_counts] = decode_sat_counts(sat_flags);
+
+% --- Useful derived indicators ---
+motor_mean = [mean(m1, "omitnan"), mean(m2, "omitnan"), mean(m3, "omitnan"), mean(m4, "omitnan")];
+motor_std = [std(m1, "omitnan"), std(m2, "omitnan"), std(m3, "omitnan"), std(m4, "omitnan")];
+motor_imbalance = max(motor_mean) - min(motor_mean);
+
+% --- Figures ---
+save_figure_time_domain(outDir, t, roll, pitch, yaw, roll_rate, pitch_rate, yaw_rate, ...
+    tgt_roll_rate, tgt_pitch_rate, tgt_yaw_rate, pid_roll_out, pid_pitch_out, pid_yaw_out, ...
+    m1, m2, m3, m4);
+
+save_figure_tracking(outDir, t, err_roll, err_pitch, err_yaw);
+
+save_figure_pid_terms(outDir, t, ...
+    pid_roll_p, pid_roll_i, pid_roll_d, pid_roll_out, ...
+    pid_pitch_p, pid_pitch_i, pid_pitch_d, pid_pitch_out, ...
+    pid_yaw_p, pid_yaw_i, pid_yaw_d, pid_yaw_out);
+
+save_figure_axis_motor_coupling(outDir, roll, pitch, pid_roll_out, pid_pitch_out, m1, m2, m3, m4);
+
+save_figure_vertical(outDir, t, z, tgt_z, vz, tgt_ff_vz, accel_norm, gyro_norm);
+
+save_figure_timing_sat(outDir, t, dt_sec, seq, sat_flags);
+
+% --- Interactive one-window dashboard (tabs) ---
+dashboard_fig = create_analysis_dashboard_window(t, ...
+    roll, pitch, yaw, roll_rate, pitch_rate, yaw_rate, ...
+    tgt_roll_rate, tgt_pitch_rate, tgt_yaw_rate, ...
+    pid_roll_p, pid_roll_i, pid_roll_d, pid_roll_out, ...
+    pid_pitch_p, pid_pitch_i, pid_pitch_d, pid_pitch_out, ...
+    pid_yaw_p, pid_yaw_i, pid_yaw_d, pid_yaw_out, ...
+    m1, m2, m3, m4, ...
+    err_roll, err_pitch, err_yaw, ...
+    z, tgt_z, vz, tgt_ff_vz, accel_norm, gyro_norm, ...
+    dt_sec, seq, sat_flags);
+savefig(dashboard_fig, fullfile(outDir, "analysis_dashboard.fig"));
+
+% --- Summary report ---
+summaryText = compose_summary(duration_s, N, fs_est, seq_drops, metrics, ...
+    motor_mean, motor_std, motor_imbalance, sat_low_counts, sat_high_counts, ...
+    armed, drone_mode, flight_mode);
+
+fprintf("%s\n", summaryText);
+fid = fopen(fullfile(outDir, "summary.txt"), "w");
+if fid >= 0
+    fprintf(fid, "%s\n", summaryText);
+    fclose(fid);
+end
+
+results = struct();
+results.csvPath = string(csvPath);
+results.outDir = string(outDir);
+results.samples = N;
+results.duration_s = duration_s;
+results.fs_est_hz = fs_est;
+results.seq_drops = seq_drops;
+results.metrics = metrics;
+results.sat_low_counts = sat_low_counts;
+results.sat_high_counts = sat_high_counts;
+results.motor_mean = motor_mean;
+results.motor_std = motor_std;
+results.motor_imbalance = motor_imbalance;
+results.time_s = t;
+results.err_roll = err_roll;
+results.err_pitch = err_pitch;
+results.err_yaw = err_yaw;
+
+save(fullfile(outDir, "analysis_results.mat"), "results");
+fprintf("Analysis artifacts saved to: %s\n", outDir);
+
+end
+
+
+function csvPath = find_default_csv()
+folders = {"flight_log_VCP", "flight_log", "."};
+bestFile = "";
+bestDnum = -inf;
+
+for i = 1:numel(folders)
+    if ~isfolder(folders{i})
+        continue;
+    end
+    L = dir(fullfile(folders{i}, "*.csv"));
+    for k = 1:numel(L)
+        if L(k).datenum > bestDnum
+            bestDnum = L(k).datenum;
+            bestFile = fullfile(L(k).folder, L(k).name);
+        end
+    end
+end
+
+if strlength(bestFile) == 0
+    [f, p] = uigetfile("*.csv", "Select VCP dump CSV");
+    if isequal(f, 0)
+        error("No CSV selected.");
+    end
+    csvPath = fullfile(p, f);
+else
+    csvPath = bestFile;
+end
+end
+
+
+function x = get_numeric_column(T, names)
+x = [];
+v = string(T.Properties.VariableNames);
+vLower = lower(v);
+for i = 1:numel(names)
+    key = string(names{i});
+    idx = find(vLower == lower(key), 1);
+    if ~isempty(idx)
+        raw = T.(v(idx));
+        if isnumeric(raw)
+            x = double(raw(:));
+        elseif iscell(raw)
+            x = str2double(string(raw(:)));
+        else
+            x = str2double(string(raw(:)));
+        end
+        return;
+    end
+end
+end
+
+
+function x = get_numeric_column_or_nan(T, names, N)
+x = get_numeric_column(T, names);
+if isempty(x)
+    x = nan(N, 1);
+    return;
+end
+x = x(:);
+if numel(x) < N
+    x(numel(x)+1:N, 1) = nan;
+elseif numel(x) > N
+    x = x(1:N);
+end
+end
+
+
+function drops = compute_sequence_drops(seq)
+if isempty(seq) || all(isnan(seq))
+    drops = NaN;
+    return;
+end
+seq = seq(~isnan(seq));
+if numel(seq) < 2
+    drops = 0;
+    return;
+end
+seq = uint16(seq(:));
+d = double(mod(double(seq(2:end)) - double(seq(1:end-1)), 65536));
+jumps = max(d - 1, 0);
+drops = sum(jumps);
+end
+
+
+function m = tracking_metrics(err)
+m = struct();
+m.mean = mean(err, "omitnan");
+m.std = std(err, "omitnan");
+m.rms = sqrt(mean(err.^2, "omitnan"));
+m.mae = mean(abs(err), "omitnan");
+eabs = abs(err(~isnan(err)));
+if isempty(eabs)
+    m.p95_abs = NaN;
+else
+    m.p95_abs = prctile(eabs, 95);
+end
+m.max_abs = max(abs(err), [], "omitnan");
+end
+
+
+function [lowCounts, highCounts] = decode_sat_counts(satFlags)
+if isempty(satFlags) || all(isnan(satFlags))
+    lowCounts = nan(1, 4);
+    highCounts = nan(1, 4);
+    return;
+end
+
+sat = satFlags(:);
+sat = sat(~isnan(sat));
+sat = uint8(sat);
+lowCounts = zeros(1, 4);
+highCounts = zeros(1, 4);
+for i = 1:4
+    lowCounts(i) = sum(bitget(sat, i) ~= 0);
+    highCounts(i) = sum(bitget(sat, i + 4) ~= 0);
+end
+end
+
+
+function save_figure_time_domain(outDir, t, roll, pitch, yaw, rr, pr, yr, trr, tpr, tyr, pido_r, pido_p, pido_y, m1, m2, m3, m4)
+f = figure("Name", "VCP Time Domain", "Color", "w", "Position", [120 80 1400 900]);
+tlo = tiledlayout(4, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo, "AHRS / Rate / PID / Motors");
+
+nexttile;
+plot(t, roll, "r", t, pitch, "g", t, yaw, "b"); grid on;
+ylabel("deg"); title("Attitude");
+legend("Roll", "Pitch", "Yaw", "Location", "best");
+
+nexttile;
+plot(t, rr, "r", t, trr, "r--", t, pr, "g", t, tpr, "g--", t, yr, "b", t, tyr, "b--"); grid on;
+ylabel("deg/s"); title("Rate Tracking");
+legend("Roll", "Roll cmd", "Pitch", "Pitch cmd", "Yaw", "Yaw cmd", "Location", "best");
+
+nexttile;
+plot(t, pido_r, "r", t, pido_p, "g", t, pido_y, "b"); grid on;
+ylabel("PID out"); title("Inner Loop PID Outputs");
+legend("Roll", "Pitch", "Yaw", "Location", "best");
+
+nexttile;
+plot(t, m1, "r", t, m2, "g", t, m3, "b", t, m4, "k"); grid on;
+ylabel("%"); xlabel("Time (s)"); title("Motor Outputs");
+legend("M1", "M2", "M3", "M4", "Location", "best");
+
+exportgraphics(f, fullfile(outDir, "figure_time_domain.png"), "Resolution", 180);
+close(f);
+end
+
+
+function save_figure_tracking(outDir, t, er, ep, ey)
+f = figure("Name", "VCP Tracking Error", "Color", "w", "Position", [140 110 1200 700]);
+tlo = tiledlayout(2, 2, "TileSpacing", "compact", "Padding", "compact");
+title(tlo, "Rate Tracking Errors");
+
+nexttile([1 2]);
+plot(t, er, "r", t, ep, "g", t, ey, "b"); grid on;
+ylabel("deg/s"); xlabel("Time (s)");
+legend("Roll err", "Pitch err", "Yaw err", "Location", "best");
+
+nexttile;
+histogram(er, 120, "FaceColor", [0.9 0.2 0.2]); grid on; title("Roll Error Hist");
+xlabel("deg/s");
+
+nexttile;
+histogram(ep, 120, "FaceColor", [0.2 0.8 0.2]); hold on;
+histogram(ey, 120, "FaceColor", [0.2 0.2 0.9]); grid on; title("Pitch/Yaw Error Hist");
+xlabel("deg/s");
+legend("Pitch", "Yaw");
+
+exportgraphics(f, fullfile(outDir, "figure_tracking_error.png"), "Resolution", 180);
+close(f);
+end
+
+
+function save_figure_pid_terms(outDir, t, rp, ri, rd, ro, pp, pi, pd, po, yp, yi, yd, yo)
+f = figure("Name", "VCP PID Terms", "Color", "w", "Position", [180 120 1400 900]);
+tlo = tiledlayout(3, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo, "PID Terms (P / I / D / Out)");
+
+nexttile;
+plot(t, rp, "r-", t, ri, "b-", t, rd, "g-", t, ro, "k-", "LineWidth", 1.1); grid on;
+ylabel("Roll");
+legend("P", "I", "D", "Out", "Location", "best");
+
+nexttile;
+plot(t, pp, "r-", t, pi, "b-", t, pd, "g-", t, po, "k-", "LineWidth", 1.1); grid on;
+ylabel("Pitch");
+legend("P", "I", "D", "Out", "Location", "best");
+
+nexttile;
+plot(t, yp, "r-", t, yi, "b-", t, yd, "g-", t, yo, "k-", "LineWidth", 1.1); grid on;
+ylabel("Yaw"); xlabel("Time (s)");
+legend("P", "I", "D", "Out", "Location", "best");
+
+exportgraphics(f, fullfile(outDir, "figure_pid_terms.png"), "Resolution", 180);
+close(f);
+end
+
+
+function save_figure_axis_motor_coupling(outDir, roll, pitch, pid_roll_out, pid_pitch_out, m1, m2, m3, m4)
+f = figure("Name", "VCP Axis-PID-Motor Coupling", "Color", "w", "Position", [220 120 1400 920]);
+tlo = tiledlayout(2, 2, "TileSpacing", "compact", "Padding", "compact");
+title(tlo, "Axis / PID Output / Motor Coupling");
+
+nexttile;
+mask = ~isnan(pitch) & ~isnan(pid_pitch_out);
+h = scatter(pitch(mask), pid_pitch_out(mask), 12, [0.1 0.3 1.0], "filled");
+set_scatter_alpha(h, 0.18);
+grid on;
+xlabel("Pitch (deg)");
+ylabel("PID Pitch Out");
+title("Pitch vs PID Pitch Out");
+
+nexttile;
+mask_m13 = ~isnan(pid_pitch_out) & ~isnan(m1) & ~isnan(m3);
+h1 = scatter(pid_pitch_out(mask_m13), m1(mask_m13), 16, [0.1 0.35 0.95], "filled");
+hold on;
+h2 = scatter(pid_pitch_out(mask_m13), m3(mask_m13), 16, [0.95 0.6 0.0], "filled");
+hold off;
+set_scatter_alpha(h1, 0.18);
+set_scatter_alpha(h2, 0.18);
+grid on;
+xlabel("PID Pitch Out");
+ylabel("Motor %");
+title("PID Pitch Out vs Motors");
+legend("M1 (Front)", "M3 (Rear)", "Location", "best");
+
+nexttile;
+mask = ~isnan(roll) & ~isnan(pid_roll_out);
+h = scatter(roll(mask), pid_roll_out(mask), 12, [1.0 0.1 0.1], "filled");
+set_scatter_alpha(h, 0.18);
+grid on;
+xlabel("Roll (deg)");
+ylabel("PID Roll Out");
+title("Roll vs PID Roll Out");
+
+nexttile;
+mask_m24 = ~isnan(pid_roll_out) & ~isnan(m2) & ~isnan(m4);
+h1 = scatter(pid_roll_out(mask_m24), m2(mask_m24), 16, [0.05 0.35 0.95], "filled");
+hold on;
+h2 = scatter(pid_roll_out(mask_m24), m4(mask_m24), 16, [0.95 0.6 0.0], "filled");
+hold off;
+set_scatter_alpha(h1, 0.18);
+set_scatter_alpha(h2, 0.18);
+grid on;
+xlabel("PID Roll Out");
+ylabel("Motor %");
+title("PID Roll Out vs Motors");
+legend("M2 (Right)", "M4 (Left)", "Location", "best");
+
+exportgraphics(f, fullfile(outDir, "figure_axis_motor_coupling.png"), "Resolution", 180);
+close(f);
+end
+
+
+function set_scatter_alpha(h, a)
+try
+    h.MarkerFaceAlpha = a;
+    h.MarkerEdgeAlpha = a;
+catch
+    % Older MATLAB versions may not support per-marker alpha.
+end
+end
+
+
+function save_figure_vertical(outDir, t, z, tz, vz, ffvz, an, gn)
+f = figure("Name", "VCP Vertical + Sensor Norms", "Color", "w", "Position", [210 140 1300 800]);
+tlo = tiledlayout(3, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo, "Vertical Loop and Sensor Norms");
+
+nexttile;
+plot(t, z, "m", t, tz, "m--"); grid on;
+ylabel("m"); title("Altitude");
+legend("z", "target z", "Location", "best");
+
+nexttile;
+plot(t, vz, "c", t, ffvz, "c--"); grid on;
+ylabel("m/s"); title("Vertical Velocity");
+legend("vz", "target ff vz", "Location", "best");
+
+nexttile;
+plot(t, an, "k", t, gn, "Color", [0.2 0.2 0.8]); grid on;
+ylabel("norm"); xlabel("Time (s)"); title("Accel / Gyro Norms");
+legend("|accel|", "|gyro|", "Location", "best");
+
+exportgraphics(f, fullfile(outDir, "figure_vertical_sensor_norms.png"), "Resolution", 180);
+close(f);
+end
+
+
+function save_figure_timing_sat(outDir, t, dt_mcu, seq, sat)
+f = figure("Name", "VCP Timing + Saturation", "Color", "w", "Position", [240 160 1400 850]);
+tlo = tiledlayout(3, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo, "Timing Quality and Saturation Flags");
+
+nexttile;
+plot(t, dt_mcu * 1000.0, "k"); grid on;
+ylabel("ms"); title("MCU dt");
+
+nexttile;
+plot(t, seq, "Color", [0.15 0.15 0.8]); grid on;
+ylabel("seq"); title("Sequence Counter");
+
+nexttile;
+if isempty(sat)
+    plot(t, zeros(size(t)));
+else
+    sat_clean = sat;
+    sat_clean(isnan(sat_clean)) = 0;
+    sat_u8 = uint8(sat_clean);
+    y1 = bitget(sat_u8, 1) + 2 * bitget(sat_u8, 2) + 4 * bitget(sat_u8, 3) + 8 * bitget(sat_u8, 4);
+    y2 = bitget(sat_u8, 5) + 2 * bitget(sat_u8, 6) + 4 * bitget(sat_u8, 7) + 8 * bitget(sat_u8, 8);
+    stairs(t, y1, "r", "LineWidth", 1.1); hold on;
+    stairs(t, y2, "b", "LineWidth", 1.1);
+    legend("low-side nibble", "high-side nibble", "Location", "best");
+end
+grid on; ylabel("bits"); xlabel("Time (s)"); title("Saturation Flag Nibbles");
+
+exportgraphics(f, fullfile(outDir, "figure_timing_saturation.png"), "Resolution", 180);
+close(f);
+end
+
+
+function f = create_analysis_dashboard_window(t, ...
+    roll, pitch, yaw, rr, pr, yr, trr, tpr, tyr, ...
+    rp, ri, rd, ro, pp, pi, pd, po, yp, yi, yd, yo, ...
+    m1, m2, m3, m4, er, ep, ey, z, tz, vz, ffvz, an, gn, dt_mcu, seq, sat)
+
+f = figure("Name", "Amaltheia VCP Analysis Dashboard", "Color", "w", "Position", [80 40 1500 980]);
+tg = uitabgroup(f);
+time_axes = gobjects(0);
+
+% Time Domain
+tab1 = uitab(tg, "Title", "Time Domain");
+tlo1 = tiledlayout(tab1, 4, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo1, "AHRS / Rate / PID / Motors");
+
+nexttile(tlo1);
+hold on;
+plot(t, roll, "r");
+plot(t, pitch, "g");
+plot(t, yaw, "b");
+hold off; grid on;
+ylabel("deg"); title("Attitude");
+legend("Roll", "Pitch", "Yaw", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo1);
+hold on;
+plot(t, rr, "r");
+plot(t, trr, "r--");
+plot(t, pr, "g");
+plot(t, tpr, "g--");
+plot(t, yr, "b");
+plot(t, tyr, "b--");
+hold off; grid on;
+ylabel("deg/s"); title("Rate Tracking");
+legend("Roll", "Roll cmd", "Pitch", "Pitch cmd", "Yaw", "Yaw cmd", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo1);
+hold on;
+plot(t, ro, "r");
+plot(t, po, "g");
+plot(t, yo, "b");
+hold off; grid on;
+ylabel("PID out"); title("Inner Loop PID Outputs");
+legend("Roll", "Pitch", "Yaw", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo1);
+hold on;
+plot(t, m1, "r");
+plot(t, m2, "g");
+plot(t, m3, "b");
+plot(t, m4, "k");
+hold off; grid on;
+ylabel("%"); xlabel("Time (s)"); title("Motor Outputs");
+legend("M1", "M2", "M3", "M4", "Location", "best");
+time_axes(end+1) = gca;
+
+% Tracking Error
+tab2 = uitab(tg, "Title", "Tracking");
+tlo2 = tiledlayout(tab2, 2, 2, "TileSpacing", "compact", "Padding", "compact");
+title(tlo2, "Rate Tracking Errors");
+
+nexttile(tlo2, [1 2]);
+hold on;
+plot(t, er, "r");
+plot(t, ep, "g");
+plot(t, ey, "b");
+hold off; grid on;
+ylabel("deg/s"); xlabel("Time (s)");
+legend("Roll err", "Pitch err", "Yaw err", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo2);
+histogram(er, 120, "FaceColor", [0.9 0.2 0.2]); grid on; title("Roll Error Hist");
+xlabel("deg/s");
+
+nexttile(tlo2);
+histogram(ep, 120, "FaceColor", [0.2 0.8 0.2]); hold on;
+histogram(ey, 120, "FaceColor", [0.2 0.2 0.9]); hold off;
+grid on; title("Pitch/Yaw Error Hist");
+xlabel("deg/s");
+legend("Pitch", "Yaw");
+
+% PID Terms
+tab3 = uitab(tg, "Title", "PID Terms");
+tlo3 = tiledlayout(tab3, 3, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo3, "PID Terms (P / I / D / Out)");
+
+nexttile(tlo3);
+hold on;
+plot(t, rp, "r-", "LineWidth", 1.1);
+plot(t, ri, "b-", "LineWidth", 1.1);
+plot(t, rd, "g-", "LineWidth", 1.1);
+plot(t, ro, "k-", "LineWidth", 1.1);
+hold off; grid on;
+ylabel("Roll");
+legend("P", "I", "D", "Out", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo3);
+hold on;
+plot(t, pp, "r-", "LineWidth", 1.1);
+plot(t, pi, "b-", "LineWidth", 1.1);
+plot(t, pd, "g-", "LineWidth", 1.1);
+plot(t, po, "k-", "LineWidth", 1.1);
+hold off; grid on;
+ylabel("Pitch");
+legend("P", "I", "D", "Out", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo3);
+hold on;
+plot(t, yp, "r-", "LineWidth", 1.1);
+plot(t, yi, "b-", "LineWidth", 1.1);
+plot(t, yd, "g-", "LineWidth", 1.1);
+plot(t, yo, "k-", "LineWidth", 1.1);
+hold off; grid on;
+ylabel("Yaw"); xlabel("Time (s)");
+legend("P", "I", "D", "Out", "Location", "best");
+time_axes(end+1) = gca;
+
+% Vertical + Sensors
+tab4 = uitab(tg, "Title", "Vertical/Sensors");
+tlo4 = tiledlayout(tab4, 3, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo4, "Vertical Loop and Sensor Norms");
+
+nexttile(tlo4);
+hold on;
+plot(t, z, "m");
+plot(t, tz, "m--");
+hold off; grid on;
+ylabel("m"); title("Altitude");
+legend("z", "target z", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo4);
+hold on;
+plot(t, vz, "c");
+plot(t, ffvz, "c--");
+hold off; grid on;
+ylabel("m/s"); title("Vertical Velocity");
+legend("vz", "target ff vz", "Location", "best");
+time_axes(end+1) = gca;
+
+nexttile(tlo4);
+hold on;
+plot(t, an, "k");
+plot(t, gn, "Color", [0.2 0.2 0.8]);
+hold off; grid on;
+ylabel("norm"); xlabel("Time (s)"); title("Accel / Gyro Norms");
+legend("|accel|", "|gyro|", "Location", "best");
+time_axes(end+1) = gca;
+
+% Timing + Saturation
+tab5 = uitab(tg, "Title", "Timing/Sat");
+tlo5 = tiledlayout(tab5, 3, 1, "TileSpacing", "compact", "Padding", "compact");
+title(tlo5, "Timing Quality and Saturation Flags");
+
+nexttile(tlo5);
+plot(t, dt_mcu * 1000.0, "k"); grid on;
+ylabel("ms"); title("MCU dt");
+time_axes(end+1) = gca;
+
+nexttile(tlo5);
+plot(t, seq, "Color", [0.15 0.15 0.8]); grid on;
+ylabel("seq"); title("Sequence Counter");
+time_axes(end+1) = gca;
+
+nexttile(tlo5);
+if isempty(sat)
+    plot(t, zeros(size(t)));
+else
+    sat_clean = sat;
+    sat_clean(isnan(sat_clean)) = 0;
+    sat_u8 = uint8(sat_clean);
+    y1 = bitget(sat_u8, 1) + 2 * bitget(sat_u8, 2) + 4 * bitget(sat_u8, 3) + 8 * bitget(sat_u8, 4);
+    y2 = bitget(sat_u8, 5) + 2 * bitget(sat_u8, 6) + 4 * bitget(sat_u8, 7) + 8 * bitget(sat_u8, 8);
+    stairs(t, y1, "r", "LineWidth", 1.1); hold on;
+    stairs(t, y2, "b", "LineWidth", 1.1); hold off;
+    legend("low-side nibble", "high-side nibble", "Location", "best");
+end
+grid on; ylabel("bits"); xlabel("Time (s)"); title("Saturation Flag Nibbles");
+time_axes(end+1) = gca;
+
+% Axis / PID / motor scatter diagnostics
+tab6 = uitab(tg, "Title", "Axis/Motor");
+tlo6 = tiledlayout(tab6, 2, 2, "TileSpacing", "compact", "Padding", "compact");
+title(tlo6, "Axis / PID Output / Motor Coupling");
+
+nexttile(tlo6);
+mask = ~isnan(pitch) & ~isnan(po);
+h = scatter(pitch(mask), po(mask), 12, [0.1 0.3 1.0], "filled");
+set_scatter_alpha(h, 0.18);
+grid on;
+xlabel("Pitch (deg)");
+ylabel("PID Pitch Out");
+title("Pitch vs PID Pitch Out");
+
+nexttile(tlo6);
+mask_m13 = ~isnan(po) & ~isnan(m1) & ~isnan(m3);
+h1 = scatter(po(mask_m13), m1(mask_m13), 16, [0.1 0.35 0.95], "filled");
+hold on;
+h2 = scatter(po(mask_m13), m3(mask_m13), 16, [0.95 0.6 0.0], "filled");
+hold off;
+set_scatter_alpha(h1, 0.18);
+set_scatter_alpha(h2, 0.18);
+grid on;
+xlabel("PID Pitch Out");
+ylabel("Motor %");
+title("PID Pitch Out vs Motors");
+legend("M1 (Front)", "M3 (Rear)", "Location", "best");
+
+nexttile(tlo6);
+mask = ~isnan(roll) & ~isnan(ro);
+h = scatter(roll(mask), ro(mask), 12, [1.0 0.1 0.1], "filled");
+set_scatter_alpha(h, 0.18);
+grid on;
+xlabel("Roll (deg)");
+ylabel("PID Roll Out");
+title("Roll vs PID Roll Out");
+
+nexttile(tlo6);
+mask_m24 = ~isnan(ro) & ~isnan(m2) & ~isnan(m4);
+h1 = scatter(ro(mask_m24), m2(mask_m24), 16, [0.05 0.35 0.95], "filled");
+hold on;
+h2 = scatter(ro(mask_m24), m4(mask_m24), 16, [0.95 0.6 0.0], "filled");
+hold off;
+set_scatter_alpha(h1, 0.18);
+set_scatter_alpha(h2, 0.18);
+grid on;
+xlabel("PID Roll Out");
+ylabel("Motor %");
+title("PID Roll Out vs Motors");
+legend("M2 (Right)", "M4 (Left)", "Location", "best");
+
+% Link all time-domain axes so zoom/pan on one propagates to all.
+if ~isempty(time_axes)
+    linkaxes(time_axes, "x");
+    xlim(time_axes(1), [min(t) max(t)]);
+end
+
+end
+
+
+function txt = compose_summary(duration_s, N, fs_est, seq_drops, metrics, motor_mean, motor_std, motor_imbalance, sat_low, sat_high, armed, mode_vals, fmode_vals)
+armed_ratio = mean(armed ~= 0, "omitnan");
+dominant_mode = dominant_value(mode_vals);
+dominant_fmode = dominant_value(fmode_vals);
+
+txt = sprintf([ ...
+    '=== Amaltheia VCP Analysis Summary ===\n' ...
+    'Samples: %d\n' ...
+    'Duration: %.3f s\n' ...
+    'Estimated stream rate: %.2f Hz\n' ...
+    'Sequence drops: %.0f\n' ...
+    'Armed ratio: %.2f %%\n' ...
+    'Dominant drone_mode: %g\n' ...
+    'Dominant flight_mode: %g\n\n' ...
+    'Rate Error Metrics (deg/s):\n' ...
+    '  Roll  RMS=%.4f MAE=%.4f P95|e|=%.4f Max|e|=%.4f\n' ...
+    '  Pitch RMS=%.4f MAE=%.4f P95|e|=%.4f Max|e|=%.4f\n' ...
+    '  Yaw   RMS=%.4f MAE=%.4f P95|e|=%.4f Max|e|=%.4f\n\n' ...
+    'Motor Means (%%): [%.3f %.3f %.3f %.3f]\n' ...
+    'Motor Std (%%):   [%.3f %.3f %.3f %.3f]\n' ...
+    'Motor mean imbalance (max-min): %.3f %%\n\n' ...
+    'Saturation counts (low-side bits M1..M4):  [%.0f %.0f %.0f %.0f]\n' ...
+    'Saturation counts (high-side bits M1..M4): [%.0f %.0f %.0f %.0f]\n'], ...
+    N, duration_s, fs_est, seq_drops, 100.0 * armed_ratio, dominant_mode, dominant_fmode, ...
+    metrics.roll.rms, metrics.roll.mae, metrics.roll.p95_abs, metrics.roll.max_abs, ...
+    metrics.pitch.rms, metrics.pitch.mae, metrics.pitch.p95_abs, metrics.pitch.max_abs, ...
+    metrics.yaw.rms, metrics.yaw.mae, metrics.yaw.p95_abs, metrics.yaw.max_abs, ...
+    motor_mean(1), motor_mean(2), motor_mean(3), motor_mean(4), ...
+    motor_std(1), motor_std(2), motor_std(3), motor_std(4), ...
+    motor_imbalance, ...
+    sat_low(1), sat_low(2), sat_low(3), sat_low(4), ...
+    sat_high(1), sat_high(2), sat_high(3), sat_high(4));
+end
+
+
+function v = dominant_value(x)
+x = x(~isnan(x));
+if isempty(x)
+    v = NaN;
+else
+    v = mode(x);
+end
+end

@@ -49,8 +49,6 @@ float PID_Calculate(PIDController* pid, float actual, float goal) {
     //Derivative on measurement
     float dt = pid->cycle_time_seconds;
     if (dt <= 0.0f) dt = 0.002f;
-    pid->cycle_time_seconds = dt;
-    if (dt <= 0.0f) dt = 0.002f;
     float D_raw = -pid->kd * (actual - pid->previous_actual) / dt;
 
     // Apply Low Pass Filter if alpha is set (0.0 to 1.0)
@@ -94,4 +92,16 @@ void PID_Reset(PIDController* pid) {
     if (!pid) return;
     pid->previous_error = 0.0f;
     pid->previous_i = 0.0f;
+    pid->previous_d_filtered = 0.0f;
+    pid->previous_actual = 0.0f;
+    pid->p_out = 0.0f;
+    pid->i_out = 0.0f;
+    pid->d_out = 0.0f;
+    pid->output = 0.0f;
+}
+
+void PID_ResetWithMeasurement(PIDController* pid, float actual_now) {
+    if (!pid) return;
+    PID_Reset(pid);
+    pid->previous_actual = actual_now;
 }

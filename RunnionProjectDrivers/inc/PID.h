@@ -67,6 +67,13 @@ float PID_Calculate(PIDController* pid, float actual, float goal);
 void PID_Reset(PIDController* pid);
 
 /**
+ * @brief Resets internal PID state and seeds derivative memory with current measurement.
+ *
+ * Use this when transitioning flight modes or (re)arming to avoid first-cycle D-term kick.
+ */
+void PID_ResetWithMeasurement(PIDController* pid, float actual_now);
+
+/**
  * @brief Helper to calculate Alpha for the D-term filter based on frequency.
  */
 float PID_Calculate_Alpha(float cutoff_hz, float loop_time_s);

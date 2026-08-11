@@ -9,24 +9,9 @@
 #include <stdbool.h>
 
 #ifndef AHRS_MADGWICK_BETA
-#define AHRS_MADGWICK_BETA 0.06f
+#define AHRS_MADGWICK_BETA 0.04f
 #endif
 
-// Set to 1 if accel axes must be mapped with the same transform as gyro:
-// [ax_body, ay_body, az_body] = [-ay_sensor, ax_sensor, az_sensor]
-#ifndef AHRS_MAP_ACCEL_WITH_GYRO_FRAME
-#define AHRS_MAP_ACCEL_WITH_GYRO_FRAME 1
-#endif
-
-typedef struct {
-    float roll_bias;
-    float pitch_bias;
-    float yaw_bias;
-    bool is_calibrated;
-} AHRS_Offsets_t;
-
-// This tells main.c "There is a variable named g_offsets defined somewhere else"
-extern AHRS_Offsets_t g_offsets;
 /**
  * @brief Raw and processed sensor data from the IMU.
  */

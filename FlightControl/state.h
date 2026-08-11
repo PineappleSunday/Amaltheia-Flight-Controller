@@ -3,36 +3,60 @@
 #define STATE_H
 
 #include <stdint.h>
-
+#include <stdbool.h>
 
 #define MODE_MANUAL_LEVEL  1  // Auto-level on, but user controls vertical
 #define MODE_MISSION       2  // Following your mission_plan[64] string
 #define MODE_THRUST_STAND  3
-#define MODE_AHRS_ONLY 	   4
+#define MODE_ENGINEER      4  // Ground diagnostics with raw VCP sensor packets
+
+#define FLIGHT_MODE_PBIT_OK    55
+#define FLIGHT_MODE_PBIT_FAIL  56
 
 #define SUBMODE_STABLE     0
 #define SUBMODE_TAKEOFF    1
 
-// Kinematic State of the drone (Single Source of Truth)
+/*
+ * Active flight PIDs operate in the M1-forward aircraft frame.
+ * vehicleState_t attitude/rates remain in the AHRS/FC frame.
+ */
+
+// Kinematic State of the drone
 typedef struct {
     float x, y, z;
     float vx, vy, vz;
+
+    /*
+     * AHRS / FC estimator frame:
+     *   +X toward M3
+     *   +Y toward M4
+     */
     float roll, pitch, yaw;
     float q0, q1, q2, q3;
-    // Add these for the Rate PID
+
     float gyro_x, gyro_y, gyro_z;
+
+    /*
+     * AHRS / FC estimator-frame body rates.
+     */
     float roll_rate, pitch_rate, yaw_rate;
+
     bool offGround;
-    bool isTuning;
     float dt_sec;
 } vehicleState_t;
 
 // Desired State (from Navigation/Mission Manager)
+/*
+ * Operational aircraft control frame:
+ *   +X toward M1 (front)
+ *   +Y toward M2 (right)
+ */
 typedef struct {
     float x, y, z, yaw;
     float roll, pitch;         // Target Angles
     float rate_roll, rate_pitch, rate_yaw; // Target Rates
     float ff_vx, ff_vy, ff_vz;
+    bool yaw_hold_enabled;
 } targetState_t;
 
 // Drone Status and Telemetry Metadata
