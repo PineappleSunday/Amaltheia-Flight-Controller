@@ -12,6 +12,10 @@ under `FlightControl/`; board and sensor drivers live under
 Current active work is on the flight-mode and mission-executive behavior,
 especially takeoff, mission navigation, landing, and safety behavior.
 
+Hardware-target planning now lives in `HARDWARE_TARGETS.md`. The current
+sensor integration is treated as the DiscoveryBoard baseline. New Arbiter
+Industries hardware integration starts on branch `hardware/arbiter-industries`.
+
 ## Safety Posture
 
 Treat this as safety-critical embedded control code. Motor/ESC behavior,
